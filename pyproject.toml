@@ -1,0 +1,19 @@
+[project]
+name = "test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boxmot>=21.0.0",
+    "insightface>=1.0.1",
+    "mediapipe>=0.10.35",
+    "onnxruntime>=1.26.0",
+    "pyqt6>=6.6.0",
+    "scipy>=1.17.1",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
+]
