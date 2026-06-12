@@ -122,10 +122,10 @@ class KalmanFaceTracker:
     """Tracks a handful of faces (the app targets at most two people).
 
     update() takes this frame's filtered InsightFace detections plus an
-    optional lazy `head_provider` callable. The provider is only invoked
-    when at least one live track failed to match a face detection, so the
-    (comparatively expensive) pose model runs exclusively on the frames
-    that actually need it.
+    optional `head_provider` callable. The provider is invoked whenever
+    there is a live track to assist: a matched track takes a weak nudge from
+    its own head box, a track that lost its face is revived by one. It is
+    skipped only when there are no tracks at all.
     """
 
     def __init__(
@@ -219,16 +219,25 @@ class KalmanFaceTracker:
             t.correct(f.bbox[:4])
             t.source = "face"
 
-        # Pose assist: only consulted when a live track has no face this
-        # frame. Head boxes overlapping an already-matched track are
-        # discarded so one person's head cannot correct the other's track.
+        # Pose assist: head boxes correct *all* live tracks. A face-matched
+        # track takes a weak secondary nudge from its own overlapping head box
+        # (steadier size/position heading into a detection gap; its "face" tag
+        # is kept). Remaining heads revive tracks that had no face this frame.
+        # Heads are claimed one per track so one person's head can never
+        # correct another's track.
         head_corrected: set[_Track] = set()
-        lost = [t for t in self._tracks if t not in face_of]
-        if lost and head_provider is not None:
-            heads = [
-                hb for hb, _score in head_provider()
-                if not any(_iou(hb, t.bbox) > 0.3 for t in face_of)
-            ]
+        if self._tracks and head_provider is not None:
+            heads = [hb for hb, _score in head_provider()]
+            # Matched tracks first: only a clearly-overlapping head is theirs.
+            for t in face_of:
+                if not heads:
+                    break
+                cand = max(heads, key=lambda hb: _iou(hb, t.bbox))
+                if _iou(cand, t.bbox) > 0.3:
+                    t.correct(cand, weak=True)
+                    heads = [hb for hb in heads if hb is not cand]
+            # Lost tracks: revive on loose overlap or centre proximity.
+            lost = [t for t in self._tracks if t not in face_of]
             for t in lost:
                 if not heads:
                     break

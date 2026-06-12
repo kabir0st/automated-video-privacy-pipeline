@@ -98,8 +98,21 @@ class PoseHeadEstimator:
         return self.available
 
     def head_boxes(self, frame_bgr: np.ndarray) -> list[tuple[np.ndarray, float]]:
+        return self.estimate(frame_bgr)[0]
+
+    def estimate(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[list[tuple[np.ndarray, float]], list[np.ndarray]]:
+        """Return (head_boxes, poses).
+
+        head_boxes is the coarse tracker correction (one per person whose head
+        region could be estimated). poses[i] is an (33, 3) float32 array of
+        (x_px, y_px, visibility) — the raw keypoints, exposed so the inspector
+        can draw the skeleton and confirm pose estimation is alive. Both are
+        empty when the estimator is unavailable.
+        """
         if not self._ensure():
-            return []
+            return [], []
         import cv2
 
         fh, fw = frame_bgr.shape[:2]
@@ -109,11 +122,14 @@ class PoseHeadEstimator:
         result = self._landmarker.detect(mp_img)
 
         boxes: list[tuple[np.ndarray, float]] = []
+        poses: list[np.ndarray] = []
         for lms in result.pose_landmarks:
+            poses.append(np.array([[lm.x * fw, lm.y * fh, lm.visibility]
+                                   for lm in lms], dtype=np.float32))
             box = self._head_box(lms, fw, fh)
             if box is not None:
                 boxes.append(box)
-        return boxes
+        return boxes, poses
 
     @staticmethod
     def _head_box(

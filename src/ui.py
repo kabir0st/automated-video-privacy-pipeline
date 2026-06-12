@@ -64,7 +64,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
 from libs.face_app import FaceApp
-from libs.pose_head import PoseHeadEstimator
+from libs.pose_head import PoseHeadEstimator, _VIS_THRESHOLD
 from libs.tracker import KalmanFaceTracker
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
@@ -321,6 +321,24 @@ PRESETS: dict[str, tuple[str, Params]] = {
 # Overlay tag per tracking source, drawn after the track id.
 _SOURCE_TAGS = {"face": "", "head": "·pose", "coast": "·hold"}
 
+# Standard BlazePose 33-point skeleton connections, used to draw the pose
+# overlay on the tracking panel so pose estimation is visibly alive.
+_POSE_EDGES = (
+    # Face
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10),
+    # Arms
+    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
+    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    # Torso
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    # Legs
+    (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
+    (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
+)
+# Distinct from the per-track palette so the skeleton reads as a separate layer.
+_POSE_EDGE_COLOUR = (220, 220, 220)
+_POSE_BOX_COLOUR = (0, 200, 255)
+
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
@@ -345,6 +363,36 @@ def _draw_outline(
         x, y = x1, y1
     cv2.putText(frame, f"id:{tid}{tag}", (x, max(0, y - 4)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA)
+
+
+def _draw_pose(
+    frame: np.ndarray,
+    pose: np.ndarray,
+    head_box: Optional[np.ndarray] = None,
+) -> None:
+    """Draw one BlazePose skeleton (and its derived head box) onto frame.
+
+    pose is an (33, 3) array of (x_px, y_px, visibility). Edges and keypoints
+    are drawn only where visibility clears the same threshold the head-box
+    estimator uses; keypoints are coloured by confidence (green = high,
+    red = low) so a glance tells whether pose estimation is healthy.
+    """
+    vis = pose[:, 2]
+    for a, b in _POSE_EDGES:
+        if vis[a] > _VIS_THRESHOLD and vis[b] > _VIS_THRESHOLD:
+            pa = (int(pose[a, 0]), int(pose[a, 1]))
+            pb = (int(pose[b, 0]), int(pose[b, 1]))
+            cv2.line(frame, pa, pb, _POSE_EDGE_COLOUR, 1, cv2.LINE_AA)
+    for x, y, v in pose:
+        if v <= _VIS_THRESHOLD:
+            continue
+        # Lerp red→green over [threshold, 1.0] so weak joints stand out.
+        t = min(1.0, (v - _VIS_THRESHOLD) / max(1.0 - _VIS_THRESHOLD, 1e-6))
+        kp_colour = (0, int(255 * t), int(255 * (1 - t)))
+        cv2.circle(frame, (int(x), int(y)), 2, kp_colour, -1, cv2.LINE_AA)
+    if head_box is not None:
+        x1, y1, x2, y2 = (int(v) for v in head_box[:4])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), _POSE_BOX_COLOUR, 1)
 
 
 def _ok_face(bbox: np.ndarray, score: float, p: Params) -> bool:
@@ -574,8 +622,16 @@ class ProcessWorker(QThread):
                                        hold_secs=p.hold_secs)
         self._pv_last_idx = frame_idx
 
+        # Run pose every preview frame (even with a face present) so the
+        # skeleton can be drawn live and the tracker can lean on it; the boxes
+        # are precomputed here and handed to the tracker so pose runs once.
+        head_boxes: list[tuple[np.ndarray, float]] = []
+        poses: list[np.ndarray] = []
+        if p.pose_assist:
+            head_boxes, poses = self._pose.estimate(frame)
         tracked = self._pv_tracker.update(
-            refined, frame.shape, self._head_provider(frame, p))
+            refined, frame.shape,
+            (lambda: head_boxes) if p.pose_assist else None)
 
         # Build blur mask
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
@@ -598,6 +654,14 @@ class ProcessWorker(QThread):
             tag = _SOURCE_TAGS.get(t.source, "")
             _draw_outline(tracking, poly, bbox, t.track_id, c, tag)
             _draw_outline(blurred, poly, bbox, t.track_id, c, tag)
+
+        # Pose overlay (tracking panel only): skeletons on top of the outlines,
+        # plus the coarse head boxes the tracker is fed.
+        for pose in poses:
+            _draw_pose(tracking, pose)
+        for hb, _score in head_boxes:
+            cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
+                          (int(hb[2]), int(hb[3])), _POSE_BOX_COLOUR, 1)
 
         elapsed = time.perf_counter() - t0
         return orig, tracking, blurred, 1.0 / max(elapsed, 1e-6)
