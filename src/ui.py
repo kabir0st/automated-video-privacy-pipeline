@@ -58,7 +58,7 @@ import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QSlider, QFileDialog, QGroupBox, QGridLayout,
-    QSizePolicy, QComboBox, QFrame,
+    QSizePolicy, QComboBox, QFrame, QSplashScreen,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
@@ -1464,12 +1464,23 @@ class MainWindow(QMainWindow):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    app = QApplication(sys.argv)
+def main(splash: QSplashScreen | None = None) -> None:
+    app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    if splash is not None:
+        splash.showMessage("Preparing interface…")
+        app.processEvents()
     win = MainWindow()
     win.show()
+    if splash is not None:
+        splash.finish(win)
+    # Bootloader splash from a PyInstaller --splash build, if present.
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
     sys.exit(app.exec())
 
 
