@@ -74,6 +74,7 @@ from libs.utils import (
     crop_face_patch,
     unproject_landmark,
 )
+from libs.video_writer import make_video_writer, source_bitrate_kbps
 
 CLOSE_UP_TARGET_SIZE = 1024
 _TRACK_COLOURS = [
@@ -656,6 +657,10 @@ class ProcessWorker(QThread):
             return
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Match the source's bitrate so the export keeps its format/quality
+        # without OpenCV's uncontrolled ~250 Mbps blow-up (the 4 GiB / 2:18
+        # corruption). Encoded via FFmpeg → co64-safe even past 4 GiB.
+        src_kbps = source_bitrate_kbps(cap)
 
         ret, frame = cap.read()
         if not ret:
@@ -664,12 +669,11 @@ class ProcessWorker(QThread):
             return
         fh, fw = frame.shape[:2]
 
-        fourcc = cv2.VideoWriter.fourcc(*"avc1")  # type: ignore[attr-defined]
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
-        if not writer.isOpened():
-            fourcc = cv2.VideoWriter.fourcc(*"mp4v")  # type: ignore[attr-defined]
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (fw, fh))
-        if not writer.isOpened():
+        writer = make_video_writer(
+            output_path, fw, fh, fps,
+            bitrate_kbps=src_kbps, on_status=self.status.emit,
+        )
+        if writer is None:
             cap.release()
             self.export_finished.emit(False, f"Cannot create output: {output_path}")
             return

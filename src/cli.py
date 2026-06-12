@@ -16,6 +16,7 @@ from libs.face_app import FaceApp
 
 from libs.pose_head import PoseHeadEstimator
 from libs.tracker import KalmanFaceTracker
+from libs.video_writer import make_video_writer, source_bitrate_kbps
 from libs.utils import (
     BlurPipeline,
     MaskBuilder,
@@ -112,6 +113,7 @@ def main() -> None:
         sys.exit(1)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_kbps = source_bitrate_kbps(cap)
     tracker = KalmanFaceTracker(fps=fps, hold_secs=args.hold_secs)
     # Use actual first-frame dimensions — more reliable than codec-reported values.
     ret0, frame0 = cap.read()
@@ -120,13 +122,17 @@ def main() -> None:
         sys.exit(1)
     frame_h, frame_w = frame0.shape[:2]
 
-    writer: cv2.VideoWriter | None = None
+    writer = None
     if args.output:
-        _fourcc = cv2.VideoWriter.fourcc(*"avc1")  # type: ignore[attr-defined]
-        writer = cv2.VideoWriter(args.output, _fourcc, fps, (frame_w, frame_h))
-        if not writer.isOpened():
-            _fourcc = cv2.VideoWriter.fourcc(*"mp4v")  # type: ignore[attr-defined]
-            writer = cv2.VideoWriter(args.output, _fourcc, fps, (frame_w, frame_h))
+        # FFmpeg-backed, source-bitrate-matched encode: avoids OpenCV's
+        # uncontrolled bitrate that overflows MP4's 32-bit offsets past 4 GiB.
+        writer = make_video_writer(
+            args.output, frame_w, frame_h, fps,
+            bitrate_kbps=src_kbps, on_status=lambda m: print(m, file=sys.stderr),
+        )
+        if writer is None:
+            print(f"ERROR: cannot create output '{args.output}'", file=sys.stderr)
+            sys.exit(1)
 
     frame_idx = 0
     t_start = time.perf_counter()

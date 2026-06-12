@@ -58,9 +58,13 @@ echo ">>> Installing dependencies into Windows Python…"
 # boxmot pinned to the same version as the Linux venv (see uv.lock) so the
 # import paths and tracker API match. Its full dep tree (torch CPU, pandas,
 # pyyaml, regex, yacs, …) resolves to pre-built wheels on Python 3.10–3.13.
+# imageio-ffmpeg ships a static ffmpeg binary that the export path uses for
+# rate-controlled, co64-safe H.264 encoding (replacing cv2.VideoWriter, which
+# blew exports past 4 GiB into unplayable files). It is collected into the
+# bundle below so no system ffmpeg install is required on the target machine.
 "${WIN_PY[@]}" -m pip install --no-cache-dir \
   "boxmot==21.0.0" \
-  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn
+  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg
 
 # GPU: onnxruntime-directml ships the DirectML execution provider, which
 # accelerates inference on any Windows GPU (AMD/Intel/NVIDIA). It installs
@@ -130,6 +134,8 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --collect-all "insightface" \
   --collect-all "onnxruntime" \
   --collect-all "boxmot" \
+  --collect-all "imageio_ffmpeg" \
+  --hidden-import "libs.video_writer" \
   \
   --hidden-import "onnx" \
   --hidden-import "onnxruntime.tools.onnx_model_utils" \
