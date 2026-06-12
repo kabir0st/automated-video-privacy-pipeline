@@ -20,11 +20,11 @@ trace("[3] importing onnxruntime")
 import onnxruntime
 trace("[4] importing torch")
 import torch
-trace("[5] importing boxmot")
-import boxmot
+trace("[5] importing mediapipe")
+import mediapipe
 
 print("=== 1. onnxruntime providers ===")
-from libs.utils import best_onnx_providers, BlurPipeline, add_bbox_mask, add_face_mask
+from libs.utils import best_onnx_providers, BlurPipeline, MaskBuilder
 providers = best_onnx_providers()
 print("providers:", providers)
 
@@ -51,21 +51,32 @@ crop, (ox, oy, sc) = crop_face_patch(frame, faces[0].bbox[:4], target_size=1024)
 cfs = app.get(crop)
 print(f"crop {crop.shape} -> {len(cfs)} faces")
 
-print("=== 5. ByteTrack update ===")
-from libs.tracker import ByteTrackWrapper
-tracked = ByteTrackWrapper(match_iou=0.3).update(faces, frame)
+print("=== 5. Kalman tracker update (with detection-gap coast) ===")
+from libs.tracker import KalmanFaceTracker
+tracker = KalmanFaceTracker(fps=25.0, match_iou=0.3, hold_secs=2.0)
+tracked = tracker.update(faces, frame.shape)
 print("tracked:", len(tracked))
-for tid, face, tbox in tracked:
-    print(f"  track {tid}: face={'yes' if face is not None else 'COASTING'}")
+for t in tracked:
+    print(f"  track {t.track_id}: source={t.source}")
+# Detector goes blind: every track must keep coasting on prediction.
+coasted = tracker.update([], frame.shape)
+assert len(coasted) == len(tracked), "tracks vanished on detection gap"
+assert all(t.source == "coast" for t in coasted)
+print(f"coasting OK: {len(coasted)} tracks held without detections")
 
-print("=== 6. blur with face polygons ===")
+print("=== 6. pose head boxes (mediapipe, downloads model on first run) ===")
+from libs.pose_head import PoseHeadEstimator
+pose = PoseHeadEstimator(on_status=print)
+heads = pose.head_boxes(frame)
+print(f"pose available={pose.available} head boxes={len(heads)}")
+
+print("=== 7. blur with face polygons (stacked layers) ===")
 blur = BlurPipeline()
+blur.reconfigure((("gaussian", 71), ("pixelate", 10), ("gaussian", 31)))
+masks = MaskBuilder()
 mask = np.zeros((fh, fw), dtype=np.uint8)
-for tid, face, tbox in tracked:
-    if face is not None and face.landmark_2d_106 is not None:
-        add_face_mask(mask, face.landmark_2d_106)
-    else:
-        add_bbox_mask(mask, tbox)
+for t in coasted:
+    masks.add(mask, t)
 blur.apply(frame, mask)
 print("blur OK")
 

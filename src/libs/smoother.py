@@ -77,3 +77,12 @@ class LandmarkSmoother:
 
         self._last[track_id] = smoothed
         return smoothed
+
+    def drop(self, track_id: int) -> None:
+        """Forget a track's history (call when the tracker drops it)."""
+        self._histories.pop(track_id, None)
+        self._last.pop(track_id, None)
+
+    def drop_all(self) -> None:
+        self._histories.clear()
+        self._last.clear()

@@ -15,12 +15,11 @@ import cv2
 import numpy as np
 from libs.face_app import FaceApp
 
-from libs.smoother import LandmarkSmoother
-from libs.tracker import ByteTrackWrapper
+from libs.pose_head import PoseHeadEstimator
+from libs.tracker import KalmanFaceTracker
 from libs.utils import (
     BlurPipeline,
-    add_bbox_mask,
-    add_face_mask,
+    MaskBuilder,
     best_onnx_providers,
     crop_face_patch,
     is_likely_face,
@@ -76,7 +75,8 @@ def draw_track_outline(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Pipeline B: InsightFace + ByteTrack + GPU blur")
+    p = argparse.ArgumentParser(
+        description="Pipeline B: InsightFace + Kalman face tracking (+ pose assist) + GPU blur")
     p.add_argument("--input", default="0", help="Video path or webcam index (default: 0)")
     p.add_argument("--output", default="", help="Optional output video path")
     p.add_argument(
@@ -84,6 +84,14 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Detection input size (default: 640; use 1024+ for offline accuracy)",
     )
     p.add_argument("--no-display", action="store_true", help="Suppress cv2.imshow")
+    p.add_argument(
+        "--no-pose", action="store_true",
+        help="Disable pose-assisted head tracking for lost faces",
+    )
+    p.add_argument(
+        "--hold-secs", type=float, default=2.0,
+        help="Keep blurring a lost face this long on Kalman prediction (default: 2.0)",
+    )
     return p
 
 
@@ -101,9 +109,9 @@ def main() -> None:
     app = FaceApp(providers=best_onnx_providers())
     app.prepare(ctx_id=0, det_size=(args.target_size, args.target_size))
 
-    tracker = ByteTrackWrapper()
-    smoother = LandmarkSmoother()
     blur = BlurPipeline()
+    masks = MaskBuilder()
+    pose = None if args.no_pose else PoseHeadEstimator(on_status=print)
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -111,6 +119,7 @@ def main() -> None:
         sys.exit(1)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    tracker = KalmanFaceTracker(fps=fps, hold_secs=args.hold_secs)
     # Use actual first-frame dimensions — more reliable than codec-reported values.
     ret0, frame0 = cap.read()
     if not ret0:
@@ -125,9 +134,6 @@ def main() -> None:
         if not writer.isOpened():
             _fourcc = cv2.VideoWriter.fourcc(*"mp4v")  # type: ignore[attr-defined]
             writer = cv2.VideoWriter(args.output, _fourcc, fps, (frame_w, frame_h))
-
-    # Last known smoothed landmarks per track (for ghost-track blur continuity).
-    last_landmarks: dict[int, np.ndarray] = {}
 
     frame_idx = 0
     t_start = time.perf_counter()
@@ -168,39 +174,27 @@ def main() -> None:
                     continue
             refined.append(face)
 
-        # ── tracking ─────────────────────────────────────────────────────────
-        tracked_triples = tracker.update(refined, frame)
+        # ── tracking — Kalman predict + face correction; pose head boxes
+        # revive tracks whose face the detector lost this frame ───────────────
+        head_provider = (lambda f=frame: pose.head_boxes(f)) if pose else None
+        tracked = tracker.update(refined, frame.shape, head_provider)
 
         # ── build combined blur mask (one pass for all faces) ─────────────────
         blur_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
         polys: dict[int, np.ndarray | None] = {}  # track_id → hull polygon for drawing
 
-        for track_id, face, track_box in tracked_triples:
-            if face is not None and face.landmark_2d_106 is not None:
-                smoothed = smoother.update(track_id, face.landmark_2d_106, float(face.det_score))
-                last_landmarks[track_id] = smoothed
-                poly = add_face_mask(blur_mask, smoothed)
-                polys[track_id] = poly
-            elif track_id in last_landmarks:
-                poly = add_face_mask(blur_mask, last_landmarks[track_id])
-                polys[track_id] = poly
-            else:
-                add_bbox_mask(blur_mask, track_box)
-                polys[track_id] = None
+        for t in tracked:
+            polys[t.track_id] = masks.add(blur_mask, t)
+        masks.evict({t.track_id for t in tracked})
 
         # ── apply stacked GPU/CPU blur in a single call ───────────────────────
         blur.apply(frame, blur_mask)
 
         # ── draw hull outlines + track IDs on top of blur ─────────────────────
-        for track_id, face, track_box in tracked_triples:
-            bbox = face.bbox if face is not None else track_box
-            draw_track_outline(frame, polys.get(track_id), bbox, track_id, track_colour(track_id))
-
-        # Evict stale track state.
-        active = {t for t, _, _ in tracked_triples}
-        for sid in list(last_landmarks):
-            if sid not in active:
-                del last_landmarks[sid]
+        for t in tracked:
+            bbox = t.face.bbox if t.face is not None else t.bbox
+            draw_track_outline(frame, polys.get(t.track_id), bbox,
+                               t.track_id, track_colour(t.track_id))
 
         # FPS overlay
         elapsed = time.perf_counter() - t_start

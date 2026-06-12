@@ -14,6 +14,16 @@ BLUR_HAIR_EXTRA = 0.90   # additional upward expansion to cover hairline
 BLUR_K_GAUSSIAN = 71     # Gaussian kernel (must be odd)
 BLUR_PIXELATE_BLOCK = 10 # downsample factor for pixelation pass
 
+# A blur stack is an ordered tuple of (kind, strength) layers applied in
+# sequence; "gaussian" strength is the kernel size, "pixelate" strength is
+# the mosaic block size. The default reproduces the original hardwired
+# Gaussian → pixelate pipeline.
+BlurLayer = tuple[str, int]
+DEFAULT_BLUR_LAYERS: tuple[BlurLayer, ...] = (
+    ("gaussian", BLUR_K_GAUSSIAN),
+    ("pixelate", BLUR_PIXELATE_BLOCK),
+)
+
 # ── face-detection filter ────────────────────────────────────────────────────
 _MIN_FACE_ASPECT = 0.4
 _MIN_DET_SCORE = 0.55
@@ -124,43 +134,116 @@ def add_bbox_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
         mask[y1:y2, x1:x2] = 255
 
 
+def _map_landmarks(
+    landmarks: np.ndarray, src_bbox: np.ndarray, dst_bbox: np.ndarray
+) -> np.ndarray:
+    """Translate + scale landmarks from src_bbox's frame to dst_bbox's.
+
+    Scale is clamped so a degenerate Kalman box cannot explode or collapse
+    the hull.
+    """
+    sc = np.array([(src_bbox[0] + src_bbox[2]) / 2, (src_bbox[1] + src_bbox[3]) / 2])
+    dc = np.array([(dst_bbox[0] + dst_bbox[2]) / 2, (dst_bbox[1] + dst_bbox[3]) / 2])
+    sw = max(float(src_bbox[2] - src_bbox[0]), 1.0)
+    sh = max(float(src_bbox[3] - src_bbox[1]), 1.0)
+    scale = np.clip(
+        [float(dst_bbox[2] - dst_bbox[0]) / sw, float(dst_bbox[3] - dst_bbox[1]) / sh],
+        0.5, 2.0,
+    )
+    return ((landmarks - sc) * scale + dc).astype(np.float32)
+
+
+class MaskBuilder:
+    """Builds the combined blur mask from tracker output, with continuity.
+
+    For a track matched to a face this frame the smoothed landmark hull is
+    used directly (and remembered together with the bbox it was observed
+    at). For a coasting or pose-corrected track the remembered hull is
+    translated/scaled onto the track's current Kalman box, so the blur
+    follows the head instead of freezing at the last detected position.
+    Tracks that never produced landmarks fall back to the rectangular box.
+    """
+
+    def __init__(self, smoother: "LandmarkSmoother | None" = None) -> None:
+        from .smoother import LandmarkSmoother
+        self._smoother = smoother or LandmarkSmoother()
+        # track_id -> (smoothed landmarks, bbox at observation time)
+        self._mem: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def add(
+        self,
+        mask: np.ndarray,
+        tracked,  # TrackedFace from libs.tracker
+        *,
+        expand: float = BLUR_EXPAND,
+        hair_extra: float = BLUR_HAIR_EXTRA,
+    ) -> np.ndarray | None:
+        """Stamp one track into mask; returns the hull polygon for overlays."""
+        tid, face, bbox = tracked.track_id, tracked.face, tracked.bbox
+        if face is not None and face.landmark_2d_106 is not None:
+            smoothed = self._smoother.update(
+                tid, face.landmark_2d_106, float(face.det_score))
+            self._mem[tid] = (smoothed, np.array(face.bbox[:4], dtype=np.float32))
+            return add_face_mask(mask, smoothed, expand=expand, hair_extra=hair_extra)
+        if tid in self._mem:
+            lm0, bb0 = self._mem[tid]
+            moved = _map_landmarks(lm0, bb0, bbox)
+            return add_face_mask(mask, moved, expand=expand, hair_extra=hair_extra)
+        add_bbox_mask(mask, bbox)
+        return None
+
+    def evict(self, active_ids: set[int]) -> None:
+        """Drop state for tracks the tracker no longer reports."""
+        for tid in list(self._mem):
+            if tid not in active_ids:
+                del self._mem[tid]
+                self._smoother.drop(tid)
+
+    def reset(self) -> None:
+        self._mem.clear()
+        self._smoother.drop_all()
+
+
 # ── GPU-accelerated stacked blur pipeline ────────────────────────────────────
 
 class BlurPipeline:
-    """Applies stacked Gaussian + pixelation blur to a masked region.
+    """Applies a configurable stack of blur layers to a masked region.
 
-    Uses CUDA via PyTorch when available (one GPU round-trip per frame
+    Layers (Gaussian / pixelate, in any order and multiplicity) are applied
+    in sequence to the whole frame once, then composited where the mask is
+    set. Uses CUDA via PyTorch when available (one GPU round-trip per frame
     regardless of how many faces are present). Falls back to CPU cv2.
     """
 
     def __init__(self) -> None:
         self.use_gpu = _TORCH_AVAILABLE and torch.cuda.is_available()  # type: ignore[possibly-undefined]
-        self._k = BLUR_K_GAUSSIAN
-        self._block = BLUR_PIXELATE_BLOCK
+        self._layers: tuple[BlurLayer, ...] = DEFAULT_BLUR_LAYERS
         if self.use_gpu:
             self._device = torch.device("cuda")  # type: ignore[possibly-undefined]
-            self._kernel = self._make_gaussian_kernel(
-                self._k, self._k / 6.0, self._device)
+            self._kernels: dict[int, "torch.Tensor"] = {}
         print(
             f"[BlurPipeline] {'GPU (CUDA)' if self.use_gpu else 'CPU'} blur active"
         )
 
-    def reconfigure(self, k_gaussian: int, pixelate_block: int) -> None:
-        """Update blur parameters without re-constructing the pipeline."""
-        k_gaussian = k_gaussian | 1  # enforce odd
-        if k_gaussian == self._k and pixelate_block == self._block:
-            return
-        self._k = k_gaussian
-        self._block = pixelate_block
-        if self.use_gpu:
-            self._kernel = self._make_gaussian_kernel(
-                k_gaussian, k_gaussian / 6.0, self._device)
+    def reconfigure(self, layers: tuple[BlurLayer, ...]) -> None:
+        """Update the blur layer stack without re-constructing the pipeline."""
+        self._layers = tuple(
+            (kind, (max(3, s) | 1) if kind == "gaussian" else max(2, s))
+            for kind, s in layers
+        )
+
+    def _gaussian_kernel(self, k: int) -> "torch.Tensor":
+        kernel = self._kernels.get(k)
+        if kernel is None:
+            kernel = self._make_gaussian_kernel(k, k / 6.0, self._device)
+            self._kernels[k] = kernel
+        return kernel
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def apply(self, frame: np.ndarray, mask: np.ndarray) -> None:
-        """Apply stacked blur to frame in-place, only where mask == 255."""
-        if not np.any(mask):
+        """Apply the blur stack to frame in-place, only where mask == 255."""
+        if not self._layers or not np.any(mask):
             return
         if self.use_gpu:
             self._apply_gpu(frame, mask)
@@ -171,23 +254,26 @@ class BlurPipeline:
 
     def _apply_cpu(self, frame: np.ndarray, mask: np.ndarray) -> None:
         h, w = frame.shape[:2]
-        k = self._k
-        b = self._block
+        out = frame
+        for kind, strength in self._layers:
+            if kind == "gaussian":
+                out = cv2.GaussianBlur(out, (strength, strength), 0)
+            else:
+                # Mosaic — INTER_AREA averages each block to a flat colour,
+                # giving true solid-square mosaic rather than a blended
+                # downsample.
+                b = strength
+                small = cv2.resize(out, (max(1, w // b), max(1, h // b)),
+                                   interpolation=cv2.INTER_AREA)
+                out = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        # Pass 1: Gaussian blur
-        blurred = cv2.GaussianBlur(frame, (k, k), 0)
-
-        # Pass 2: mosaic — INTER_AREA averages each block to a flat colour,
-        # giving true solid-square mosaic rather than a blended downsample.
-        small = cv2.resize(blurred, (max(1, w // b), max(1, h // b)), interpolation=cv2.INTER_AREA)
-        mosaic = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-
-        frame[mask == 255] = mosaic[mask == 255]
+        frame[mask == 255] = out[mask == 255]
 
     # ── GPU path ──────────────────────────────────────────────────────────────
 
     def _apply_gpu(self, frame: np.ndarray, mask: np.ndarray) -> None:
         device = self._device
+        h, w = frame.shape[:2]
 
         # Upload once: (1, 3, H, W) float32
         t = (
@@ -198,22 +284,23 @@ class BlurPipeline:
             .float()
         )
 
-        # Pass 1: Gaussian blur using precomputed kernel (depthwise conv)
-        h, w = frame.shape[:2]
-        pad = self._k // 2
-        blurred = F.conv2d(  # type: ignore[possibly-undefined]
-            F.pad(t, [pad] * 4, mode="reflect"),  # type: ignore[possibly-undefined]
-            self._kernel,
-            groups=3,
-        )
+        out = t
+        for kind, strength in self._layers:
+            if kind == "gaussian":
+                pad = strength // 2
+                out = F.conv2d(  # type: ignore[possibly-undefined]
+                    F.pad(out, [pad] * 4, mode="reflect"),  # type: ignore[possibly-undefined]
+                    self._gaussian_kernel(strength),
+                    groups=3,
+                )
+            else:
+                # Mosaic — avg_pool2d averages each block to a flat colour
+                # (GPU equivalent of INTER_AREA).
+                b = strength
+                out = F.avg_pool2d(out, kernel_size=b, stride=b, padding=0)  # type: ignore[possibly-undefined]
+                out = F.interpolate(out, size=(h, w), mode="nearest")  # type: ignore[possibly-undefined]
 
-        # Pass 2: mosaic — avg_pool2d averages each block to a flat colour
-        # (GPU equivalent of INTER_AREA), giving true solid-square mosaic.
-        b = self._block
-        mosaic = F.avg_pool2d(blurred, kernel_size=b, stride=b, padding=0)  # type: ignore[possibly-undefined]
-        mosaic = F.interpolate(mosaic, size=(h, w), mode="nearest")  # type: ignore[possibly-undefined]
-
-        # Composite: use mosaic where mask is set, original elsewhere
+        # Composite: use blurred result where mask is set, original elsewhere
         mask_t = (
             torch.from_numpy(mask)  # type: ignore[possibly-undefined]
             .to(device)
@@ -221,7 +308,7 @@ class BlurPipeline:
             .unsqueeze(0)
             .unsqueeze(0)
         )  # (1, 1, H, W)
-        result = torch.where(mask_t, mosaic, t)  # type: ignore[possibly-undefined]
+        result = torch.where(mask_t, out, t)  # type: ignore[possibly-undefined]
 
         # Write back to the original numpy buffer
         result_np = result.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()

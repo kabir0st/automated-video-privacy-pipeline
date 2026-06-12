@@ -64,12 +64,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
 from libs.face_app import FaceApp
-from libs.smoother import LandmarkSmoother
-from libs.tracker import ByteTrackWrapper
+from libs.pose_head import PoseHeadEstimator
+from libs.tracker import KalmanFaceTracker
 from libs.utils import (
+    DEFAULT_BLUR_LAYERS,
     BlurPipeline,
-    add_bbox_mask,
-    add_face_mask,
+    MaskBuilder,
     best_onnx_providers,
     crop_face_patch,
     unproject_landmark,
@@ -82,92 +82,195 @@ _TRACK_COLOURS = [
     (200, 100, 0), (100, 0, 200),
 ]
 
-# ── Catppuccin-inspired dark theme ────────────────────────────────────────────
+# ── Design tokens — Nordic muted: polar-night surfaces, frost-blue accent ────
+_BG         = "#232831"   # window base
+_SURFACE    = "#2B313C"   # cards / group boxes (gradient bottom)
+_SURFACE_HI = "#303744"   # cards gradient top
+_FIELD      = "#333B48"   # inputs, buttons
+_FIELD_HI   = "#3C4554"   # hovered field
+_BORDER     = "#3E4654"
+_BORDER_HI  = "#515C6E"
+_TEXT       = "#ECEFF4"
+_TEXT_MID   = "#AEB6C3"
+_TEXT_DIM   = "#7A8494"
+_ACCENT     = "#88C0D0"   # interactive elements only
+_ACCENT_HI  = "#A3D3E0"
+_ACCENT_BG  = "rgba(136, 192, 208, 0.16)"
+_VALUE      = "#A3BE8C"   # live numeric readouts, sage
+_PANEL_BG   = "#1B2028"   # video panel letterbox
+_MONO       = '"Cascadia Mono", "JetBrains Mono", "Consolas", monospace'
+
 STYLE = """
-QMainWindow, QWidget {
-    background-color: #11111b;
-    color: #cdd6f4;
+QWidget {
+    background-color: transparent;
+    color: @text;
     font-family: "Inter", "Segoe UI", "Ubuntu", sans-serif;
-    font-size: 11px;
+    font-size: 13px;
+}
+QMainWindow, QDialog {
+    background-color: @bg;
 }
 QGroupBox {
-    border: 1px solid #313244;
-    border-radius: 8px;
-    margin-top: 16px;
-    padding: 8px 6px 6px 6px;
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 @surfaceHi, stop:1 @surface);
+    border: 1px solid @border;
+    border-radius: 14px;
+    margin-top: 18px;
+    padding: 12px 12px 10px 12px;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
-    left: 10px;
+    left: 14px;
     padding: 0 6px;
-    color: #cba6f7;
-    font-size: 9px;
+    color: @textDim;
+    font-size: 10px;
     font-weight: bold;
-    letter-spacing: 1.5px;
-    text-transform: uppercase;
 }
 QSlider::groove:horizontal {
-    height: 3px;
-    background: #313244;
-    border-radius: 2px;
+    height: 6px;
+    background: @border;
+    border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    background: #cba6f7;
-    width: 13px;
-    height: 13px;
+    background: @accent;
+    width: 16px;
+    height: 16px;
     margin: -5px 0;
-    border-radius: 7px;
-    border: 2px solid #1e1e2e;
+    border-radius: 8px;
+    border: 2px solid @surface;
 }
+QSlider::handle:horizontal:hover { background: @accentHi; border-color: @borderHi; }
+QSlider::handle:horizontal:disabled { background: @borderHi; }
 QSlider::sub-page:horizontal {
-    background: #cba6f7;
-    border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+        stop:0 @accent, stop:1 @accentHi);
+    border-radius: 3px;
 }
+QSlider::sub-page:horizontal:disabled { background: @border; }
 QPushButton {
-    background-color: #1e1e2e;
-    border: 1px solid #45475a;
-    border-radius: 6px;
-    padding: 5px 14px;
-    color: #cdd6f4;
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 @fieldHi, stop:1 @field);
+    border: 1px solid @border;
+    border-radius: 9px;
+    padding: 7px 16px;
+    color: @text;
     min-width: 80px;
 }
 QPushButton:hover {
-    background-color: #313244;
-    border-color: #cba6f7;
+    background-color: @fieldHi;
+    border-color: @borderHi;
 }
 QPushButton:pressed {
-    background-color: #cba6f7;
-    color: #1e1e2e;
+    background-color: @accentBg;
+    border-color: @accent;
 }
+QPushButton:disabled { color: @textDim; background-color: @surface; }
 QPushButton[accent="true"] {
-    background-color: #cba6f7;
-    color: #1e1e2e;
-    font-weight: bold;
+    background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 @accentHi, stop:1 @accent);
+    color: @bg;
+    font-weight: 600;
+    border: 1px solid @accentHi;
+}
+QPushButton[accent="true"]:hover { background-color: @accentHi; }
+QPushButton[accent="true"]:disabled {
+    background-color: @field;
+    color: @textDim;
+    border-color: @border;
+}
+QPushButton[chip="true"] {
+    background-color: transparent;
+    border: 1px solid @border;
+    border-radius: 16px;
+    padding: 6px 16px;
+    color: @textMid;
+    min-width: 0px;
+    font-weight: 500;
+}
+QPushButton[chip="true"]:hover { border-color: @borderHi; color: @text; }
+QPushButton[chip="true"]:checked {
+    background-color: @accentBg;
+    border-color: @accent;
+    color: @accentHi;
+}
+QPushButton[ghost="true"] {
+    background-color: transparent;
     border: none;
+    color: @textMid;
+    min-width: 0px;
 }
-QPushButton[accent="true"]:hover {
-    background-color: #d4b8ff;
-}
-QLabel {
-    color: #cdd6f4;
-}
+QPushButton[ghost="true"]:hover { color: @text; background-color: @field; }
+QPushButton[ghost="true"]:checked { color: @accentHi; }
 QComboBox {
-    background-color: #1e1e2e;
-    border: 1px solid #45475a;
-    border-radius: 5px;
-    padding: 3px 8px;
-    color: #cdd6f4;
+    background-color: @field;
+    border: 1px solid @border;
+    border-radius: 9px;
+    padding: 4px 10px;
+    color: @text;
     min-width: 64px;
 }
-QComboBox:hover { border-color: #cba6f7; }
-QComboBox::drop-down { border: none; }
+QComboBox:hover { border-color: @borderHi; }
+QComboBox::drop-down { border: none; width: 18px; }
 QComboBox QAbstractItemView {
-    background-color: #1e1e2e;
-    selection-background-color: #313244;
-    border: 1px solid #45475a;
-    color: #cdd6f4;
+    background-color: @field;
+    selection-background-color: @accentBg;
+    border: 1px solid @borderHi;
+    color: @text;
 }
+QLineEdit {
+    background-color: @field;
+    border: 1px solid @border;
+    border-radius: 8px;
+    padding: 4px 8px;
+    color: @text;
+    selection-background-color: @accentBg;
+}
+QAbstractItemView { background-color: @field; color: @text; }
+QHeaderView::section {
+    background-color: @surface;
+    color: @textMid;
+    border: none;
+    padding: 4px 6px;
+}
+QToolTip {
+    background-color: @surfaceHi;
+    color: @text;
+    border: 1px solid @borderHi;
+    border-radius: 6px;
+    padding: 5px 9px;
+}
+QScrollBar:vertical { background: transparent; width: 10px; }
+QScrollBar::handle:vertical {
+    background: @borderHi;
+    border-radius: 5px;
+    min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+QScrollBar:horizontal { background: transparent; height: 10px; }
+QScrollBar::handle:horizontal {
+    background: @borderHi;
+    border-radius: 5px;
+    min-width: 24px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
 """
+
+# Longer tokens first so e.g. @textMid is consumed before @text.
+for _token, _colour in (
+    ("@borderHi", _BORDER_HI), ("@border", _BORDER),
+    ("@fieldHi", _FIELD_HI), ("@field", _FIELD),
+    ("@textMid", _TEXT_MID), ("@textDim", _TEXT_DIM), ("@text", _TEXT),
+    ("@accentHi", _ACCENT_HI), ("@accentBg", _ACCENT_BG), ("@accent", _ACCENT),
+    ("@surfaceHi", _SURFACE_HI), ("@surface", _SURFACE), ("@bg", _BG),
+):
+    STYLE = STYLE.replace(_token, _colour)
+
+
+def _letterspace(lbl: QLabel, px: float = 1.5) -> None:
+    """Spread uppercase caption labels; QSS has no letter-spacing property."""
+    font = lbl.font()
+    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, px)
+    lbl.setFont(font)
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -180,9 +283,42 @@ class Params:
     close_up_ratio: float = 0.60
     blur_expand: float = 0.45
     blur_hair_extra: float = 0.90
-    blur_k: int = 71        # must remain odd
-    blur_block: int = 10
+    # Ordered blur stack: ("gaussian", kernel) / ("pixelate", block).
+    blur_layers: tuple[tuple[str, int], ...] = DEFAULT_BLUR_LAYERS
     match_iou: float = 0.30
+    hold_secs: float = 2.0      # keep blurring this long after last correction
+    pose_assist: bool = True    # pose-estimated head boxes revive lost tracks
+
+
+# ── Presets — curated Params bundles; Advanced exposes every value ───────────
+
+PRESETS: dict[str, tuple[str, Params]] = {
+    "Balanced": (
+        "Sensible defaults for most footage",
+        Params(),
+    ),
+    "Max Privacy": (
+        "Catch every face and blur hard — favours coverage over speed",
+        Params(target_size=1024, det_score=0.35, face_aspect=0.25,
+               blur_expand=0.80, blur_hair_extra=1.50,
+               blur_layers=(("gaussian", 99), ("pixelate", 16)),
+               match_iou=0.20, hold_secs=4.0),
+    ),
+    "Crowded Scene": (
+        "Many small faces — high-res detection, stricter ID matching",
+        Params(target_size=1024, det_score=0.45, face_aspect=0.35,
+               match_iou=0.45),
+    ),
+    "Fast Preview": (
+        "Low-res detection for quick scrubbing on CPU",
+        Params(target_size=320,
+               blur_layers=(("gaussian", 41), ("pixelate", 12)),
+               pose_assist=False),
+    ),
+}
+
+# Overlay tag per tracking source, drawn after the track id.
+_SOURCE_TAGS = {"face": "", "head": "·pose", "coast": "·hold"}
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -197,6 +333,7 @@ def _draw_outline(
     bbox: np.ndarray,
     tid: int,
     colour: tuple[int, int, int],
+    tag: str = "",
 ) -> None:
     if poly is not None:
         cv2.polylines(frame, [poly], True, colour, 1, cv2.LINE_AA)
@@ -205,7 +342,7 @@ def _draw_outline(
         x1, y1, x2, y2 = (int(v) for v in bbox[:4])
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1)
         x, y = x1, y1
-    cv2.putText(frame, f"id:{tid}", (x, max(0, y - 4)),
+    cv2.putText(frame, f"id:{tid}{tag}", (x, max(0, y - 4)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA)
 
 
@@ -238,12 +375,19 @@ class ProcessWorker(QThread):
     def __init__(self) -> None:
         super().__init__()
         self._lock = threading.Lock()
-        self._pending: Optional[tuple[np.ndarray, Params]] = None
+        self._pending: Optional[tuple[np.ndarray, Params, int, float]] = None
         self._wake = threading.Event()
         self._running = True
         self._app: Optional[FaceApp] = None
         self._model_size = -1
         self._blur = BlurPipeline()
+        # Lazy: no model load (or one-time download) until first head query.
+        self._pose = PoseHeadEstimator(on_status=self.status.emit)
+        # Preview tracking state persists across sequential frames (Play),
+        # so detection-gap coasting is visible live; any scrub/jump resets it.
+        self._pv_tracker: Optional[KalmanFaceTracker] = None
+        self._pv_masks = MaskBuilder()
+        self._pv_last_idx = -2
         self._preview_lock = threading.Lock()
         self._preview: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = None
         # Export state — latest params are re-read every frame so slider
@@ -254,9 +398,10 @@ class ProcessWorker(QThread):
         self._export_run = threading.Event()    # cleared = paused
         self._export_cancel = threading.Event()
 
-    def submit(self, frame: np.ndarray, params: Params) -> None:
+    def submit(self, frame: np.ndarray, params: Params,
+               frame_idx: int = -1, fps: float = 25.0) -> None:
         with self._lock:
-            self._pending = (frame.copy(), replace(params))
+            self._pending = (frame.copy(), replace(params), frame_idx, fps)
         self._wake.set()
 
     def update_params(self, params: Params) -> None:
@@ -339,9 +484,9 @@ class ProcessWorker(QThread):
                 self._pending = None
             if job is None:
                 continue
-            frame, params = job
+            frame, params, frame_idx, fps = job
             try:
-                results = self._process(frame, params)
+                results = self._process(frame, params, frame_idx, fps)
                 self._emit_preview(*results)
             except Exception as exc:  # noqa: BLE001
                 tb = _log_exception(exc)
@@ -396,8 +541,15 @@ class ProcessWorker(QThread):
             refined.append(face)
         return refined
 
+    def _head_provider(self, frame: np.ndarray, p: Params):
+        """Lazy head-box source for the tracker; None disables pose assist."""
+        if not p.pose_assist:
+            return None
+        return lambda: self._pose.head_boxes(frame)
+
     def _process(
-        self, frame: np.ndarray, p: Params
+        self, frame: np.ndarray, p: Params, frame_idx: int = -1,
+        fps: float = 25.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         t0 = time.perf_counter()
         self._ensure_model(p.target_size)
@@ -409,33 +561,42 @@ class ProcessWorker(QThread):
 
         refined = self._detect_refined(frame, p)
 
-        # Tracking (fresh per-frame for stable single-frame inspection)
-        tracked = ByteTrackWrapper(match_iou=p.match_iou).update(refined, frame)
+        # Sequential frames (Play) keep the tracker so gap-coasting shows in
+        # the live preview; scrubbing or single-frame inspection resets it.
+        if self._pv_tracker is None or frame_idx < 0 \
+                or frame_idx != self._pv_last_idx + 1:
+            self._pv_tracker = KalmanFaceTracker(
+                fps=fps, match_iou=p.match_iou, hold_secs=p.hold_secs)
+            self._pv_masks.reset()
+        else:
+            self._pv_tracker.configure(match_iou=p.match_iou,
+                                       hold_secs=p.hold_secs)
+        self._pv_last_idx = frame_idx
+
+        tracked = self._pv_tracker.update(
+            refined, frame.shape, self._head_provider(frame, p))
 
         # Build blur mask
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
         polys: dict[int, Optional[np.ndarray]] = {}
-        for tid, face, tbox in tracked:
-            if face is not None and face.landmark_2d_106 is not None:
-                poly = add_face_mask(blur_mask, face.landmark_2d_106,
-                                     expand=p.blur_expand,
-                                     hair_extra=p.blur_hair_extra)
-                polys[tid] = poly
-            else:
-                add_bbox_mask(blur_mask, tbox)
-                polys[tid] = None
+        for t in tracked:
+            polys[t.track_id] = self._pv_masks.add(
+                blur_mask, t, expand=p.blur_expand,
+                hair_extra=p.blur_hair_extra)
+        self._pv_masks.evict({t.track_id for t in tracked})
 
         # Apply blur with live params
-        self._blur.reconfigure(p.blur_k, p.blur_block)
+        self._blur.reconfigure(p.blur_layers)
         self._blur.apply(blurred, blur_mask)
 
         # Draw tracking overlays
-        for tid, face, tbox in tracked:
-            bbox = face.bbox if face is not None else tbox
-            c = _track_colour(tid)
-            poly = polys.get(tid)
-            _draw_outline(tracking, poly, bbox, tid, c)
-            _draw_outline(blurred, poly, bbox, tid, c)
+        for t in tracked:
+            bbox = t.face.bbox if t.face is not None else t.bbox
+            c = _track_colour(t.track_id)
+            poly = polys.get(t.track_id)
+            tag = _SOURCE_TAGS.get(t.source, "")
+            _draw_outline(tracking, poly, bbox, t.track_id, c, tag)
+            _draw_outline(blurred, poly, bbox, t.track_id, c, tag)
 
         elapsed = time.perf_counter() - t0
         return orig, tracking, blurred, 1.0 / max(elapsed, 1e-6)
@@ -446,47 +607,31 @@ class ProcessWorker(QThread):
         self,
         frame: np.ndarray,
         p: Params,
-        tracker: ByteTrackWrapper,
-        smoother: LandmarkSmoother,
-        last_landmarks: dict[int, np.ndarray],
+        tracker: KalmanFaceTracker,
+        masks: MaskBuilder,
     ) -> tuple[np.ndarray, list, dict[int, Optional[np.ndarray]]]:
         """Process one frame with the persistent offline pipeline.
 
-        Returns (clean blurred frame, tracked triples, polys for overlay drawing).
+        Returns (clean blurred frame, tracked faces, polys for overlay drawing).
         """
         self._ensure_model(p.target_size)
         fh, fw = frame.shape[:2]
 
         refined = self._detect_refined(frame, p)
-        tracker.set_match_iou(p.match_iou)
-        tracked = tracker.update(refined, frame)
+        tracker.configure(match_iou=p.match_iou, hold_secs=p.hold_secs)
+        tracked = tracker.update(
+            refined, frame.shape, self._head_provider(frame, p))
 
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
         polys: dict[int, Optional[np.ndarray]] = {}
-        for tid, face, tbox in tracked:
-            if face is not None and face.landmark_2d_106 is not None:
-                smoothed = smoother.update(
-                    tid, face.landmark_2d_106, float(face.det_score))
-                last_landmarks[tid] = smoothed
-                polys[tid] = add_face_mask(blur_mask, smoothed,
-                                           expand=p.blur_expand,
-                                           hair_extra=p.blur_hair_extra)
-            elif tid in last_landmarks:
-                # Ghost track: hold the last smoothed landmarks for continuity.
-                polys[tid] = add_face_mask(blur_mask, last_landmarks[tid],
-                                           expand=p.blur_expand,
-                                           hair_extra=p.blur_hair_extra)
-            else:
-                add_bbox_mask(blur_mask, tbox)
-                polys[tid] = None
-
-        active = {t for t, _, _ in tracked}
-        for sid in list(last_landmarks):
-            if sid not in active:
-                del last_landmarks[sid]
+        for t in tracked:
+            polys[t.track_id] = masks.add(blur_mask, t,
+                                          expand=p.blur_expand,
+                                          hair_extra=p.blur_hair_extra)
+        masks.evict({t.track_id for t in tracked})
 
         blurred = frame.copy()
-        self._blur.reconfigure(p.blur_k, p.blur_block)
+        self._blur.reconfigure(p.blur_layers)
         self._blur.apply(blurred, blur_mask)
         return blurred, tracked, polys
 
@@ -494,7 +639,7 @@ class ProcessWorker(QThread):
         """Re-render the held frame while paused so slider changes show live.
 
         Uses the single-frame inspect path (fresh tracker) so the persistent
-        export tracker/smoother state is untouched; blur appearance matches
+        export tracker/mask state is untouched; blur appearance matches
         what resume will write.
         """
         try:
@@ -529,9 +674,10 @@ class ProcessWorker(QThread):
             self.export_finished.emit(False, f"Cannot create output: {output_path}")
             return
 
-        tracker = ByteTrackWrapper(fps=fps, match_iou=self._latest_params().match_iou)
-        smoother = LandmarkSmoother()
-        last_landmarks: dict[int, np.ndarray] = {}
+        p0 = self._latest_params()
+        tracker = KalmanFaceTracker(fps=fps, match_iou=p0.match_iou,
+                                    hold_secs=p0.hold_secs)
+        masks = MaskBuilder()
         idx = 0
         cancelled = False
 
@@ -549,17 +695,20 @@ class ProcessWorker(QThread):
                 p = self._latest_params()
                 t0 = time.perf_counter()
                 blurred, tracked, polys = self._export_frame(
-                    frame, p, tracker, smoother, last_landmarks)
+                    frame, p, tracker, masks)
                 writer.write(blurred)
 
                 # Preview panels: overlays only on copies, never in the file.
                 tracking = frame.copy()
                 preview = blurred.copy()
-                for tid, face, tbox in tracked:
-                    bbox = face.bbox if face is not None else tbox
-                    c = _track_colour(tid)
-                    _draw_outline(tracking, polys.get(tid), bbox, tid, c)
-                    _draw_outline(preview, polys.get(tid), bbox, tid, c)
+                for t in tracked:
+                    bbox = t.face.bbox if t.face is not None else t.bbox
+                    c = _track_colour(t.track_id)
+                    tag = _SOURCE_TAGS.get(t.source, "")
+                    _draw_outline(tracking, polys.get(t.track_id), bbox,
+                                  t.track_id, c, tag)
+                    _draw_outline(preview, polys.get(t.track_id), bbox,
+                                  t.track_id, c, tag)
                 elapsed = time.perf_counter() - t0
                 self._emit_preview(
                     frame.copy(), tracking, preview, 1.0 / max(elapsed, 1e-6))
@@ -592,17 +741,18 @@ class VideoPanel(QWidget):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(4)
 
-        hdr = QLabel(title)
+        hdr = QLabel(title.upper())
         hdr.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hdr.setStyleSheet(
-            "font-weight: bold; font-size: 10px; color: #cba6f7;"
-            "letter-spacing: 1.5px; text-transform: uppercase;"
+            f"font-weight: bold; font-size: 10px; color: {_TEXT_DIM};"
         )
+        _letterspace(hdr)
 
         self._img = QLabel("No frame")
         self._img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._img.setStyleSheet(
-            "background-color: #0d0d1a; border-radius: 8px; color: #45475a;"
+            f"background-color: {_PANEL_BG}; border: 1px solid {_BORDER};"
+            f"border-radius: 14px; color: {_TEXT_DIM};"
         )
         self._img.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -641,13 +791,13 @@ class TunableSlider(QWidget):
 
         row = QHBoxLayout()
         lbl = QLabel(label)
-        lbl.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
         self._val = QLabel(self._fmt(default))
         self._val.setStyleSheet(
-            "color: #a6e3a1; font-family: monospace; font-size: 10px;"
+            f"color: {_VALUE}; font-family: {_MONO}; font-size: 11px;"
         )
         self._val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._val.setFixedWidth(38)
+        self._val.setFixedWidth(42)
         row.addWidget(lbl, stretch=1)
         row.addWidget(self._val)
 
@@ -674,18 +824,93 @@ class TunableSlider(QWidget):
     def int_value(self) -> int:
         return int(self.value())
 
+    def set_value(self, v: float) -> None:
+        """Programmatic move; emits changed exactly like a user drag."""
+        self._slider.setValue(round(v * self._scale))
+
+
+class BlurLayerRow(QWidget):
+    """One layer of the blur stack: kind selector + strength + remove."""
+
+    changed = pyqtSignal()
+    remove_clicked = pyqtSignal(object)   # emits self
+
+    _RANGES = {"gaussian": (3, 151, 71), "pixelate": (2, 40, 10)}
+
+    def __init__(self, kind: str = "gaussian",
+                 strength: Optional[int] = None) -> None:
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        self._kind = QComboBox()
+        self._kind.addItem("Gaussian", "gaussian")
+        self._kind.addItem("Pixelate", "pixelate")
+        self._kind.setCurrentIndex(0 if kind == "gaussian" else 1)
+
+        lo, hi, default = self._RANGES[kind]
+        self._sl = QSlider(Qt.Orientation.Horizontal)
+        self._sl.setMinimum(lo)
+        self._sl.setMaximum(hi)
+        self._sl.setValue(strength if strength is not None else default)
+
+        self._val = QLabel(str(self._sl.value()))
+        self._val.setStyleSheet(
+            f"color: {_VALUE}; font-family: {_MONO}; font-size: 11px;")
+        self._val.setFixedWidth(28)
+        self._val.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self._rm = QPushButton("✕")
+        self._rm.setProperty("ghost", "true")
+        self._rm.setFixedWidth(24)
+        self._rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rm.setToolTip("Remove layer")
+
+        self._kind.currentIndexChanged.connect(self._on_kind_change)
+        self._sl.valueChanged.connect(self._on_strength_change)
+        self._rm.clicked.connect(lambda: self.remove_clicked.emit(self))
+
+        lay.addWidget(self._kind)
+        lay.addWidget(self._sl, stretch=1)
+        lay.addWidget(self._val)
+        lay.addWidget(self._rm)
+
+    def _on_kind_change(self) -> None:
+        lo, hi, default = self._RANGES[self._kind.currentData()]
+        self._sl.blockSignals(True)
+        self._sl.setMinimum(lo)
+        self._sl.setMaximum(hi)
+        self._sl.setValue(default)
+        self._sl.blockSignals(False)
+        self._val.setText(str(default))
+        self.changed.emit()
+
+    def _on_strength_change(self, v: int) -> None:
+        self._val.setText(str(v))
+        self.changed.emit()
+
+    def set_removable(self, removable: bool) -> None:
+        self._rm.setEnabled(removable)
+
+    def value(self) -> tuple[str, int]:
+        return self._kind.currentData(), int(self._sl.value())
+
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Face Blur Pipeline Inspector")
+        self.setWindowTitle("Automated Video Privacy Pipeline")
         self.resize(1360, 860)
 
         self._params = Params()
+        self._applying_preset = False
         self._cap: Optional[cv2.VideoCapture] = None
         self._video_path: Optional[str] = None
+        self._video_fps = 25.0
         self._total_frames = 0
         self._current_frame_idx = 0
         self._pending_frame: Optional[np.ndarray] = None
@@ -723,7 +948,7 @@ class MainWindow(QMainWindow):
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color: #313244;")
+        sep.setStyleSheet(f"color: {_BORDER}; background-color: {_BORDER};")
         lay.addWidget(sep)
 
         lay.addWidget(self._build_controls())
@@ -755,15 +980,17 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self._frame_lbl = QLabel("—  /  —")
-        self._frame_lbl.setStyleSheet("color: #6c7086; font-size: 10px;")
+        self._frame_lbl.setStyleSheet(
+            f"color: {_TEXT_MID}; font-family: {_MONO}; font-size: 11px;")
         self._frame_lbl.setFixedWidth(84)
 
         self._fps_lbl = QLabel("— fps")
-        self._fps_lbl.setStyleSheet("color: #6c7086; font-size: 10px;")
+        self._fps_lbl.setStyleSheet(
+            f"color: {_VALUE}; font-family: {_MONO}; font-size: 11px;")
         self._fps_lbl.setFixedWidth(60)
 
         self._status_lbl = QLabel("Open a video to begin")
-        self._status_lbl.setStyleSheet("color: #585b70; font-size: 10px;")
+        self._status_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
 
         lay.addWidget(self._open_btn)
         lay.addWidget(self._play_btn)
@@ -791,22 +1018,73 @@ class MainWindow(QMainWindow):
 
     def _build_controls(self) -> QWidget:
         ctrl = QWidget()
-        lay = QHBoxLayout(ctrl)
+        lay = QVBoxLayout(ctrl)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        lay.addWidget(self._build_detection_group(), stretch=5)
-        lay.addWidget(self._build_blur_group(),      stretch=6)
-        lay.addWidget(self._build_tracking_group(),  stretch=2)
+        lay.addWidget(self._build_presets_bar())
+
+        # Full tunable control, revealed by the Advanced toggle.
+        self._advanced = QWidget()
+        adv = QHBoxLayout(self._advanced)
+        adv.setContentsMargins(0, 0, 0, 0)
+        adv.setSpacing(8)
+        adv.addWidget(self._build_detection_group(), stretch=5)
+        adv.addWidget(self._build_blur_group(),      stretch=7)
+        adv.addWidget(self._build_tracking_group(),  stretch=3)
+        self._advanced.setVisible(False)
+        lay.addWidget(self._advanced)
         return ctrl
 
+    def _build_presets_bar(self) -> QWidget:
+        bar = QWidget()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(6)
+
+        cap = QLabel("PRESETS")
+        cap.setStyleSheet(
+            f"color: {_TEXT_DIM}; font-size: 10px; font-weight: bold;")
+        _letterspace(cap)
+        lay.addWidget(cap)
+        lay.addSpacing(4)
+
+        self._preset_btns: dict[str, QPushButton] = {}
+        for name, (tip, _p) in PRESETS.items():
+            btn = QPushButton(name)
+            btn.setProperty("chip", "true")
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _c, n=name: self._apply_preset(n))
+            self._preset_btns[name] = btn
+            lay.addWidget(btn)
+        self._preset_btns["Balanced"].setChecked(True)
+
+        # Lights up when sliders diverge from every preset.
+        self._custom_lbl = QLabel("custom")
+        self._custom_lbl.setStyleSheet(
+            f"color: {_VALUE}; font-size: 10px; font-style: italic;")
+        self._custom_lbl.setVisible(False)
+        lay.addWidget(self._custom_lbl)
+
+        lay.addStretch()
+
+        self._adv_btn = QPushButton("Advanced  ▾")
+        self._adv_btn.setProperty("ghost", "true")
+        self._adv_btn.setCheckable(True)
+        self._adv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._adv_btn.toggled.connect(self._toggle_advanced)
+        lay.addWidget(self._adv_btn)
+        return bar
+
     def _build_detection_group(self) -> QGroupBox:
-        grp = QGroupBox("Detection")
+        grp = QGroupBox("DETECTION")
         lay = QGridLayout(grp)
         lay.setSpacing(6)
 
         size_lbl = QLabel("Target Size")
-        size_lbl.setStyleSheet("color: #a6adc8; font-size: 10px;")
+        size_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
         self._size_combo = QComboBox()
         for sz in (320, 480, 640, 800, 1024):
             self._size_combo.addItem(f"{sz} px", sz)
@@ -828,34 +1106,119 @@ class MainWindow(QMainWindow):
         return grp
 
     def _build_blur_group(self) -> QGroupBox:
-        grp = QGroupBox("Blur")
-        lay = QGridLayout(grp)
-        lay.setSpacing(6)
-        lay.setColumnStretch(0, 1)
-        lay.setColumnStretch(1, 1)
+        grp = QGroupBox("BLUR")
+        lay = QHBoxLayout(grp)
+        lay.setSpacing(12)
 
-        self._expand_sl = TunableSlider("Hull Expand",    0.00, 2.00, 0.45)
-        self._hair_sl   = TunableSlider("Hair Extra",     0.00, 3.00, 0.90)
-        self._k_sl      = TunableSlider("Gaussian K",     3,    151,  71,  decimals=0)
-        self._block_sl  = TunableSlider("Pixelate Block", 2,    40,   10,  decimals=0)
-
-        for sl in (self._expand_sl, self._hair_sl, self._k_sl, self._block_sl):
+        self._expand_sl = TunableSlider("Hull Expand", 0.00, 2.00, 0.45)
+        self._hair_sl   = TunableSlider("Hair Extra",  0.00, 3.00, 0.90)
+        for sl in (self._expand_sl, self._hair_sl):
             sl.changed.connect(self._on_param_change)
 
-        lay.addWidget(self._expand_sl, 0, 0)
-        lay.addWidget(self._hair_sl,   1, 0)
-        lay.addWidget(self._k_sl,      0, 1)
-        lay.addWidget(self._block_sl,  1, 1)
+        left = QVBoxLayout()
+        left.setSpacing(6)
+        left.addWidget(self._expand_sl)
+        left.addWidget(self._hair_sl)
+        left.addStretch()
+
+        # Stackable blur layers, applied top to bottom.
+        cap = QLabel("LAYER STACK")
+        cap.setStyleSheet(
+            f"color: {_TEXT_DIM}; font-size: 10px; font-weight: bold;")
+        _letterspace(cap)
+        self._layers_box = QVBoxLayout()
+        self._layers_box.setSpacing(2)
+        self._add_layer_btn = QPushButton("+ Add Layer")
+        self._add_layer_btn.setProperty("ghost", "true")
+        self._add_layer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_layer_btn.clicked.connect(self._on_add_layer)
+
+        right = QVBoxLayout()
+        right.setSpacing(4)
+        right.addWidget(cap)
+        right.addLayout(self._layers_box)
+        right.addWidget(self._add_layer_btn,
+                        alignment=Qt.AlignmentFlag.AlignLeft)
+        right.addStretch()
+
+        lay.addLayout(left, stretch=4)
+        lay.addLayout(right, stretch=6)
+
+        self._layer_rows: list[BlurLayerRow] = []
+        self._set_blur_layers(self._params.blur_layers)
         return grp
 
+    # ── blur layer stack management ────────────────────────────────────────────
+
+    _MAX_LAYERS = 5
+
+    def _new_layer_row(self, kind: str, strength: Optional[int]) -> BlurLayerRow:
+        row = BlurLayerRow(kind, strength)
+        row.changed.connect(self._on_param_change)
+        row.remove_clicked.connect(self._on_remove_layer)
+        self._layer_rows.append(row)
+        self._layers_box.addWidget(row)
+        return row
+
+    def _refresh_layer_buttons(self) -> None:
+        removable = len(self._layer_rows) > 1
+        for row in self._layer_rows:
+            row.set_removable(removable)
+        self._add_layer_btn.setEnabled(len(self._layer_rows) < self._MAX_LAYERS)
+
+    def _set_blur_layers(self, layers: tuple[tuple[str, int], ...]) -> None:
+        """Rebuild the rows without emitting per-row change signals."""
+        for row in self._layer_rows:
+            self._layers_box.removeWidget(row)
+            row.deleteLater()
+        self._layer_rows = []
+        for kind, strength in (layers or DEFAULT_BLUR_LAYERS):
+            self._new_layer_row(kind, strength)
+        self._refresh_layer_buttons()
+
+    def _blur_layers_value(self) -> tuple[tuple[str, int], ...]:
+        return tuple(row.value() for row in self._layer_rows)
+
+    def _on_add_layer(self) -> None:
+        if len(self._layer_rows) >= self._MAX_LAYERS:
+            return
+        self._new_layer_row("gaussian", None)
+        self._refresh_layer_buttons()
+        self._on_param_change()
+
+    def _on_remove_layer(self, row: BlurLayerRow) -> None:
+        if len(self._layer_rows) <= 1:
+            return
+        self._layer_rows.remove(row)
+        self._layers_box.removeWidget(row)
+        row.deleteLater()
+        self._refresh_layer_buttons()
+        self._on_param_change()
+
     def _build_tracking_group(self) -> QGroupBox:
-        grp = QGroupBox("Tracking")
+        grp = QGroupBox("TRACKING")
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
 
         self._iou_sl = TunableSlider("Match IoU", 0.05, 0.95, 0.30)
         self._iou_sl.changed.connect(self._on_param_change)
+        # How long a lost face keeps its blur, coasting on Kalman prediction.
+        self._hold_sl = TunableSlider("Hold (s)", 0.0, 5.0, 2.0, decimals=1)
+        self._hold_sl.changed.connect(self._on_param_change)
+
+        self._pose_btn = QPushButton("Pose Assist")
+        self._pose_btn.setProperty("chip", "true")
+        self._pose_btn.setCheckable(True)
+        self._pose_btn.setChecked(True)
+        self._pose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pose_btn.setToolTip(
+            "Track the head via body pose when the face detector loses it\n"
+            "(person turns away / looks down) so the blur stays put.")
+        self._pose_btn.toggled.connect(lambda _c: self._on_param_change())
+
         lay.addWidget(self._iou_sl)
+        lay.addWidget(self._hold_sl)
+        lay.addWidget(self._pose_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addStretch()
         return grp
 
@@ -878,6 +1241,7 @@ class MainWindow(QMainWindow):
             self._on_status(f"Cannot open: {path}")
             return
         self._video_path = path
+        self._video_fps = self._cap.get(cv2.CAP_PROP_FPS) or 25.0
         self._total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._frame_slider.setMaximum(max(0, self._total_frames - 1))
         self._frame_slider.blockSignals(True)
@@ -1003,6 +1367,39 @@ class MainWindow(QMainWindow):
 
     # ── Param handling ────────────────────────────────────────────────────────
 
+    def _toggle_advanced(self, checked: bool) -> None:
+        self._advanced.setVisible(checked)
+        self._adv_btn.setText("Advanced  ▴" if checked else "Advanced  ▾")
+
+    def _apply_preset(self, name: str) -> None:
+        _tip, p = PRESETS[name]
+        self._applying_preset = True
+        try:
+            idx = self._size_combo.findData(p.target_size)
+            if idx >= 0:
+                self._size_combo.setCurrentIndex(idx)
+            self._det_score_sl.set_value(p.det_score)
+            self._face_aspect_sl.set_value(p.face_aspect)
+            self._closeup_sl.set_value(p.close_up_ratio)
+            self._expand_sl.set_value(p.blur_expand)
+            self._hair_sl.set_value(p.blur_hair_extra)
+            self._set_blur_layers(p.blur_layers)
+            self._iou_sl.set_value(p.match_iou)
+            self._hold_sl.set_value(p.hold_secs)
+            self._pose_btn.setChecked(p.pose_assist)
+            # Re-submit even when no slider actually moved (e.g. re-click).
+            self._on_param_change()
+        finally:
+            self._applying_preset = False
+        for n, btn in self._preset_btns.items():
+            btn.setChecked(n == name)
+        self._custom_lbl.setVisible(False)
+
+    def _mark_custom(self) -> None:
+        for btn in self._preset_btns.values():
+            btn.setChecked(False)
+        self._custom_lbl.setVisible(True)
+
     def _on_target_size_change(self) -> None:
         self._params.target_size = self._size_combo.currentData()
         self._on_param_change()
@@ -1013,10 +1410,13 @@ class MainWindow(QMainWindow):
         self._params.close_up_ratio = self._closeup_sl.value()
         self._params.blur_expand    = self._expand_sl.value()
         self._params.blur_hair_extra = self._hair_sl.value()
-        self._params.blur_k         = self._k_sl.int_value() | 1   # ensure odd
-        self._params.blur_block     = max(2, self._block_sl.int_value())
+        self._params.blur_layers    = self._blur_layers_value()
         self._params.match_iou      = self._iou_sl.value()
+        self._params.hold_secs      = self._hold_sl.value()
+        self._params.pose_assist    = self._pose_btn.isChecked()
         self._worker.update_params(self._params)
+        if not self._applying_preset:
+            self._mark_custom()
         if self._exporting:
             return  # export loop re-reads params each frame; it owns the panels
         self._debounce.start(120)
@@ -1025,7 +1425,8 @@ class MainWindow(QMainWindow):
         if self._exporting:
             return
         if self._pending_frame is not None:
-            self._worker.submit(self._pending_frame, self._params)
+            self._worker.submit(self._pending_frame, self._params,
+                                self._current_frame_idx, self._video_fps)
 
     # ── Worker callbacks ──────────────────────────────────────────────────────
 
