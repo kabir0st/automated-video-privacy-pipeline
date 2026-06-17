@@ -24,7 +24,9 @@ Nothing is uploaded, ever.
 ## Features
 
 - **Three-panel live inspector.** Before, Tracking, and After side by side, so
-  you see exactly what the pipeline sees and exactly what gets exported.
+  you see exactly what the pipeline sees and exactly what gets exported. The
+  Tracking panel overlays the MediaPipe pose skeleton and the coarse head box fed
+  to the tracker, so you can watch pose assist keep a lost face covered.
 - **Presets first, sliders when you want them.** Pick a preset chip for the
   common cases, or open the Advanced panel for full control of every tunable.
   Changes re-render the current frame live.
@@ -209,6 +211,7 @@ src/
     pose_head.py     MediaPipe pose to head boxes, for lost-track revival
     smoother.py      Savitzky-Golay landmark smoother with occlusion hold
     utils.py         hull masks + stackable blur layers + mask continuity
+    video_writer.py  streaming ffmpeg exporter (handles >4 GiB output)
 scripts/
   capture_screenshots.py   regenerates the README screenshots, headless
 build_exe.sh         standalone Windows .exe via PyInstaller (run from WSL2)

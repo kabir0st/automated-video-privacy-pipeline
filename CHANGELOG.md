@@ -1,0 +1,77 @@
+# Changelog
+
+All notable changes to this project are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.0] — 2026-06-17
+
+This release is about **tracking and estimating faces more reliably** — keeping
+the blur locked on a face through head turns, glances down, and partial
+occlusion, instead of flickering off the moment the detector loses a frame.
+
+### Tracking & estimation
+
+- **Kalman-filter face tracker** (`src/libs/tracker.py`). Each face owns a
+  constant-velocity Kalman filter with state `[cx, cy, w, h, vx, vy]` (size is a
+  random walk). Every frame it *predicts* the head's position and then *corrects*
+  from measurements, so when the detector drops a face the track coasts on
+  prediction rather than disappearing. Velocity is damped on every coasting frame
+  so a lost box can't sail across the frame, and a track is dropped only after
+  `Hold (s)` seconds without any correction or once it leaves the frame. This
+  replaced the earlier boxmot/ByteTrack wrapper, which only ever returned tracks
+  matched in the current frame.
+- **Pose-estimation head-box recovery** (`src/libs/pose_head.py`). MediaPipe
+  Pose still sees the *person* when a frontal face detector gives up, so a coarse
+  head box is derived from the pose keypoints — ear-to-ear width when visible,
+  falling back to eye span, then to an estimate hung above the shoulders for a
+  full turn-away. That box revives a lost track as a *weak* correction (it pins
+  position but barely nudges size), keeping the blur on even when the face is
+  turned away or seen from behind.
+- **Skeleton & head-box overlay in the Tracking panel.** The inspector now draws
+  the MediaPipe pose skeleton and the coarse head box that is fed to the tracker,
+  so you can see pose assist working frame by frame.
+- **Other estimation improvements:**
+  - Distance-fallback matching attaches a detection to a track by centre
+    proximity when fast motion drops IoU to zero between consecutive frames.
+  - Close-up faces (filling most of the frame) are re-detected on an upscaled
+    crop for tighter 106-point landmarks.
+  - Savitzky-Golay landmark smoothing (`src/libs/smoother.py`) removes
+    frame-to-frame jitter so the blur mask doesn't wiggle.
+  - Strong (face detection) corrections override weak (pose) ones, so the filter
+    snaps back to the real face the moment it reappears.
+
+### Added
+
+- Skeleton overlay and head-box visualization in the inspector's Tracking panel.
+- Streaming, ffmpeg-based video writer (`src/libs/video_writer.py`).
+- `docs/TECH_STACK.md` — technology stack and architecture documentation.
+
+### Fixed
+
+- Exports failing or corrupting past ~4 GiB: replaced the previous writer with a
+  streaming ffmpeg-based one (`src/libs/video_writer.py`).
+- Documentation drift — corrected the smoother class name and defaults, the blur
+  pipeline example, the pose head-box description, and the file listings in
+  `docs/TECH_STACK.md`.
+
+### Docs
+
+- README and `docs/TECH_STACK.md` refreshed to match the current code.
+
+## [0.1.0-beta] — 2026-06-12
+
+Initial public preview.
+
+- InsightFace SCRFD face detection with 106-point landmarks (`src/libs/face_app.py`).
+- Per-face Kalman tracker with detection-gap coasting (`src/libs/tracker.py`).
+- MediaPipe pose head-region recovery for lost faces (`src/libs/pose_head.py`).
+- Stackable Gaussian + pixelate blur over an expanded landmark-hull mask
+  (`src/libs/utils.py`).
+- PyQt6 three-panel inspector (Before / Tracking / After) with presets and live
+  tuning (`src/ui.py`).
+- Headless CLI for batch jobs (`src/cli.py`).
+- Standalone Windows `.exe` build via PyInstaller (`build_exe.sh`).
+
+[0.2.0]: https://github.com/kabir0st/automated-video-privacy-pipeline/releases/tag/v0.2.0
+[0.1.0-beta]: https://github.com/kabir0st/automated-video-privacy-pipeline/releases/tag/0.1.0-beta-0.1

@@ -15,7 +15,7 @@ Video Frame
     ↓
 [Smoothing] → Savitzky-Golay Filter (landmark noise reduction)
     ↓
-[Masking] → Convex Hull + Expansion (landmarkitted mask)
+[Masking] → Convex Hull + Expansion (landmark-fitted mask)
     ↓
 [Blurring] → PyTorch / NumPy (Gaussian + Pixelate layers)
     ↓
@@ -62,7 +62,8 @@ faces = face_app.get(frame, target_size=640)
 - **State:** Position (cx, cy), size (w, h), velocity (vx, vy) — 6 numbers per face
 - **Prediction:** "If this face was moving right at 10 px/frame, it's probably 10 px further right now"
 - **Correction:** When a new detection arrives, the filter updates the state to match observed position
-- **Coasting:** If detection drops, the filter keeps predicting for up to `hold_secs` (default 2.0), then the track dies
+- **Coasting:** If detection drops, the filter keeps predicting for up to `hold_secs` (default 2.0), then the track dies. Velocity is damped on each coasting frame so a lost box cannot drift across the frame
+- **Fallbacks:** Detections are matched to tracks by IoU, with a centre-distance fallback so fast motion (which drops IoU to zero between frames) doesn't break the association
 
 **Example:**
 ```
@@ -86,9 +87,13 @@ Frame 4: After 2 seconds, track is dropped if no new detection arrives
 - Lightweight (~5 MB model) and fast
 
 **How it's used:**
-- MediaPipe detects 33 body landmarks (shoulders, elbows, etc.)
-- We extract head position from torso landmarks and feed it to the Kalman filter as a *weak correction*
+- MediaPipe detects 33 body landmarks (nose, eyes, ears, shoulders, etc.)
+- A coarse head box is built primarily from the head landmarks — ear-to-ear width
+  when visible (robust even from behind), falling back to eye span, and finally to
+  an estimate hung above the shoulders for a full turn-away — then fed to the
+  Kalman filter as a *weak correction* (it pins position but barely moves size)
 - Strong corrections (new face detection) override weak ones, so if the face comes back into view, the filter snaps to the real detection
+- The inspector's Tracking panel overlays the pose skeleton and this head box, so you can confirm pose assist is alive frame by frame
 
 **Example:**
 ```
@@ -109,7 +114,7 @@ Blur stays on as the person walks out of frame
 
 **What it does:** Reduces jitter in the 106 landmarks so the blur mask doesn't wiggle frame-to-frame.
 
-**Where:** `libs/smoother.py` → `SavitzkyGolaySmoother`
+**Where:** `libs/smoother.py` → `LandmarkSmoother`
 
 **Why Savitzky-Golay?**
 - Preserves the shape of the landmark cloud while removing high-frequency noise
@@ -117,8 +122,8 @@ Blur stays on as the person walks out of frame
 - Better than simple averaging because it doesn't blur edges
 
 **How it's used:**
-- Runs over a sliding window of the last N frames (default: 3 frames)
-- Fits a low-degree polynomial to each landmark's trajectory
+- Runs over a sliding window of recent frames (default: 15-frame window, polynomial order 2)
+- Fits the polynomial to each landmark's trajectory and reads off the smoothed latest point
 - Outputs smoothed positions that track real motion without jitter
 
 ---
@@ -174,7 +179,8 @@ Mask polygon: A shape that covers face + ears + hair
 ```python
 # Stack layers: Gaussian 71 kernel, then Pixelate 10 px blocks
 layers = [("gaussian", 71), ("pixelate", 10)]
-blurred = pipeline.blur(frame, mask, layers)
+pipeline.reconfigure(layers)
+pipeline.apply(frame, mask)  # blurs the masked region of `frame` in place
 ```
 
 ---
@@ -258,6 +264,7 @@ libs/
   pose_head.py           MediaPipe pose → head boxes
   smoother.py            Savitzky-Golay smoothing
   utils.py               MaskBuilder + BlurPipeline
+  video_writer.py        streaming ffmpeg exporter (handles >4 GiB output)
 ```
 
 ---
