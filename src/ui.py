@@ -14,7 +14,7 @@ import threading
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Crash log next to the temp dir so frozen (windowed) builds, which have no
 # console, still leave a readable traceback behind.
@@ -67,7 +67,7 @@ from libs.face_app import FaceApp
 from libs.models import preflight as preflight_models
 from libs.pose_head import _VIS_THRESHOLD
 from libs.pipeline import detect, make_pose_backend
-from libs.tracker import KalmanFaceTracker
+from libs.tracker import SubjectTracker
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
@@ -327,7 +327,7 @@ PRESETS: dict[str, tuple[str, Params]] = {
 }
 
 # Overlay tag per tracking source, drawn after the track id.
-_SOURCE_TAGS = {"face": "", "head": "·pose", "coast": "·hold", "anchor": "·rf-detr"}
+_SOURCE_TAGS = {"face": "", "head": "·seg", "hold": "·hold"}
 
 # Standard BlazePose 33-point skeleton connections, used to draw the pose
 # overlay on the tracking panel so pose estimation is visibly alive.
@@ -357,10 +357,10 @@ _KPT_THR_133 = 0.3   # RTMW per-keypoint confidence to draw
 _POSE_EDGE_COLOUR = (220, 220, 220)
 _POSE_BOX_COLOUR = (0, 200, 255)
 # RF-DETR's contribution, drawn only on the TRACKING panel: whole-person boxes
-# (magenta) and the safety-net head anchors derived from them (amber). Distinct
-# from the pose/track palettes so it reads as a separate layer.
+# (magenta) and the head region located on each person's silhouette (amber).
+# Distinct from the pose/track palettes so it reads as a separate layer.
 _PERSON_BOX_COLOUR = (255, 0, 255)
-_ANCHOR_BOX_COLOUR = (0, 140, 255)
+_HEAD_REGION_COLOUR = (0, 140, 255)
 # Translucent person silhouette from the RF-DETR ``-seg`` masks (spring green).
 _SEG_MASK_COLOUR = (80, 220, 120)
 
@@ -459,40 +459,35 @@ def _draw_tracking_overlay(
     tracking: np.ndarray,
     tracked: list,
     polys: dict,
-    poses: list,
-    head_boxes: list,
-    person_boxes: list,
-    anchors: list,
-    person_masks: list,
+    subjects: list,
+    pf,
 ) -> None:
     """Composite every detection layer onto the TRACKING panel copy.
 
     Shared by the live-preview and export paths so the middle panel shows the
-    same thing in both: RF-DETR seg silhouettes (translucent base), track
-    outlines, pose skeletons, the coarse pose head boxes, RF-DETR person boxes
-    and the safety-net anchors. Drawn on a frame copy only — never on the
-    written/blurred output.
+    same thing in both, bottom layer up: RF-DETR seg silhouettes (the body
+    truth, translucent green), RF-DETR person boxes (magenta), pose skeletons
+    (white), each subject's located head region (amber), and the per-track blur
+    outlines. Drawn on a frame copy only — never on the written/blurred output.
     """
-    _draw_seg_masks(tracking, person_masks)
-    for t in tracked:
-        bbox = t.face.bbox if t.face is not None else t.bbox
-        _draw_outline(tracking, polys.get(t.track_id), bbox, t.track_id,
-                      _track_colour(t.track_id), _SOURCE_TAGS.get(t.source, ""))
-    for pose in poses:
-        _draw_pose(tracking, pose)
-    for hb, _score in head_boxes:
-        cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
-                      (int(hb[2]), int(hb[3])), _POSE_BOX_COLOUR, 1)
-    for pb, _score in person_boxes:
+    _draw_seg_masks(tracking, pf.person_masks)
+    for pb, _score in pf.person_boxes:
         x1, y1 = int(pb[0]), int(pb[1])
         cv2.rectangle(tracking, (x1, y1), (int(pb[2]), int(pb[3])),
                       _PERSON_BOX_COLOUR, 1)
         cv2.putText(tracking, "rf-detr", (x1, max(0, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, _PERSON_BOX_COLOUR, 1,
                     cv2.LINE_AA)
-    for ab, _score in anchors:
-        cv2.rectangle(tracking, (int(ab[0]), int(ab[1])),
-                      (int(ab[2]), int(ab[3])), _ANCHOR_BOX_COLOUR, 1)
+    for pose in pf.poses:
+        _draw_pose(tracking, pose)
+    for s in subjects:
+        hb = s.head
+        cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
+                      (int(hb[2]), int(hb[3])), _HEAD_REGION_COLOUR, 1)
+    for t in tracked:
+        bbox = t.face.bbox if t.face is not None else t.bbox
+        _draw_outline(tracking, polys.get(t.track_id), bbox, t.track_id,
+                      _track_colour(t.track_id), _SOURCE_TAGS.get(t.source, ""))
 
 
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -528,8 +523,8 @@ class ProcessWorker(QThread):
         self._pose = None
         self._pose_key: Optional[tuple[str, str]] = None
         # Preview tracking state persists across sequential frames (Play),
-        # so detection-gap coasting is visible live; any scrub/jump resets it.
-        self._pv_tracker: Optional[KalmanFaceTracker] = None
+        # so head smoothing/hold is visible live; any scrub/jump resets it.
+        self._pv_tracker: Optional[SubjectTracker] = None
         self._pv_masks = MaskBuilder()
         self._pv_last_idx = -2
         self._preview_lock = threading.Lock()
@@ -667,25 +662,22 @@ class ProcessWorker(QThread):
             self._pose_key = key
         return self._pose
 
-    def _detect(
-        self, frame: np.ndarray, p: Params
-    ) -> tuple[list, list, list, list, list, list]:
-        """Detection: (faces, head_boxes, poses, anchors, person_boxes, person_masks).
+    def _detect(self, frame: np.ndarray, p: Params) -> tuple[list, Any]:
+        """Detection: ``(subjects, pose_frame)``.
 
-        ``anchors`` are the RF-DETR safety-net head regions for the tracker's
-        ``anchor_provider``; ``person_boxes`` are RF-DETR's whole-person boxes
-        and ``person_masks`` its per-person ``-seg`` silhouettes, both drawn on
-        the TRACKING panel so its contribution is visible.
+        ``subjects`` are the per-person anonymisation targets (body box +
+        silhouette + on-body head region + refining face); ``pose_frame`` carries
+        the people/masks/poses drawn on the TRACKING panel so the segmentation
+        and pose layers stay visible.
         """
         assert self._app is not None
         pose = self._ensure_pose(p)
-        faces, head_boxes, anchors, pf = detect(
+        subjects, pf = detect(
             self._app, frame, pose,
             det_score=p.det_score, face_aspect=p.face_aspect,
             close_up_ratio=p.close_up_ratio,
             close_up_target=CLOSE_UP_TARGET_SIZE)
-        return (faces, head_boxes, pf.poses, anchors,
-                pf.person_boxes, pf.person_masks)
+        return subjects, pf
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
@@ -699,16 +691,15 @@ class ProcessWorker(QThread):
         tracking = frame.copy()
         blurred = frame.copy()
 
-        # Ensembled detection (SCRFD ⊕ pose) — pose runs once here; its head
-        # boxes feed the tracker and its skeletons are drawn on the overlay.
-        faces, head_boxes, poses, anchors, person_boxes, person_masks = \
-            self._detect(frame, p)
+        # Segmentation-first detection: RF-DETR people + masks, RTMW poses, and
+        # one head-located subject per person (refined to a face when visible).
+        subjects, pf = self._detect(frame, p)
 
-        # Sequential frames (Play) keep the tracker so gap-coasting shows in
-        # the live preview; scrubbing or single-frame inspection resets it.
+        # Sequential frames (Play) keep the tracker so head smoothing/hold shows
+        # in the live preview; scrubbing or single-frame inspection resets it.
         if self._pv_tracker is None or frame_idx < 0 \
                 or frame_idx != self._pv_last_idx + 1:
-            self._pv_tracker = KalmanFaceTracker(
+            self._pv_tracker = SubjectTracker(
                 fps=fps, match_iou=p.match_iou, hold_secs=p.hold_secs)
             self._pv_masks.reset()
         else:
@@ -716,10 +707,7 @@ class ProcessWorker(QThread):
                                        hold_secs=p.hold_secs)
         self._pv_last_idx = frame_idx
 
-        tracked = self._pv_tracker.update(
-            faces, frame.shape,
-            (lambda: head_boxes) if head_boxes else None,
-            (lambda: anchors) if anchors else None)
+        tracked = self._pv_tracker.update(subjects, frame.shape)
 
         # Build blur mask
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
@@ -742,8 +730,7 @@ class ProcessWorker(QThread):
                           _SOURCE_TAGS.get(t.source, ""))
 
         # TRACKING panel: every detection layer, incl. the RF-DETR seg masks.
-        _draw_tracking_overlay(tracking, tracked, polys, poses, head_boxes,
-                               person_boxes, anchors, person_masks)
+        _draw_tracking_overlay(tracking, tracked, polys, subjects, pf)
 
         elapsed = time.perf_counter() - t0
         return orig, tracking, blurred, 1.0 / max(elapsed, 1e-6)
@@ -754,26 +741,21 @@ class ProcessWorker(QThread):
         self,
         frame: np.ndarray,
         p: Params,
-        tracker: KalmanFaceTracker,
+        tracker: SubjectTracker,
         masks: MaskBuilder,
     ) -> tuple[np.ndarray, list, dict[int, Optional[np.ndarray]], tuple]:
         """Process one frame with the persistent offline pipeline.
 
-        Returns ``(blurred frame, tracked faces, polys, overlay)`` where
-        ``overlay`` is ``(poses, head_boxes, person_boxes, anchors,
-        person_masks)`` — fed to ``_draw_tracking_overlay`` so the export
-        preview's TRACKING panel matches the live one.
+        Returns ``(blurred frame, tracked, polys, overlay)`` where ``overlay`` is
+        ``(subjects, pose_frame)`` — fed to ``_draw_tracking_overlay`` so the
+        export preview's TRACKING panel matches the live one.
         """
         self._ensure_model(p.target_size)
         fh, fw = frame.shape[:2]
 
-        faces, head_boxes, poses, anchors, person_boxes, person_masks = \
-            self._detect(frame, p)
+        subjects, pf = self._detect(frame, p)
         tracker.configure(match_iou=p.match_iou, hold_secs=p.hold_secs)
-        tracked = tracker.update(
-            faces, frame.shape,
-            (lambda: head_boxes) if head_boxes else None,
-            (lambda: anchors) if anchors else None)
+        tracked = tracker.update(subjects, frame.shape)
 
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
         polys: dict[int, Optional[np.ndarray]] = {}
@@ -786,7 +768,7 @@ class ProcessWorker(QThread):
         blurred = frame.copy()
         self._blur.reconfigure(p.blur_layers)
         self._blur.apply(blurred, blur_mask)
-        overlay = (poses, head_boxes, person_boxes, anchors, person_masks)
+        overlay = (subjects, pf)
         return blurred, tracked, polys, overlay
 
     def _paused_preview(self, frame: np.ndarray) -> None:
@@ -832,8 +814,8 @@ class ProcessWorker(QThread):
             return
 
         p0 = self._latest_params()
-        tracker = KalmanFaceTracker(fps=fps, match_iou=p0.match_iou,
-                                    hold_secs=p0.hold_secs)
+        tracker = SubjectTracker(fps=fps, match_iou=p0.match_iou,
+                                 hold_secs=p0.hold_secs)
         masks = MaskBuilder()
         idx = 0
         cancelled = False

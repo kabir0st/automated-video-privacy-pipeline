@@ -236,8 +236,8 @@ def add_bbox_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
 
 
 def add_ellipse_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
-    """Fill an ellipse inscribed in bbox — head-shaped fallback for a privacy
-    safety-net anchor track, which has only a coarse head box and no landmarks."""
+    """Fill an ellipse inscribed in bbox — head-shaped blur for a head region
+    that has no detected face landmarks (the blur is clipped to the body next)."""
     fh, fw = mask.shape[:2]
     x1, y1, x2, y2 = (float(v) for v in bbox[:4])
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -245,6 +245,23 @@ def add_ellipse_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
     if 0 <= cx < fw and 0 <= cy < fh:
         cv2.ellipse(mask, (int(cx), int(cy)), (int(ax), int(ay)),
                     0, 0, 360, 255, -1)
+
+
+def clip_to_body(scratch: np.ndarray, body: "np.ndarray | None", bbox: np.ndarray) -> None:
+    """Zero out scratch (uint8 0/255) outside the person's silhouette, in-place.
+
+    The body silhouette (uint8, 1 inside) is grown a little — proportional to the
+    head height — to cover the hairline and absorb mask-edge error, then anything
+    outside it is dropped. No-op when no silhouette is available (face-only /
+    MediaPipe path), so the blur is never erased for want of a mask.
+    """
+    if body is None or not np.any(body):
+        return
+    k = max(3, int(round((float(bbox[3]) - float(bbox[1])) * 0.12)))
+    k |= 1  # odd kernel
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    grown = cv2.dilate(body.astype(np.uint8), kernel)
+    scratch[grown == 0] = 0
 
 
 def _map_landmarks(
@@ -269,12 +286,14 @@ def _map_landmarks(
 class MaskBuilder:
     """Builds the combined blur mask from tracker output, with continuity.
 
-    For a track matched to a face this frame the smoothed landmark hull is
-    used directly (and remembered together with the bbox it was observed
-    at). For a coasting or pose-corrected track the remembered hull is
-    translated/scaled onto the track's current Kalman box, so the blur
-    follows the head instead of freezing at the last detected position.
-    Tracks that never produced landmarks fall back to the rectangular box.
+    Each person's blur is built in a scratch layer and then clipped to that
+    person's body silhouette before compositing, so the blur never paints
+    background (``clip_to_body``). When a refining face was found this frame the
+    smoothed 106-pt hull is used (and remembered with the box it was seen at);
+    when a tracked person has no face this frame the remembered hull is
+    translated/scaled onto its current head box so the blur follows the head;
+    a person who never had a face falls back to a head-region ellipse. The
+    silhouette clip keeps every one of those on the body.
     """
 
     def __init__(self, smoother: "LandmarkSmoother | None" = None) -> None:
@@ -291,32 +310,27 @@ class MaskBuilder:
         expand: float = BLUR_EXPAND,
         hair_extra: float = BLUR_HAIR_EXTRA,
     ) -> np.ndarray | None:
-        """Stamp one track into mask; returns the hull polygon for overlays."""
+        """Stamp one person into mask, clipped to their body; return the hull."""
         tid, face, bbox = tracked.track_id, tracked.face, tracked.bbox
-        if face is not None and face.landmark_2d_106 is not None:
+        body = getattr(tracked, "mask", None)
+        scratch = np.zeros_like(mask)
+        poly: np.ndarray | None = None
+
+        if face is not None and getattr(face, "landmark_2d_106", None) is not None:
             smoothed = self._smoother.update(
                 tid, face.landmark_2d_106, float(face.det_score))
             self._mem[tid] = (smoothed, np.array(face.bbox[:4], dtype=np.float32))
-            return add_face_mask(mask, smoothed, expand=expand, hair_extra=hair_extra)
-        if tid in self._mem:
+            poly = add_face_mask(scratch, smoothed, expand=expand, hair_extra=hair_extra)
+        elif tid in self._mem:
             lm0, bb0 = self._mem[tid]
             moved = _map_landmarks(lm0, bb0, bbox)
-            return add_face_mask(mask, moved, expand=expand, hair_extra=hair_extra)
-        # Privacy safety-net anchor: a person RF-DETR sees but whose face was
-        # never detected, so there is no landmark history to remap. Blur the
-        # coarse head region as an ellipse, bypassing the area guard below — the
-        # box is a fresh, bounded RF-DETR head region, not a runaway coast box.
-        if getattr(tracked, "source", "") == "anchor":
-            add_ellipse_mask(mask, bbox)
-            return None
-        # No landmark history: only paint a bare box if it is a plausible head
-        # size. A runaway/oversized coasting box with no prior face must not
-        # blur a huge swath of the frame.
-        fh, fw = mask.shape[:2]
-        box_area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
-        if box_area <= 0.08 * fh * fw:
-            add_bbox_mask(mask, bbox)
-        return None
+            poly = add_face_mask(scratch, moved, expand=expand, hair_extra=hair_extra)
+        else:
+            add_ellipse_mask(scratch, bbox)
+
+        clip_to_body(scratch, body, bbox)
+        mask[scratch == 255] = 255
+        return poly
 
     def evict(self, active_ids: set[int]) -> None:
         """Drop state for tracks the tracker no longer reports."""

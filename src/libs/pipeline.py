@@ -1,55 +1,62 @@
-"""Shared detection front-end: SCRFD faces ⊕ RTMW pose, ensembled.
+"""Segmentation-first detection front-end: body is the basis of truth.
 
-The GUI's preview and export paths both need identical "detect faces, refine
-close-ups, ask the pose model for head boxes" logic. This module centralises it
-and adds the ensemble that fixes the two failures the project hit on its target
-footage
-(two people in bed, cuddling, top-down close-ups):
+Rewritten around the observation that RF-DETR's per-person *segmentation* is the
+most reliable signal on this project's footage (two people, intimate, top-down
+close-ups, odd angles). The old SCRFD-first pipeline leaked faces (the detector
+only fires near-frontal) and blurred bare skin (it fired where no head was),
+patched over with a brittle "anchor" safety-net and a coasting Kalman tracker.
 
-  1. *Missed faces at odd angles.* SCRFD only fires near-frontal, so a face
-     looking up/down/away was never detected and never blurred. RTMW estimates
-     the head from whole-body context and contributes a face detection there.
+The new flow is **segmentation as the spine, pose as the compass**:
 
-  2. *Skin blurred as a face.* SCRFD occasionally fired on bare skin (a real
-     problem on nude footage). We now drop any SCRFD detection that overlaps no
-     RTMW head region — skin on a torso has no head keypoints near it — while
-     keeping high-confidence SCRFD boxes so genuine faces are never lost.
+  1. RF-DETR -seg gives every person a box + a silhouette mask (the body truth).
+  2. RTMW pose, run inside each person box, gives the head keypoints and the
+     torso axis — the orientation needed to know *which end is the head*.
+  3. For each person we locate a head region: the pose head box when it lands on
+     the body, else the head end of the silhouette itself. The head is therefore
+     never placed off the body.
+  4. When SCRFD or RTMW found a *face inside that head region* we blur its tight
+     landmark hull; otherwise we blur the head region. A face detection that
+     overlaps no located head region is skin/background and is ignored — the old
+     false-positive simply cannot happen.
 
-Where both agree, SCRFD's 106-point mesh wins (a tighter hull than the 68 pose
-points); RTMW fills in everywhere SCRFD is silent.
+Every detected person is blurred (no "the face must have been seen" rule), and
+the blur is clipped to each person's own silhouette downstream (see
+libs/utils.MaskBuilder), so it never paints background. Over-blur is the only
+remaining error mode — the right error for a privacy tool.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
+import cv2
 import numpy as np
 
-from .pose_rtmw import _KPT_THR, PoseFrame, RTMWPoseEstimator, _torso_axis
+from .pose_rtmw import (
+    PoseFrame,
+    RTMWPoseEstimator,
+    _head_box_from_anchors,
+    _KPT_THR,
+)
 from .utils import crop_face_patch, unproject_landmark
 
-# An SCRFD detection this confident is kept even with no corroborating pose
-# head region — strong frontal faces must never be gated away.
-_HIGH_CONF = 0.70
-# A pose face this close to a kept SCRFD face is the same person; SCRFD's
-# denser landmarks win, so the pose duplicate is dropped.
-_DUP_IOU = 0.40
-
-# ── privacy safety-net anchor tuning ─────────────────────────────────────────
-# An RF-DETR person box must clear this score before it may anchor a blur.
-_ANCHOR_PERSON_SCORE_MIN = 0.55
-# Fraction of a person box's height taken as the head region when nothing else
-# located the head. Deliberately generous — for a privacy tool over-blur is the
-# safe error — but kept head-ish (see _person_head_region). NOTE: this assumes
-# the head sits at the top of the box, which is wrong for a lying/top-down
-# subject; it is a last resort that only fires when pose found no head at all.
-_ANCHOR_TOP_FRAC = 0.33
-# Suppress an anchor whose head region a real face or pose head already covers —
-# only a genuinely unseen head earns a safety-net blur.
-_ANCHOR_COVERED_IOU = 0.10
-# When no pose orients a person box, the top-of-box head guess is only trusted
-# for a clearly-upright (tall) box; a top-down/lying box has its head elsewhere.
-_ANCHOR_UPRIGHT_ASPECT = 1.3
+# ── head-from-mask tuning ─────────────────────────────────────────────────────
+# Smallest silhouette (px in the largest connected blob) we will locate a head
+# from — below this the mask is noise/sliver and we skip the person.
+_MIN_MASK_PX = 64
+# A pose-derived head box must cover at least this many body-mask pixels to be
+# trusted; otherwise it floats off the body and we relocate from the silhouette.
+_MIN_HEAD_MASK_PX = 12
+# Eigenvalue ratio above which a silhouette is "elongated" enough that its
+# principal axis is a trustworthy body axis (head end = the narrower end).
+_PCA_ELONGATION = 1.5
+# Head-ward slab: the top fraction (by projection onto the head direction) of
+# the silhouette whose centroid becomes the head centre.
+_HEAD_TIP_PCTL = 88
+# A face detection counts as "this head's face" when it overlaps the head region
+# this much, or its centre lands inside the (slightly grown) region.
+_FACE_IN_HEAD_IOU = 0.15
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -65,21 +72,23 @@ def _iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(inter / (area_a + area_b - inter))
 
 
-def _overlaps_region(face_box: np.ndarray, region: np.ndarray) -> bool:
-    """True if the face box plausibly belongs to this head region.
-
-    Tight on purpose: a real IoU overlap, or the face centre landing inside the
-    region grown by only a small margin. A loose test let an oversized/offset
-    head region validate SCRFD hits on bare skin far from any actual head.
-    """
-    if _iou(face_box, region) > 0.20:
-        return True
-    cx = (face_box[0] + face_box[2]) / 2
-    cy = (face_box[1] + face_box[3]) / 2
-    mx = (region[2] - region[0]) * 0.15
-    my = (region[3] - region[1]) * 0.15
+def _centre_in_region(box: np.ndarray, region: np.ndarray, margin: float = 0.15) -> bool:
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    mx = (region[2] - region[0]) * margin
+    my = (region[3] - region[1]) * margin
     return (region[0] - mx <= cx <= region[2] + mx
             and region[1] - my <= cy <= region[3] + my)
+
+
+def _mask_px_in_box(box: np.ndarray, mask: np.ndarray) -> int:
+    """Count body-mask pixels under a box — used to test a head box is on-body."""
+    fh, fw = mask.shape[:2]
+    x1 = max(0, int(box[0])); y1 = max(0, int(box[1]))
+    x2 = min(fw, int(box[2])); y2 = min(fh, int(box[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    return int(np.count_nonzero(mask[y1:y2, x1:x2]))
 
 
 # ── SCRFD detection + close-up refinement ────────────────────────────────────
@@ -93,7 +102,12 @@ def scrfd_detect(
     close_up_ratio: float,
     close_up_target: int = 1024,
 ) -> list:
-    """Run SCRFD, filter, and re-detect on an upscaled crop for close-ups."""
+    """Run SCRFD, filter, and re-detect on an upscaled crop for close-ups.
+
+    Unchanged from before, but its role is now *refinement only*: a face is used
+    only when it lands inside a head region already located from the body, so a
+    stray hit on skin/background is harmless (it matches no head).
+    """
     fh, fw = frame.shape[:2]
     raw = app.get(frame)
     faces = [
@@ -125,42 +139,195 @@ def scrfd_detect(
     return refined
 
 
-# ── ensemble ─────────────────────────────────────────────────────────────────
+# ── head localisation: body silhouette + pose orientation ────────────────────
 
-def merge_detections(scrfd_faces: list, pose: PoseFrame) -> list:
-    """Gate SCRFD against pose head regions, then add the pose faces it missed."""
-    regions = pose.head_regions
-    if not regions:
-        # Pose unavailable/absent → preserve legacy SCRFD-only behaviour.
-        return list(scrfd_faces) + list(pose.faces)
+def _largest_blob_points(
+    mask: np.ndarray, pbox: np.ndarray
+) -> Optional[tuple[np.ndarray, int, int]]:
+    """Float (x, y) pixels of the largest connected silhouette blob in ``pbox``.
 
-    kept = [
-        f for f in scrfd_faces
-        if float(f.det_score) >= _HIGH_CONF
-        or any(_overlaps_region(np.asarray(f.bbox[:4], dtype=np.float32), r)
-               for r in regions)
-    ]
+    Returns ``(pts_local, x_off, y_off)`` in coordinates local to the person
+    box, or None when the mask is too small / empty. Cropping to the box keeps
+    the PCA over a few thousand pixels and drops any stray blob outside it.
+    """
+    fh, fw = mask.shape[:2]
+    x1 = max(0, int(pbox[0])); y1 = max(0, int(pbox[1]))
+    x2 = min(fw, int(pbox[2])); y2 = min(fh, int(pbox[3]))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return None
+    sub = np.ascontiguousarray(mask[y1:y2, x1:x2]).astype(np.uint8)
+    if int(sub.sum()) < _MIN_MASK_PX:
+        return None
+    num, lbl, stats, _ = cv2.connectedComponentsWithStats(sub, connectivity=8)
+    if num <= 1:
+        return None
+    # Largest non-background component (skip label 0).
+    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    ys, xs = np.nonzero(lbl == largest)
+    if xs.size < _MIN_MASK_PX:
+        return None
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    return pts, x1, y1
 
-    merged = list(kept)
-    for pf in pose.faces:
-        pb = np.asarray(pf.bbox[:4], dtype=np.float32)
-        if not any(_iou(pb, np.asarray(kf.bbox[:4], dtype=np.float32)) > _DUP_IOU
-                   for kf in kept):
-            merged.append(pf)
-    return merged
+
+def _head_from_mask(mask: np.ndarray, pbox: np.ndarray) -> Optional[np.ndarray]:
+    """Head region (xyxy) at the head end of the body silhouette.
+
+    Orientation comes from the silhouette's principal axis (PCA): an elongated
+    body's head is its *narrower* extreme (a head is thinner than shoulders /
+    hips / legs). A near-round blob (curled / top-down) has no reliable axis, so
+    we fall back to its topmost slab — a bounded guess that the per-person blur
+    clip keeps on the body either way. This is the last resort used only when
+    pose gave no usable head; with pose present the pose head box wins.
+    """
+    found = _largest_blob_points(mask, pbox)
+    if found is None:
+        return None
+    pts, xo, yo = found
+
+    mean, eigvec, eigval = cv2.PCACompute2(pts, mean=None)
+    major = eigvec[0].astype(np.float32)
+    elong = float(eigval[0, 0]) / max(float(eigval[1, 0]), 1e-6)
+    perp = np.array([-major[1], major[0]], dtype=np.float32)
+
+    proj_major = pts @ major
+    perp_proj = pts @ perp
+    if elong >= _PCA_ELONGATION:
+        lo = proj_major <= np.percentile(proj_major, 25)
+        hi = proj_major >= np.percentile(proj_major, 75)
+        w_lo = float(perp_proj[lo].std()) if lo.any() else 0.0
+        w_hi = float(perp_proj[hi].std()) if hi.any() else 0.0
+        up = major if w_hi <= w_lo else -major
+        scale = 2.0 * min(w_lo, w_hi) + 1.0
+    else:
+        # No trustworthy axis: head at the top of the blob, size from its width.
+        up = np.array([0.0, -1.0], dtype=np.float32)
+        scale = float(pts[:, 0].max() - pts[:, 0].min()) * 0.5 + 1.0
+
+    proj = pts @ up
+    slab = pts[proj >= np.percentile(proj, _HEAD_TIP_PCTL)]
+    hc = slab.mean(axis=0) if slab.size else pts[np.argmax(proj)]
+
+    hw = max(0.55 * scale, 6.0)
+    hh = max(0.65 * scale, 6.0)
+    cx, cy = float(hc[0]) + xo, float(hc[1]) + yo
+    box = np.array([cx - hw, cy - hh, cx + hw, cy + hh], dtype=np.float32)
+    fh, fw = mask.shape[:2]
+    box[[0, 2]] = box[[0, 2]].clip(0, fw - 1)
+    box[[1, 3]] = box[[1, 3]].clip(0, fh - 1)
+    if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+        return None
+    return box
 
 
-# ── privacy safety-net anchors ───────────────────────────────────────────────
+def locate_head(
+    mask: Optional[np.ndarray],
+    pbox: np.ndarray,
+    pose_kpts: Optional[np.ndarray],
+    fw: int,
+    fh: int,
+) -> Optional[np.ndarray]:
+    """Locate one person's head region (xyxy), kept on the body.
 
-def _person_head_region(pbox: np.ndarray, frac: float = _ANCHOR_TOP_FRAC) -> np.ndarray:
-    """Coarse head region (xyxy) from a whole-person box: its top ``frac``,
-    centred horizontally and kept no wider than ~1.4× its height so it stays
-    head-shaped rather than a full-width band."""
-    x1, y1, x2, y2 = (float(v) for v in pbox[:4])
-    hh = (y2 - y1) * frac
-    hw = min(x2 - x1, hh * 1.4)
-    cx = (x1 + x2) / 2
-    return np.array([cx - hw / 2, y1, cx + hw / 2, y1 + hh], dtype=np.float32)
+    Pose head box first (it points at the actual face via head keypoints / the
+    torso axis), but only when it sits on the body silhouette; otherwise the
+    head end of the silhouette itself. Returns None only when neither pose nor a
+    usable mask is available (a face-only fallback handles that upstream).
+    """
+    pose_head: Optional[np.ndarray] = None
+    if pose_kpts is not None and len(pose_kpts) >= 5:
+        pk = np.asarray(pose_kpts[:, :2], dtype=np.float32)
+        ps = np.asarray(pose_kpts[:, 2], dtype=np.float32)
+        hb = _head_box_from_anchors(pk, ps, fw, fh)
+        if hb is not None:
+            pose_head = hb[0]
+
+    # A pose head box is trusted only when it actually overlaps the body.
+    if pose_head is not None and mask is not None:
+        if _mask_px_in_box(pose_head, mask) < _MIN_HEAD_MASK_PX:
+            pose_head = None
+
+    if pose_head is not None:
+        return pose_head
+    if mask is not None:
+        return _head_from_mask(mask, pbox)
+    return None
+
+
+# ── face refinement (tighten a head region to a detected face) ───────────────
+
+def _best_face_for_head(head: np.ndarray, faces: list) -> Optional[object]:
+    """The detected face that best belongs to this head region, or None.
+
+    Among faces overlapping the head region (IoU or centre-inside), prefer the
+    one with the most landmarks (SCRFD's 106-pt mesh over RTMW's 68) then the
+    highest detection score — a tighter, better hull. A face overlapping no head
+    region is never returned, so skin/background hits are dropped.
+    """
+    best = None
+    best_key = (-1, -1.0)
+    for f in faces:
+        fb = np.asarray(f.bbox[:4], dtype=np.float32)
+        if _iou(fb, head) < _FACE_IN_HEAD_IOU and not _centre_in_region(fb, head):
+            continue
+        lm = getattr(f, "landmark_2d_106", None)
+        n_lm = 0 if lm is None else len(lm)
+        key = (n_lm, float(f.det_score))
+        if key > best_key:
+            best_key, best = key, f
+    return best
+
+
+# ── subjects: one per detected person ────────────────────────────────────────
+
+@dataclass
+class Subject:
+    """One person to anonymise, derived from the body segmentation."""
+
+    person_box: np.ndarray              # xyxy float32 (RF-DETR)
+    mask: Optional[np.ndarray]          # body silhouette (uint8, 1 inside) or None
+    head: np.ndarray                    # head region xyxy float32, on the body
+    face: Optional[object]              # refining Face w/ landmark_2d_106, or None
+    score: float
+
+
+def _face_only_subjects(faces: list, fh: int, fw: int) -> list[Subject]:
+    """Degrade path: no RF-DETR people available → blur detected faces directly.
+
+    Keeps a baseline blur when segmentation is unavailable (model missing or a
+    failed frame) instead of going dark. Each face becomes its own maskless
+    subject whose head region is the face box.
+    """
+    out: list[Subject] = []
+    for f in faces:
+        fb = np.asarray(f.bbox[:4], dtype=np.float32)
+        if fb[2] - fb[0] < 4 or fb[3] - fb[1] < 4:
+            continue
+        out.append(Subject(fb.copy(), None, fb.copy(), f, float(f.det_score)))
+    return out
+
+
+def build_subjects(pf: PoseFrame, scrfd_faces: list, frame_shape: tuple) -> list[Subject]:
+    """Turn a PoseFrame (RF-DETR people + RTMW poses) into anonymisation subjects."""
+    fh, fw = frame_shape[:2]
+    if not pf.person_boxes:
+        # No bodies detected — fall back to whatever faces we have.
+        return _face_only_subjects(list(scrfd_faces) + list(pf.faces), fh, fw)
+
+    faces = list(scrfd_faces) + list(pf.faces)
+    n = len(pf.person_boxes)
+    poses_aligned = len(pf.poses) == n  # RF-DETR path: poses run per person box
+    subjects: list[Subject] = []
+    for i, (pbox, pscore) in enumerate(pf.person_boxes):
+        pbox = np.asarray(pbox, dtype=np.float32)
+        mask = pf.person_masks[i] if i < len(pf.person_masks) else None
+        pose_kpts = pf.poses[i] if poses_aligned else _best_pose_in_box(pf.poses, pbox)
+        head = locate_head(mask, pbox, pose_kpts, fw, fh)
+        if head is None:
+            continue
+        face = _best_face_for_head(head, faces)
+        subjects.append(Subject(pbox, mask, head, face, float(pscore)))
+    return subjects
 
 
 def _best_pose_in_box(
@@ -168,8 +335,9 @@ def _best_pose_in_box(
 ) -> Optional[np.ndarray]:
     """The pose with the largest share of its confident keypoints inside ``box``.
 
-    Lets a person box borrow orientation from the pose that belongs to it; None
-    when no pose overlaps the box well enough to trust."""
+    Used only on the YOLOX fallback where poses are not index-aligned with the
+    person boxes; on the RF-DETR path poses are aligned by index instead.
+    """
     best: Optional[np.ndarray] = None
     best_frac = min_frac
     for pose in poses:
@@ -187,88 +355,14 @@ def _best_pose_in_box(
     return best
 
 
-def _head_from_torso(
-    torso: tuple[np.ndarray, np.ndarray, float], pbox: np.ndarray
-) -> Optional[np.ndarray]:
-    """Head region placed a head-height beyond the shoulders along the body axis,
-    clipped to the person box. None when the torso is implausibly proportioned."""
-    sh, hp, sw = torso
-    axis = sh - hp
-    tlen = float(np.hypot(axis[0], axis[1]))
-    if not (0.6 * sw <= tlen <= 3.5 * sw):
-        return None
-    up = axis / tlen
-    hw, hh = 0.5 * sw, 0.6 * sw
-    hc = sh + up * (0.6 * sw)
-    region = np.array([hc[0] - hw, hc[1] - hh, hc[0] + hw, hc[1] + hh],
-                      dtype=np.float32)
-    region[[0, 1]] = np.maximum(region[[0, 1]], pbox[[0, 1]])
-    region[[2, 3]] = np.minimum(region[[2, 3]], pbox[[2, 3]])
-    if region[2] - region[0] < 4 or region[3] - region[1] < 4:
-        return None
-    return region
-
-
-def _oriented_head_region(pbox: np.ndarray, poses: list) -> Optional[np.ndarray]:
-    """Locate a person box's head using overlapping pose keypoints.
-
-    Places the region at the *actual* head end via the body axis (handles
-    sideways/inverted subjects). Falls back to the box's top slice only for a
-    confidently-upright box, and returns None when nothing orients it — so a
-    top-down/lying person never blurs its legs as a head."""
-    pose = _best_pose_in_box(poses, pbox)
-    if pose is not None:
-        torso = _torso_axis(pose[:, :2], pose[:, 2])
-        if torso is not None:
-            region = _head_from_torso(torso, pbox)
-            if region is not None:
-                return region
-    x1, y1, x2, y2 = (float(v) for v in pbox[:4])
-    if (y2 - y1) < _ANCHOR_UPRIGHT_ASPECT * max(x2 - x1, 1.0):
-        return None
-    return _person_head_region(pbox)
-
-
-def anchor_regions(
-    pose: PoseFrame,
-    faces: list,
-    *,
-    person_score_min: float = _ANCHOR_PERSON_SCORE_MIN,
-) -> list[tuple[np.ndarray, float]]:
-    """Head regions for people RF-DETR saw but no face/pose head covers.
-
-    Returns [(xyxy, score)] the tracker may spawn a safety-net blur from. The
-    region is oriented from the person's own pose keypoints (never a blind
-    top-of-box guess), and a person already covered by a kept face or a pose head
-    region is skipped — the anchor exists only to catch a head nothing else found.
-    """
-    if not pose.person_boxes:
-        return []
-    face_boxes = [np.asarray(f.bbox[:4], dtype=np.float32) for f in faces]
-    regions = [np.asarray(r, dtype=np.float32) for r in pose.head_regions]
-    out: list[tuple[np.ndarray, float]] = []
-    for pbox, pscore in pose.person_boxes:
-        if pscore < person_score_min:
-            continue
-        head = _oriented_head_region(np.asarray(pbox, dtype=np.float32), pose.poses)
-        if head is None:
-            continue
-        if any(_iou(head, fb) > _ANCHOR_COVERED_IOU for fb in face_boxes):
-            continue
-        if any(_iou(head, r) > _ANCHOR_COVERED_IOU for r in regions):
-            continue
-        out.append((head, float(pscore)))
-    return out
-
-
 # ── pose backend factory + uniform interface ─────────────────────────────────
 
 class _MediaPipeBackend:
     """Adapts the legacy MediaPipe PoseHeadEstimator to the PoseFrame API.
 
-    MediaPipe yields head boxes (for tracker assist) but no face landmarks, so
-    it contributes no face detections and gates nothing — SCRFD behaves exactly
-    as before, just with head-box revival of lost tracks.
+    MediaPipe yields head boxes and poses but no per-person segmentation, so the
+    segmentation-first path degrades to pose-only head localisation (head box
+    from keypoints, no silhouette clip) when this backend is selected.
     """
 
     def __init__(self, on_status: Optional[Callable[[str], None]]) -> None:
@@ -289,8 +383,8 @@ def make_pose_backend(
 ):
     """Construct a pose backend exposing ``estimate(frame) -> PoseFrame``.
 
-    backend: "rtmw" (default, robust at odd angles), "mediapipe" (legacy),
-    or "none"/"" to disable pose assist entirely.
+    backend: "rtmw" (default — RF-DETR seg + RTMW pose, the segmentation-first
+    path), "mediapipe" (legacy, pose-only), or "none"/"" to disable.
     """
     b = (backend or "none").lower()
     if b in ("none", "off", ""):
@@ -311,21 +405,18 @@ def detect(
     face_aspect: float,
     close_up_ratio: float,
     close_up_target: int = 1024,
-) -> tuple[list, list, list, PoseFrame]:
-    """Return (faces, head_boxes, anchors, pose_frame) for one frame.
+) -> tuple[list[Subject], PoseFrame]:
+    """Return ``(subjects, pose_frame)`` for one frame.
 
-    faces  — ensembled detections (each carries .bbox/.det_score and, when
-             available, .landmark_2d_106) ready for the Kalman tracker.
-    head_boxes — [(xyxy, score)] weak corrections for the tracker.
-    anchors    — [(xyxy, score)] privacy safety-net head regions for people
-                 RF-DETR saw but no face/pose head covers; pass to the tracker's
-                 ``anchor_provider`` (opt-in) to spawn/sustain a blur there.
-    pose_frame — raw PoseFrame (poses for overlay, regions for debugging).
+    subjects   — one per detected person: body box, silhouette, on-body head
+                 region, and the refining face detection (when one lands on the
+                 head). Feed to the SubjectTracker.
+    pose_frame — raw PoseFrame (people, masks, poses) for the tracking overlay.
     """
     scrfd = scrfd_detect(
         app, frame, det_score=det_score, face_aspect=face_aspect,
-        close_up_ratio=close_up_ratio, close_up_target=close_up_target)
+        close_up_ratio=close_up_ratio, close_up_target=close_up_target,
+    ) if app is not None else []
     pf = pose.estimate(frame) if pose is not None else PoseFrame()
-    faces = merge_detections(scrfd, pf)
-    anchors = anchor_regions(pf, faces)
-    return faces, pf.head_boxes, anchors, pf
+    subjects = build_subjects(pf, scrfd, frame.shape)
+    return subjects, pf
