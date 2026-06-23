@@ -27,6 +27,24 @@ from insightface.app.common import Face
 from insightface.model_zoo import model_zoo
 from insightface.utils import ensure_available
 
+from .utils import fp16_model_path
+
+
+def _load_with_fp16_fallback(path: str, providers: list[str]):
+    """Load a model, preferring its float16 derivative on a GPU provider.
+
+    ``fp16_model_path`` returns the original path on CPU / when disabled, so the
+    fp16 attempt only happens on a GPU host. If a GPU rejects the fp16 graph
+    (DirectML validates fp16 strictly), fall back to the float32 model so the
+    pipeline keeps running — mirroring the best-effort GPU swap in pose_rtmw."""
+    fp16 = fp16_model_path(path)
+    if fp16 != path:
+        try:
+            return model_zoo.get_model(fp16, providers=providers)
+        except Exception:  # noqa: BLE001 — fp16 unsupported here → float32
+            pass
+    return model_zoo.get_model(path, providers=providers)
+
 
 def _det_model_for_size(det_file: str, size: tuple[int, int]) -> str:
     """Return a det_10g variant whose graph is pinned to the given det size.
@@ -59,8 +77,8 @@ class FaceApp:
         model_dir = ensure_available("models", "buffalo_l", root="~/.insightface")
         self._providers = list(providers)
         self._det_file = osp.join(model_dir, "det_10g.onnx")
-        self.lmk_model = model_zoo.get_model(
-            osp.join(model_dir, "2d106det.onnx"), providers=self._providers)
+        self.lmk_model = _load_with_fp16_fallback(
+            osp.join(model_dir, "2d106det.onnx"), self._providers)
         # Each det size gets its own session built from a shape-pinned model
         # file (see _det_model_for_size), cached for the lifetime of the app —
         # see the module docstring for why old sessions must never be
@@ -74,8 +92,8 @@ class FaceApp:
         key = (int(det_size[0]), int(det_size[1]))
         det = self._det_by_size.get(key)
         if det is None:
-            det = model_zoo.get_model(
-                _det_model_for_size(self._det_file, key), providers=self._providers)
+            det = _load_with_fp16_fallback(
+                _det_model_for_size(self._det_file, key), self._providers)
             self._det_by_size[key] = det
         det.prepare(ctx_id, input_size=key, det_thresh=det_thresh)
         self.det_model = det

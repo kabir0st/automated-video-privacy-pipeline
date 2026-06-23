@@ -24,7 +24,10 @@ Design mirrors libs/pose_rtmw.py exactly:
 The exported ONNX model is loaded from the first path that exists:
   1. the ``AVPP_RFDETR_ONNX`` environment variable, or
   2. ``~/.cache/avpp/rfdetr/rf-detr.onnx``.
-Export one once with the ``rfdetr`` package, e.g.::
+If neither exists, :func:`download_model` fetches a pre-exported ``.onnx`` from
+``RFDETR_URL`` (overridable via ``AVPP_RFDETR_URL``) into the default cache path
+above — this is what the startup preflight in :mod:`libs.models` calls. You can
+also export one yourself with the ``rfdetr`` package, e.g.::
 
     from rfdetr import RFDETRNano
     RFDETRNano().export(format="onnx")   # writes output/inference_model.onnx
@@ -37,6 +40,7 @@ needed, keeping the strict ONNX-Runtime-only architecture intact.
 from __future__ import annotations
 
 import os
+import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -54,6 +58,15 @@ _PERSON_SCORE_MIN = 0.50
 
 _DEFAULT_CACHE = Path.home() / ".cache" / "avpp" / "rfdetr" / "rf-detr.onnx"
 
+# Pre-exported RF-DETR ONNX, fetched on first run when no local copy exists.
+# Overridable so a different export (e.g. the detection variant, or a self-hosted
+# mirror) can be swapped in without code changes.
+RFDETR_URL = os.environ.get(
+    "AVPP_RFDETR_URL",
+    "https://huggingface.co/PierreMarieCurie/rf-detr-onnx/resolve/main/"
+    "rf-detr-seg-xxlarge.onnx",
+)
+
 
 def _model_path() -> Optional[Path]:
     env = os.environ.get("AVPP_RFDETR_ONNX")
@@ -62,6 +75,34 @@ def _model_path() -> Optional[Path]:
     if _DEFAULT_CACHE.is_file():
         return _DEFAULT_CACHE
     return None
+
+
+def download_model(on_status: Optional[Callable[[str], None]] = None) -> Path:
+    """Ensure the RF-DETR ONNX exists locally, downloading it if missing.
+
+    Returns the path to the model. A custom ``AVPP_RFDETR_ONNX`` that already
+    exists is returned untouched; otherwise the file is fetched from
+    :data:`RFDETR_URL` into :data:`_DEFAULT_CACHE` via a ``.part`` temp file
+    (atomic rename), mirroring the download pattern in ``pose_head.py``. Any
+    failure propagates to the caller (the preflight logs it and degrades)."""
+    existing = _model_path()
+    if existing is not None:
+        return existing
+
+    _DEFAULT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _DEFAULT_CACHE.with_suffix(".onnx.part")
+
+    def _report(block: int, block_size: int, total: int) -> None:
+        if on_status and total > 0:
+            done = min(block * block_size, total)
+            on_status(
+                f"Downloading RF-DETR… {done / 1e6:.0f}/{total / 1e6:.0f} MB")
+
+    if on_status:
+        on_status(f"Downloading RF-DETR from {RFDETR_URL}")
+    urllib.request.urlretrieve(RFDETR_URL, tmp, reporthook=_report)
+    tmp.replace(_DEFAULT_CACHE)
+    return _DEFAULT_CACHE
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -99,10 +140,15 @@ class PersonDetector:
                     f"{_DEFAULT_CACHE})")
             import onnxruntime as ort
 
-            from .utils import best_onnx_providers
+            from .utils import best_onnx_providers, make_session
 
             self._status(f"Loading RF-DETR person detector ({path.name})…")
-            sess = ort.InferenceSession(str(path), providers=best_onnx_providers())
+            providers = best_onnx_providers()
+            try:
+                # fp16 derivative (RDNA2/DirectML ~2×) + DML session options.
+                sess = make_session(str(path), providers)
+            except Exception:  # noqa: BLE001 — fp16/DML rejected → plain float32
+                sess = ort.InferenceSession(str(path), providers=providers)
             inp = sess.get_inputs()[0]
             self._in_name = inp.name
             # Static export shape is [N, 3, H, W]; fall back to 560² if dynamic.
@@ -130,31 +176,63 @@ class PersonDetector:
 
     @staticmethod
     def _split_outputs(outs: list[np.ndarray]):
-        """Return (boxes_cxcywh, logits) from the model outputs by shape.
+        """Return (boxes_cxcywh, logits, masks) from the model outputs by shape.
 
         RF-DETR emits a boxes tensor (last dim 4, normalised cxcywh) and a
-        class-logits tensor (last dim = num classes); identify by the last dim
-        rather than by name so any export variant works.
+        class-logits tensor (last dim = num classes); the ``-seg`` export adds a
+        per-query mask-logits tensor (4-D: ``[1, Q, h, w]``). Identify each by
+        rank / last dim rather than by name so any export variant works;
+        ``masks`` is None for a detection-only export.
         """
-        boxes = logits = None
+        boxes = logits = masks = None
         for o in outs:
             a = np.asarray(o)
-            if a.ndim == 3 and a.shape[-1] == 4:
+            if a.ndim == 4:
+                masks = a[0]
+            elif a.ndim == 3 and a.shape[-1] == 4:
                 boxes = a[0]
             elif a.ndim == 3:
                 logits = a[0]
-        return boxes, logits
+        return boxes, logits, masks
 
-    def detect(self, frame_bgr: np.ndarray) -> list[tuple[np.ndarray, float]]:
-        """Return [(xyxy float32 in frame pixels, score)] for confident people."""
+    @staticmethod
+    def _mask_to_frame(
+        mask_logits: np.ndarray, box: np.ndarray, fw: int, fh: int
+    ) -> np.ndarray:
+        """Per-query mask logits → full-frame uint8 silhouette, clipped to its box.
+
+        The mask comes out at the model's internal resolution in the same
+        squashed-to-(W,H) space the boxes live in, so a direct resize to the
+        frame aligns it with the box. Clipping to the person box drops any stray
+        activation the seg head leaves outside the detection.
+        """
+        import cv2
+
+        prob = _sigmoid(np.asarray(mask_logits, dtype=np.float32))
+        prob = cv2.resize(prob, (fw, fh), interpolation=cv2.INTER_LINEAR)
+        out = np.zeros((fh, fw), dtype=np.uint8)
+        x1, y1, x2, y2 = (int(v) for v in box[:4])
+        out[y1:y2, x1:x2] = (prob[y1:y2, x1:x2] > 0.5).astype(np.uint8)
+        return out
+
+    def detect(
+        self, frame_bgr: np.ndarray
+    ) -> tuple[list[tuple[np.ndarray, float]], list[Optional[np.ndarray]]]:
+        """Confident people as ``([(xyxy float32, score)], [mask | None])``.
+
+        The second list is aligned with the first: each entry is a full-frame
+        uint8 silhouette from the ``-seg`` model (1 inside the person), or None
+        when the loaded export has no mask output. Masks are for the TRACKING
+        panel overlay only — they never drive the blur.
+        """
         if not self._ensure():
-            return []
+            return [], []
         try:
             inp = self._preprocess(frame_bgr)
             outs = self._sess.run(None, {self._in_name: inp})
-            boxes, logits = self._split_outputs(outs)
+            boxes, logits, masks = self._split_outputs(outs)
             if boxes is None or logits is None:
-                return []
+                return [], []
 
             scores = _sigmoid(logits)
             ncls = scores.shape[-1]
@@ -162,11 +240,14 @@ class PersonDetector:
             person = scores[:, col] if _PERSON_CLASS < ncls else scores.max(1)
             keep = person >= self._score_min
             if not np.any(keep):
-                return []
+                return [], []
 
+            kept_masks = masks[keep] if masks is not None else None
             fh, fw = frame_bgr.shape[:2]
-            out: list[tuple[np.ndarray, float]] = []
-            for (cx, cy, bw, bh), sc in zip(boxes[keep], person[keep]):
+            persons: list[tuple[np.ndarray, float]] = []
+            out_masks: list[Optional[np.ndarray]] = []
+            for j, ((cx, cy, bw, bh), sc) in enumerate(
+                    zip(boxes[keep], person[keep])):
                 x1 = (cx - bw / 2) * fw
                 y1 = (cy - bh / 2) * fh
                 x2 = (cx + bw / 2) * fw
@@ -175,9 +256,12 @@ class PersonDetector:
                 box[[0, 2]] = box[[0, 2]].clip(0, fw - 1)
                 box[[1, 3]] = box[[1, 3]].clip(0, fh - 1)
                 if box[2] - box[0] >= 4 and box[3] - box[1] >= 4:
-                    out.append((box, float(sc)))
-            return out
+                    persons.append((box, float(sc)))
+                    out_masks.append(
+                        self._mask_to_frame(kept_masks[j], box, fw, fh)
+                        if kept_masks is not None else None)
+            return persons, out_masks
         except Exception as exc:  # noqa: BLE001 — one bad frame must not crash
             self._status(f"RF-DETR detect failed, degrading: {exc!r}")
             self.available = False
-            return []
+            return [], []

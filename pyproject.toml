@@ -10,6 +10,7 @@ dependencies = [
     "imageio-ffmpeg>=0.5.1",
     "insightface>=1.0.1",
     "mediapipe>=0.10.35",
+    "onnxconverter-common>=1.16.0",
     "onnxruntime>=1.26.0",
     "pyqt6>=6.6.0",
     "rtmlib>=0.0.15",

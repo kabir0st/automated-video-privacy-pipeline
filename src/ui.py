@@ -64,6 +64,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
 from libs.face_app import FaceApp
+from libs.models import preflight as preflight_models
 from libs.pose_head import _VIS_THRESHOLD
 from libs.pipeline import detect, make_pose_backend
 from libs.tracker import KalmanFaceTracker
@@ -72,8 +73,10 @@ from libs.utils import (
     BlurPipeline,
     MaskBuilder,
     best_onnx_providers,
+    debug_log,
 )
 from libs.video_writer import make_video_writer, source_bitrate_kbps
+from splash import show_splash, update as splash_update
 
 CLOSE_UP_TARGET_SIZE = 1024
 _TRACK_COLOURS = [
@@ -324,7 +327,7 @@ PRESETS: dict[str, tuple[str, Params]] = {
 }
 
 # Overlay tag per tracking source, drawn after the track id.
-_SOURCE_TAGS = {"face": "", "head": "·pose", "coast": "·hold"}
+_SOURCE_TAGS = {"face": "", "head": "·pose", "coast": "·hold", "anchor": "·rf-detr"}
 
 # Standard BlazePose 33-point skeleton connections, used to draw the pose
 # overlay on the tracking panel so pose estimation is visibly alive.
@@ -353,6 +356,13 @@ _KPT_THR_133 = 0.3   # RTMW per-keypoint confidence to draw
 # Distinct from the per-track palette so the skeleton reads as a separate layer.
 _POSE_EDGE_COLOUR = (220, 220, 220)
 _POSE_BOX_COLOUR = (0, 200, 255)
+# RF-DETR's contribution, drawn only on the TRACKING panel: whole-person boxes
+# (magenta) and the safety-net head anchors derived from them (amber). Distinct
+# from the pose/track palettes so it reads as a separate layer.
+_PERSON_BOX_COLOUR = (255, 0, 255)
+_ANCHOR_BOX_COLOUR = (0, 140, 255)
+# Translucent person silhouette from the RF-DETR ``-seg`` masks (spring green).
+_SEG_MASK_COLOUR = (80, 220, 120)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -414,6 +424,75 @@ def _draw_pose(
     if head_box is not None:
         x1, y1, x2, y2 = (int(v) for v in head_box[:4])
         cv2.rectangle(frame, (x1, y1), (x2, y2), _POSE_BOX_COLOUR, 1)
+
+
+def _draw_seg_masks(
+    frame: np.ndarray,
+    masks: list,
+    colour: tuple[int, int, int] = _SEG_MASK_COLOUR,
+    alpha: float = 0.4,
+) -> None:
+    """Blend the RF-DETR person silhouettes onto the tracking panel.
+
+    ``masks`` is the per-person list from the ``-seg`` detector (uint8, 1 inside
+    the person); entries may be None on a detection-only export. Their union is
+    filled translucently and outlined so the segmentation is visibly running —
+    tracking panel only; the blur is unaffected.
+    """
+    union = None
+    for m in masks:
+        if m is None:
+            continue
+        union = m if union is None else np.maximum(union, m)
+    if union is None or not union.any():
+        return
+    sel = union > 0
+    tint = np.empty_like(frame)
+    tint[:] = colour
+    frame[sel] = (frame[sel] * (1.0 - alpha) + tint[sel] * alpha).astype(frame.dtype)
+    contours, _ = cv2.findContours(union, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(frame, contours, -1, colour, 1, cv2.LINE_AA)
+
+
+def _draw_tracking_overlay(
+    tracking: np.ndarray,
+    tracked: list,
+    polys: dict,
+    poses: list,
+    head_boxes: list,
+    person_boxes: list,
+    anchors: list,
+    person_masks: list,
+) -> None:
+    """Composite every detection layer onto the TRACKING panel copy.
+
+    Shared by the live-preview and export paths so the middle panel shows the
+    same thing in both: RF-DETR seg silhouettes (translucent base), track
+    outlines, pose skeletons, the coarse pose head boxes, RF-DETR person boxes
+    and the safety-net anchors. Drawn on a frame copy only — never on the
+    written/blurred output.
+    """
+    _draw_seg_masks(tracking, person_masks)
+    for t in tracked:
+        bbox = t.face.bbox if t.face is not None else t.bbox
+        _draw_outline(tracking, polys.get(t.track_id), bbox, t.track_id,
+                      _track_colour(t.track_id), _SOURCE_TAGS.get(t.source, ""))
+    for pose in poses:
+        _draw_pose(tracking, pose)
+    for hb, _score in head_boxes:
+        cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
+                      (int(hb[2]), int(hb[3])), _POSE_BOX_COLOUR, 1)
+    for pb, _score in person_boxes:
+        x1, y1 = int(pb[0]), int(pb[1])
+        cv2.rectangle(tracking, (x1, y1), (int(pb[2]), int(pb[3])),
+                      _PERSON_BOX_COLOUR, 1)
+        cv2.putText(tracking, "rf-detr", (x1, max(0, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, _PERSON_BOX_COLOUR, 1,
+                    cv2.LINE_AA)
+    for ab, _score in anchors:
+        cv2.rectangle(tracking, (int(ab[0]), int(ab[1])),
+                      (int(ab[2]), int(ab[3])), _ANCHOR_BOX_COLOUR, 1)
 
 
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -590,16 +669,23 @@ class ProcessWorker(QThread):
 
     def _detect(
         self, frame: np.ndarray, p: Params
-    ) -> tuple[list, list, list]:
-        """Ensembled detection: (faces, head_boxes, poses) with live params."""
+    ) -> tuple[list, list, list, list, list, list]:
+        """Detection: (faces, head_boxes, poses, anchors, person_boxes, person_masks).
+
+        ``anchors`` are the RF-DETR safety-net head regions for the tracker's
+        ``anchor_provider``; ``person_boxes`` are RF-DETR's whole-person boxes
+        and ``person_masks`` its per-person ``-seg`` silhouettes, both drawn on
+        the TRACKING panel so its contribution is visible.
+        """
         assert self._app is not None
         pose = self._ensure_pose(p)
-        faces, head_boxes, _anchors, pf = detect(
+        faces, head_boxes, anchors, pf = detect(
             self._app, frame, pose,
             det_score=p.det_score, face_aspect=p.face_aspect,
             close_up_ratio=p.close_up_ratio,
             close_up_target=CLOSE_UP_TARGET_SIZE)
-        return faces, head_boxes, pf.poses
+        return (faces, head_boxes, pf.poses, anchors,
+                pf.person_boxes, pf.person_masks)
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
@@ -615,7 +701,8 @@ class ProcessWorker(QThread):
 
         # Ensembled detection (SCRFD ⊕ pose) — pose runs once here; its head
         # boxes feed the tracker and its skeletons are drawn on the overlay.
-        faces, head_boxes, poses = self._detect(frame, p)
+        faces, head_boxes, poses, anchors, person_boxes, person_masks = \
+            self._detect(frame, p)
 
         # Sequential frames (Play) keep the tracker so gap-coasting shows in
         # the live preview; scrubbing or single-frame inspection resets it.
@@ -631,7 +718,8 @@ class ProcessWorker(QThread):
 
         tracked = self._pv_tracker.update(
             faces, frame.shape,
-            (lambda: head_boxes) if head_boxes else None)
+            (lambda: head_boxes) if head_boxes else None,
+            (lambda: anchors) if anchors else None)
 
         # Build blur mask
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
@@ -646,22 +734,16 @@ class ProcessWorker(QThread):
         self._blur.reconfigure(p.blur_layers)
         self._blur.apply(blurred, blur_mask)
 
-        # Draw tracking overlays
+        # AFTER panel shows the track outlines so the blur's target is legible.
         for t in tracked:
             bbox = t.face.bbox if t.face is not None else t.bbox
-            c = _track_colour(t.track_id)
-            poly = polys.get(t.track_id)
-            tag = _SOURCE_TAGS.get(t.source, "")
-            _draw_outline(tracking, poly, bbox, t.track_id, c, tag)
-            _draw_outline(blurred, poly, bbox, t.track_id, c, tag)
+            _draw_outline(blurred, polys.get(t.track_id), bbox, t.track_id,
+                          _track_colour(t.track_id),
+                          _SOURCE_TAGS.get(t.source, ""))
 
-        # Pose overlay (tracking panel only): skeletons on top of the outlines,
-        # plus the coarse head boxes the tracker is fed.
-        for pose in poses:
-            _draw_pose(tracking, pose)
-        for hb, _score in head_boxes:
-            cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
-                          (int(hb[2]), int(hb[3])), _POSE_BOX_COLOUR, 1)
+        # TRACKING panel: every detection layer, incl. the RF-DETR seg masks.
+        _draw_tracking_overlay(tracking, tracked, polys, poses, head_boxes,
+                               person_boxes, anchors, person_masks)
 
         elapsed = time.perf_counter() - t0
         return orig, tracking, blurred, 1.0 / max(elapsed, 1e-6)
@@ -674,18 +756,24 @@ class ProcessWorker(QThread):
         p: Params,
         tracker: KalmanFaceTracker,
         masks: MaskBuilder,
-    ) -> tuple[np.ndarray, list, dict[int, Optional[np.ndarray]]]:
+    ) -> tuple[np.ndarray, list, dict[int, Optional[np.ndarray]], tuple]:
         """Process one frame with the persistent offline pipeline.
 
-        Returns (clean blurred frame, tracked faces, polys for overlay drawing).
+        Returns ``(blurred frame, tracked faces, polys, overlay)`` where
+        ``overlay`` is ``(poses, head_boxes, person_boxes, anchors,
+        person_masks)`` — fed to ``_draw_tracking_overlay`` so the export
+        preview's TRACKING panel matches the live one.
         """
         self._ensure_model(p.target_size)
         fh, fw = frame.shape[:2]
 
-        faces, head_boxes, _poses = self._detect(frame, p)
+        faces, head_boxes, poses, anchors, person_boxes, person_masks = \
+            self._detect(frame, p)
         tracker.configure(match_iou=p.match_iou, hold_secs=p.hold_secs)
         tracked = tracker.update(
-            faces, frame.shape, (lambda: head_boxes) if head_boxes else None)
+            faces, frame.shape,
+            (lambda: head_boxes) if head_boxes else None,
+            (lambda: anchors) if anchors else None)
 
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
         polys: dict[int, Optional[np.ndarray]] = {}
@@ -698,7 +786,8 @@ class ProcessWorker(QThread):
         blurred = frame.copy()
         self._blur.reconfigure(p.blur_layers)
         self._blur.apply(blurred, blur_mask)
-        return blurred, tracked, polys
+        overlay = (poses, head_boxes, person_boxes, anchors, person_masks)
+        return blurred, tracked, polys, overlay
 
     def _paused_preview(self, frame: np.ndarray) -> None:
         """Re-render the held frame while paused so slider changes show live.
@@ -762,21 +851,22 @@ class ProcessWorker(QThread):
 
                 p = self._latest_params()
                 t0 = time.perf_counter()
-                blurred, tracked, polys = self._export_frame(
+                blurred, tracked, polys, overlay = self._export_frame(
                     frame, p, tracker, masks)
                 writer.write(blurred)
 
-                # Preview panels: overlays only on copies, never in the file.
+                # Refresh the preview panels every frame — overlays live only on
+                # these copies, never in the written file above. The TRACKING
+                # panel gets the full overlay (seg masks, pose, boxes), the AFTER
+                # panel just the track outlines so the blur target stays legible.
                 tracking = frame.copy()
                 preview = blurred.copy()
+                _draw_tracking_overlay(tracking, tracked, polys, *overlay)
                 for t in tracked:
                     bbox = t.face.bbox if t.face is not None else t.bbox
-                    c = _track_colour(t.track_id)
-                    tag = _SOURCE_TAGS.get(t.source, "")
-                    _draw_outline(tracking, polys.get(t.track_id), bbox,
-                                  t.track_id, c, tag)
                     _draw_outline(preview, polys.get(t.track_id), bbox,
-                                  t.track_id, c, tag)
+                                  t.track_id, _track_colour(t.track_id),
+                                  _SOURCE_TAGS.get(t.source, ""))
                 elapsed = time.perf_counter() - t0
                 self._emit_preview(
                     frame.copy(), tracking, preview, 1.0 / max(elapsed, 1e-6))
@@ -1516,6 +1606,7 @@ class MainWindow(QMainWindow):
         self._fps_lbl.setText(f"{fps:.1f} fps")
 
     def _on_status(self, msg: str) -> None:
+        debug_log(msg)
         self._status_lbl.setText(msg)
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
@@ -1532,23 +1623,66 @@ class MainWindow(QMainWindow):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _run_preflight(app: QApplication, splash: QSplashScreen | None) -> None:
+    """Check/download all models with the splash showing live progress.
+
+    The downloads block (hundreds of MB on first run), so they run on a worker
+    thread while this (GUI) thread pumps the event loop and repaints the splash —
+    a loading pop-up that updates instead of freezing into "Not Responding". The
+    worker only stores the latest status string; every Qt call stays on this
+    thread. preflight() mirrors each line to the debug log itself, so progress is
+    recorded even in the windowed .exe where there is no console."""
+    latest = {"msg": "Checking models…"}
+    lock = threading.Lock()
+    done = threading.Event()
+
+    def on_status(msg: str) -> None:
+        with lock:
+            latest["msg"] = msg
+
+    def work() -> None:
+        try:
+            preflight_models(on_status)
+        except Exception as exc:  # noqa: BLE001 — never crash startup on preflight
+            _log_exception(exc)
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="model-preflight", daemon=True).start()
+    shown: Optional[str] = None
+    while not done.is_set():
+        with lock:
+            msg = latest["msg"]
+        if msg != shown:
+            shown = msg
+            splash_update(splash, msg)   # repaints via processEvents
+        else:
+            app.processEvents()
+        time.sleep(0.03)
+    with lock:
+        splash_update(splash, latest["msg"])
+
+
 def main(splash: QSplashScreen | None = None) -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Show a loading pop-up even when launched without main.py (e.g. ui.py run
+    # directly, or a frozen build whose entry is this module).
+    if splash is None:
+        splash = show_splash()
+
+    # Resolve/download models up front with the splash reporting progress, BEFORE
+    # the app stylesheet is applied (its `QWidget{background:transparent}` rule
+    # would otherwise blank the splash) and before MainWindow is built — so
+    # opening the first video is no longer the first time anything downloads.
+    _run_preflight(app, splash)
+
     app.setStyleSheet(STYLE)
-    if splash is not None:
-        splash.showMessage("Preparing interface…")
-        app.processEvents()
+    splash_update(splash, "Preparing interface…")
     win = MainWindow()
     win.show()
     if splash is not None:
         splash.finish(win)
-    # Bootloader splash from a PyInstaller --splash build, if present.
-    try:
-        import pyi_splash
-        pyi_splash.close()
-    except Exception:
-        pass
     sys.exit(app.exec())
 
 

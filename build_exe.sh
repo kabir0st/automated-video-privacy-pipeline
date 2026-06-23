@@ -17,9 +17,13 @@
 #     (insightface, boxmot, onnxruntime, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - InsightFace models (~300 MB) and the RTMW/YOLOX pose models (~300-400 MB)
-#     are downloaded at first launch to %USERPROFILE%\.insightface\ and
-#     %USERPROFILE%\.cache\rtmlib\ respectively, and are NOT bundled (intentional).
+#   - Models are NOT bundled (intentional). A startup preflight (libs/models.py)
+#     checks each model's location and downloads any that are missing, reporting
+#     progress on the loading splash and to %TEMP%\FaceBlurInspector-debug.log:
+#       * InsightFace buffalo_l (~300 MB) → %USERPROFILE%\.insightface\
+#       * RTMW/YOLOX pose models (~300-400 MB) → %USERPROFILE%\.cache\rtmlib\
+#       * RF-DETR person detector (HuggingFace) → %USERPROFILE%\.cache\avpp\rfdetr\
+#     Set AVPP_SKIP_MODEL_DOWNLOAD=1 to check-and-report only (no downloads).
 #   - GPU acceleration uses the DirectML execution provider (onnxruntime-directml),
 #     which runs on any Windows GPU including the AMD Radeon RX 6800. The build
 #     asserts DirectML is active so a silent CPU-only bundle can't ship; the app
@@ -67,9 +71,12 @@ echo ">>> Installing dependencies into Windows Python…"
 # bundle below so no system ffmpeg install is required on the target machine.
 # tqdm is rtmlib's download-progress dependency; pulled in explicitly so the
 # rtmlib --no-deps install below leaves nothing missing.
+# onnxconverter-common provides the float16 graph conversion that gives the
+# RX 6800 its ~2× fp16 inference speedup (see libs/utils.fp16_model_path).
 "${WIN_PY[@]}" -m pip install --no-cache-dir \
   "boxmot==21.0.0" \
-  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg tqdm
+  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg tqdm \
+  onnxconverter-common
 
 # rtmlib is the default pose backend (RTMDet/YOLOX → RTMW whole-body); it must
 # be installed here so PyInstaller can bundle it, or the .exe dies with
@@ -112,7 +119,10 @@ print('OK: DirectML provider present — GPU inference will be used on the RX 68
 "
 
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
-SRC_WIN=$(wslpath -w "$SCRIPT_DIR/src/ui.py")
+# Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
+# cv2/onnxruntime/insightface imports, then hands the splash to ui.main() which
+# runs the model preflight on it. Building from ui.py skips the splash entirely.
+SRC_WIN=$(wslpath -w "$SCRIPT_DIR/src/main.py")
 PATHS_WIN=$(wslpath -w "$SCRIPT_DIR/src")
 RTH_WIN=$(wslpath -w "$SCRIPT_DIR/rth_windowed_stdio.py")
 
@@ -130,6 +140,18 @@ echo ""
 echo ">>> Cleaning previous build…"
 rm -rf build dist FaceBlurInspector.spec "$WIN_BUILD_ROOT/build" "$WIN_BUILD_ROOT/dist"
 
+# ── generate the bootloader splash PNG ───────────────────────────────────────
+# In --onefile mode the bootloader unpacks the whole bundle before any Python
+# runs; the Qt splash (src/splash.py) can't show during that gap, so on Windows
+# the user saw nothing for several seconds. This native --splash image covers it
+# and is handed off to the Qt splash (pyi_splash.close() in show_splash). Painted
+# from cv2 so no image asset lives in the repo.
+echo ""
+echo ">>> Generating bootloader splash image…"
+SPLASH_PNG="$WIN_BUILD_ROOT/splash.png"
+"${WIN_PY[@]}" "$(wslpath -w "$SCRIPT_DIR/make_splash.py")" "$(wslpath -w "$SPLASH_PNG")"
+SPLASH_WIN=$(wslpath -w "$SPLASH_PNG")
+
 # ── run pyinstaller via Windows Python ───────────────────────────────────────
 echo ""
 echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
@@ -137,6 +159,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
 "${WIN_PY[@]}" -m PyInstaller \
   --onefile \
   --windowed \
+  --splash "$SPLASH_WIN" \
   --runtime-hook "$RTH_WIN" \
   --name "FaceBlurInspector" \
   --distpath "$DIST_WIN" \
@@ -148,6 +171,8 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --hidden-import "libs.tracker" \
   --hidden-import "libs.smoother" \
   --hidden-import "libs.face_app" \
+  --hidden-import "libs.models" \
+  --hidden-import "splash" \
   --hidden-import "ui" \
   \
   --hidden-import "PyQt6" \
@@ -168,6 +193,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   \
   --hidden-import "onnx" \
   --hidden-import "onnxruntime.tools.onnx_model_utils" \
+  --collect-all "onnxconverter_common" \
   --hidden-import "scipy.signal" \
   --hidden-import "scipy.ndimage" \
   --hidden-import "scipy.spatial" \

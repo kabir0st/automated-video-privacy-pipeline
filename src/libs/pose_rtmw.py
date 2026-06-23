@@ -44,6 +44,7 @@ import numpy as np
 # ── COCO-WholeBody-133 keypoint layout ───────────────────────────────────────
 _NOSE, _L_EYE, _R_EYE, _L_EAR, _R_EAR = 0, 1, 2, 3, 4
 _L_SHOULDER, _R_SHOULDER = 5, 6
+_L_HIP, _R_HIP = 11, 12
 _FACE = slice(23, 91)               # 68 dense face landmarks
 _HEAD_ANCHORS = (_NOSE, _L_EYE, _R_EYE, _L_EAR, _R_EAR)
 
@@ -84,6 +85,10 @@ class PoseFrame:
     # source of the privacy safety-net anchors (see libs/pipeline.py). Empty
     # when RF-DETR is unavailable (rtmlib's YOLOX ran instead).
     person_boxes: list = field(default_factory=list)  # [(xyxy float32, score)]
+    # Per-person silhouettes from the RF-DETR ``-seg`` export, aligned with
+    # ``person_boxes`` (full-frame uint8, or None). Drawn on the TRACKING panel
+    # only; never used for the blur. Empty when the export has no mask output.
+    person_masks: list = field(default_factory=list)  # [uint8 mask | None]
     kpt_format: str = "coco133"
 
 
@@ -100,22 +105,57 @@ def _new_face(bbox: np.ndarray, score: float,
     return f
 
 
+def _torso_axis(
+    pts: np.ndarray, scr: np.ndarray
+) -> Optional[tuple[np.ndarray, np.ndarray, float]]:
+    """``(shoulder_mid, hip_mid, shoulder_width)`` for a confident torso, else None.
+
+    Requires both shoulders and both hips above ``_KPT_THR``: the body axis
+    (hip_mid → shoulder_mid → head) is the only reliable cue for which end of a
+    person is the head on a sideways / inverted / lying subject.
+    """
+    if (scr[_L_SHOULDER] <= _KPT_THR or scr[_R_SHOULDER] <= _KPT_THR
+            or scr[_L_HIP] <= _KPT_THR or scr[_R_HIP] <= _KPT_THR):
+        return None
+    sh = (pts[_L_SHOULDER] + pts[_R_SHOULDER]) / 2.0
+    hp = (pts[_L_HIP] + pts[_R_HIP]) / 2.0
+    sw = float(np.hypot(pts[_L_SHOULDER, 0] - pts[_R_SHOULDER, 0],
+                        pts[_L_SHOULDER, 1] - pts[_R_SHOULDER, 1]))
+    if sw < 4.0:
+        return None
+    return sh.astype(np.float32), hp.astype(np.float32), sw
+
+
 def _head_box_from_anchors(
     pts: np.ndarray, scr: np.ndarray, fw: int, fh: int
 ) -> Optional[tuple[np.ndarray, float]]:
-    """Coarse head box from nose/eyes/ears (+shoulders fallback).
+    """Coarse head box from nose/eyes/ears, oriented by the torso.
 
-    Used when the dense face keypoints are not confident (head turned far
-    away) so a strong turn-away still produces a head region to blur/track.
+    Used when the dense face keypoints are not confident (head turned far away)
+    so a strong turn-away still produces a head region to blur/track. The body
+    axis (hip_mid → shoulder_mid → head) both *validates* an anchor-derived head
+    (one landing on the hip side of the shoulders is a skeleton misfit onto
+    legs/torso, not a face) and *places* the shoulders-only guess — and we refuse
+    to guess a head we cannot orient rather than fabricate one over empty space.
     """
     def pt(i: int) -> tuple[float, float, float]:
         return float(pts[i, 0]), float(pts[i, 1]), float(scr[i])
+
+    torso = _torso_axis(pts, scr)
 
     head = [(x, y, s) for x, y, s in (pt(i) for i in _HEAD_ANCHORS) if s > _KPT_THR]
     if head:
         cx = float(np.mean([p[0] for p in head]))
         cy = float(np.mean([p[1] for p in head]))
         score = float(np.mean([p[2] for p in head]))
+        # A real head sits on the far side of the shoulders from the hips. When a
+        # torso is visible, reject a "head" on the hip side — the legs-read-as-
+        # upper-body misfit that fabricated a blur over the legs.
+        if torso is not None:
+            sh, hp, _sw = torso
+            up = sh - hp                       # hips → shoulders → head
+            if float(np.dot(np.asarray([cx, cy], dtype=np.float32) - sh, up)) <= 0:
+                return None
         lex, ley, lev = pt(_L_EAR)
         rex, rey, rev = pt(_R_EAR)
         if lev > _KPT_THR and rev > _KPT_THR:
@@ -130,26 +170,25 @@ def _head_box_from_anchors(
                 base = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) * 1.6
         w, h = 1.6 * base, 2.0 * base
     else:
-        ls, rs = pt(_L_SHOULDER), pt(_R_SHOULDER)
-        if ls[2] < _KPT_THR or rs[2] < _KPT_THR:
+        # No head anchors — guess the head only from a confident torso, placed a
+        # head-height beyond the shoulders *along the body axis*. Data-driven, so
+        # a sideways/inverted subject is handled; a torso we cannot establish
+        # (bare shoulders, legs misread as shoulders) yields no guess at all,
+        # where the old "above the shoulder line" hardcode fabricated one.
+        if torso is None:
             return None
-        sw = float(np.hypot(ls[0] - rs[0], ls[1] - rs[1]))
-        if sw < 4.0:
+        sh, hp, sw = torso
+        axis = sh - hp
+        torso_len = float(np.hypot(axis[0], axis[1]))
+        # A real torso is ~0.6×–3.5× shoulder width; a knee-to-knee or
+        # shoulder-to-elbow "torso" misfit falls outside this and is rejected.
+        if not (0.6 * sw <= torso_len <= 3.5 * sw):
             return None
-        # No head anchors at all — we can only *guess* the head from the
-        # shoulders, and that guess is only trustworthy for an upright person
-        # (head sits above a roughly horizontal shoulder line). On a sideways /
-        # bent / lying subject the head is beside or below the shoulders, so
-        # "above the midpoint" lands on empty space or random body — the exact
-        # runaway-blur failure. Bail unless the shoulder line is near-horizontal.
-        if abs(ls[1] - rs[1]) > 0.5 * sw:
-            return None
-        # Realistic head proportions (a head is ~0.45×shoulder-width), placed a
-        # head-height above the shoulder line — tied to head size, not span.
-        cx = (ls[0] + rs[0]) / 2
+        up = axis / torso_len
         w, h = 0.5 * sw, 0.6 * sw
-        cy = (ls[1] + rs[1]) / 2 - 0.6 * h
-        score = float(min(ls[2], rs[2])) * 0.5
+        hc = sh + up * (0.6 * h)
+        cx, cy = float(hc[0]), float(hc[1])
+        score = float(min(scr[_L_SHOULDER], scr[_R_SHOULDER])) * 0.5
 
     if w < 4 or h < 4:
         return None
@@ -217,16 +256,18 @@ class RTMWPoseEstimator:
         (e.g. DirectML's strict shape validation), that model keeps its working
         CPU session instead of taking down the pipeline.
         """
-        from .utils import best_onnx_providers
+        from .utils import best_onnx_providers, make_session
 
         providers = best_onnx_providers()
         if not providers or providers[0] == "CPUExecutionProvider":
             return
-        import onnxruntime as ort
 
         for name, tool in (("detector", wb.det_model), ("pose", wb.pose_model)):
             try:
-                sess = ort.InferenceSession(tool.onnx_model, providers=providers)
+                # make_session adds the fp16 derivative (RDNA2/DirectML ~2×) and
+                # DirectML-friendly session options; on any failure it raises and
+                # the model keeps its working CPU session below.
+                sess = make_session(tool.onnx_model, providers)
                 self._retired.append(tool.session)  # keep alive; never destroy
                 tool.session = sess
                 self._status(f"RTMW {name} on {sess.get_providers()[0]}")
@@ -240,7 +281,10 @@ class RTMWPoseEstimator:
         # Prefer RF-DETR person boxes (better recall than rtmlib's YOLOX, and
         # the safety-net anchor source); fall back to the bundled YOLOX when
         # RF-DETR is unavailable so behaviour degrades to the old path.
-        person_boxes = self._person.detect(frame_bgr) if self._person else []
+        if self._person:
+            person_boxes, person_masks = self._person.detect(frame_bgr)
+        else:
+            person_boxes, person_masks = [], []
         if person_boxes:
             bboxes = [b.tolist() for b, _s in person_boxes]
             kpts, scores = self._wb.pose_model(frame_bgr, bboxes=bboxes)
@@ -248,7 +292,7 @@ class RTMWPoseEstimator:
             kpts, scores = self._wb(frame_bgr)
         kpts = np.asarray(kpts, dtype=np.float32)
         scores = np.asarray(scores, dtype=np.float32)
-        out = PoseFrame(person_boxes=person_boxes)
+        out = PoseFrame(person_boxes=person_boxes, person_masks=person_masks)
         if kpts.ndim != 3 or kpts.shape[0] == 0:
             return out
 

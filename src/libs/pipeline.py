@@ -1,8 +1,9 @@
 """Shared detection front-end: SCRFD faces ⊕ RTMW pose, ensembled.
 
-cli.py and ui.py both ran near-identical "detect faces, refine close-ups, ask
-the pose model for head boxes" code. This module centralises it and adds the
-ensemble that fixes the two failures the project hit on its target footage
+The GUI's preview and export paths both need identical "detect faces, refine
+close-ups, ask the pose model for head boxes" logic. This module centralises it
+and adds the ensemble that fixes the two failures the project hit on its target
+footage
 (two people in bed, cuddling, top-down close-ups):
 
   1. *Missed faces at odd angles.* SCRFD only fires near-frontal, so a face
@@ -24,7 +25,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from .pose_rtmw import PoseFrame, RTMWPoseEstimator
+from .pose_rtmw import _KPT_THR, PoseFrame, RTMWPoseEstimator, _torso_axis
 from .utils import crop_face_patch, unproject_landmark
 
 # An SCRFD detection this confident is kept even with no corroborating pose
@@ -46,6 +47,9 @@ _ANCHOR_TOP_FRAC = 0.33
 # Suppress an anchor whose head region a real face or pose head already covers —
 # only a genuinely unseen head earns a safety-net blur.
 _ANCHOR_COVERED_IOU = 0.10
+# When no pose orients a person box, the top-of-box head guess is only trusted
+# for a clearly-upright (tall) box; a top-down/lying box has its head elsewhere.
+_ANCHOR_UPRIGHT_ASPECT = 1.3
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -159,6 +163,72 @@ def _person_head_region(pbox: np.ndarray, frac: float = _ANCHOR_TOP_FRAC) -> np.
     return np.array([cx - hw / 2, y1, cx + hw / 2, y1 + hh], dtype=np.float32)
 
 
+def _best_pose_in_box(
+    poses: list, box: np.ndarray, *, min_frac: float = 0.30
+) -> Optional[np.ndarray]:
+    """The pose with the largest share of its confident keypoints inside ``box``.
+
+    Lets a person box borrow orientation from the pose that belongs to it; None
+    when no pose overlaps the box well enough to trust."""
+    best: Optional[np.ndarray] = None
+    best_frac = min_frac
+    for pose in poses:
+        pose = np.asarray(pose, dtype=np.float32)
+        conf = pose[:, 2] > _KPT_THR
+        c = int(conf.sum())
+        if c == 0:
+            continue
+        inside = (conf
+                  & (pose[:, 0] >= box[0]) & (pose[:, 0] <= box[2])
+                  & (pose[:, 1] >= box[1]) & (pose[:, 1] <= box[3]))
+        frac = int(inside.sum()) / c
+        if frac > best_frac:
+            best_frac, best = frac, pose
+    return best
+
+
+def _head_from_torso(
+    torso: tuple[np.ndarray, np.ndarray, float], pbox: np.ndarray
+) -> Optional[np.ndarray]:
+    """Head region placed a head-height beyond the shoulders along the body axis,
+    clipped to the person box. None when the torso is implausibly proportioned."""
+    sh, hp, sw = torso
+    axis = sh - hp
+    tlen = float(np.hypot(axis[0], axis[1]))
+    if not (0.6 * sw <= tlen <= 3.5 * sw):
+        return None
+    up = axis / tlen
+    hw, hh = 0.5 * sw, 0.6 * sw
+    hc = sh + up * (0.6 * sw)
+    region = np.array([hc[0] - hw, hc[1] - hh, hc[0] + hw, hc[1] + hh],
+                      dtype=np.float32)
+    region[[0, 1]] = np.maximum(region[[0, 1]], pbox[[0, 1]])
+    region[[2, 3]] = np.minimum(region[[2, 3]], pbox[[2, 3]])
+    if region[2] - region[0] < 4 or region[3] - region[1] < 4:
+        return None
+    return region
+
+
+def _oriented_head_region(pbox: np.ndarray, poses: list) -> Optional[np.ndarray]:
+    """Locate a person box's head using overlapping pose keypoints.
+
+    Places the region at the *actual* head end via the body axis (handles
+    sideways/inverted subjects). Falls back to the box's top slice only for a
+    confidently-upright box, and returns None when nothing orients it — so a
+    top-down/lying person never blurs its legs as a head."""
+    pose = _best_pose_in_box(poses, pbox)
+    if pose is not None:
+        torso = _torso_axis(pose[:, :2], pose[:, 2])
+        if torso is not None:
+            region = _head_from_torso(torso, pbox)
+            if region is not None:
+                return region
+    x1, y1, x2, y2 = (float(v) for v in pbox[:4])
+    if (y2 - y1) < _ANCHOR_UPRIGHT_ASPECT * max(x2 - x1, 1.0):
+        return None
+    return _person_head_region(pbox)
+
+
 def anchor_regions(
     pose: PoseFrame,
     faces: list,
@@ -167,9 +237,10 @@ def anchor_regions(
 ) -> list[tuple[np.ndarray, float]]:
     """Head regions for people RF-DETR saw but no face/pose head covers.
 
-    Returns [(xyxy, score)] the tracker may spawn a safety-net blur from. A
-    person already covered by a kept face or a pose head region is skipped — the
-    anchor exists only to catch a head nothing else found.
+    Returns [(xyxy, score)] the tracker may spawn a safety-net blur from. The
+    region is oriented from the person's own pose keypoints (never a blind
+    top-of-box guess), and a person already covered by a kept face or a pose head
+    region is skipped — the anchor exists only to catch a head nothing else found.
     """
     if not pose.person_boxes:
         return []
@@ -179,7 +250,9 @@ def anchor_regions(
     for pbox, pscore in pose.person_boxes:
         if pscore < person_score_min:
             continue
-        head = _person_head_region(np.asarray(pbox, dtype=np.float32))
+        head = _oriented_head_region(np.asarray(pbox, dtype=np.float32), pose.poses)
+        if head is None:
+            continue
         if any(_iou(head, fb) > _ANCHOR_COVERED_IOU for fb in face_boxes):
             continue
         if any(_iou(head, r) > _ANCHOR_COVERED_IOU for r in regions):

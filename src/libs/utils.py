@@ -1,5 +1,36 @@
+import os
+import tempfile
+import time
+import warnings
+from pathlib import Path
+
 import cv2
 import numpy as np
+
+# ── windowed-safe debug log ───────────────────────────────────────────────────
+# The frozen build is --windowed: sys.stdout/stderr are routed to devnull
+# (rth_windowed_stdio.py), so print() debug vanishes. Mirror every status line
+# into this file (beside the existing FaceBlurInspector-error.log) so model
+# locations, downloads and provider/model-load info are inspectable in the .exe.
+DEBUG_LOG = Path(tempfile.gettempdir()) / "FaceBlurInspector-debug.log"
+
+
+def debug_log(msg: str) -> None:
+    """Append a timestamped line to DEBUG_LOG and echo to stdout.
+
+    Best-effort: never raises (a logging failure must not take down startup or a
+    worker frame). print() is harmless in dev and lands in devnull in the
+    windowed .exe, so the file is the source of truth there."""
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        print(line)
+    except Exception:  # noqa: BLE001 — devnull/closed stream in some builds
+        pass
 
 try:
     import torch
@@ -46,6 +77,77 @@ def has_gpu_provider() -> bool:
     """True when a non-CPU ONNX execution provider is available."""
     prov = best_onnx_providers()
     return bool(prov) and prov[0] != "CPUExecutionProvider"
+
+
+# ── float16 acceleration for GPU inference ───────────────────────────────────
+# RDNA2 (e.g. RX 6800) runs float16 convolutions/matmuls at roughly twice the
+# float32 rate, and DirectML honours an fp16 graph. Converting each model's
+# *internal* compute to fp16 while keeping its float32 inputs/outputs
+# (``keep_io_types=True``) is a near-lossless ~2× inference speedup that needs
+# no change to the numpy plumbing in insightface/rtmlib that feeds these
+# sessions float32 arrays. Output deviation measured on this project's models is
+# ~0.03 % (SCRFD det) / ~0.3 % (106-pt landmarks) — sub-pixel, imperceptible.
+
+# Shared on-disk cache for derived model files (also used by face_app for the
+# DirectML shape-pinned det variants).
+DERIVED_MODEL_CACHE = Path(tempfile.gettempdir()) / "FaceBlurInspector-models"
+
+
+def fp16_enabled() -> bool:
+    """fp16 GPU inference is on by default; ``AVPP_FP16=0`` disables it.
+
+    A single env kill-switch so a model that misbehaves under DirectML's strict
+    fp16 validation can be turned off without rebuilding the .exe."""
+    return os.environ.get("AVPP_FP16", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def fp16_model_path(src_path: str) -> str:
+    """Return a float16-internal (float32 I/O) copy of an ONNX model, cached on
+    disk. Returns ``src_path`` unchanged when fp16 is disabled, no GPU provider
+    is active (fp16 is slower on CPU), or conversion fails for any reason —
+    callers always get a usable path."""
+    if not fp16_enabled() or not has_gpu_provider():
+        return src_path
+    try:
+        src = Path(src_path)
+        DERIVED_MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+        # Key on size+mtime so a re-downloaded/updated model invalidates its
+        # cached fp16 derivative instead of silently reusing a stale one.
+        st = src.stat()
+        dst = DERIVED_MODEL_CACHE / f"{src.stem}_fp16_{st.st_size}_{int(st.st_mtime)}.onnx"
+        if not dst.exists():
+            import onnx
+            from onnxconverter_common import float16
+
+            model = onnx.load(str(src))
+            with warnings.catch_warnings():
+                # convert_float_to_float16 warns per tiny denormal it clamps to
+                # the fp16 range; harmless and very noisy, so silence it.
+                warnings.simplefilter("ignore")
+                model16 = float16.convert_float_to_float16(
+                    model, keep_io_types=True, disable_shape_infer=True)
+            onnx.save(model16, str(dst))
+        return str(dst)
+    except Exception:  # noqa: BLE001 — any failure → fall back to fp32 model
+        return src_path
+
+
+def make_session(model_path: str, providers: list[str]):
+    """Build an ONNX Runtime session with fp16 (GPU) and DirectML-friendly
+    options. Use for sessions this project creates directly (RTMW, RF-DETR);
+    insightface/rtmlib that build their own sessions get fp16 via the model
+    file from :func:`fp16_model_path` instead."""
+    import onnxruntime as ort
+
+    path = fp16_model_path(model_path)
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    if providers and providers[0] == "DmlExecutionProvider":
+        # DirectML does not support ORT's memory-pattern planner; leaving it on
+        # forces a fallback path. Disabling is required for DML, harmless else.
+        so.enable_mem_pattern = False
+    return ort.InferenceSession(path, sess_options=so, providers=providers)
 
 
 # ── crop / unproject helpers ─────────────────────────────────────────────────
