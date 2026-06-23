@@ -17,10 +17,13 @@
 #     (insightface, boxmot, onnxruntime, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - InsightFace models (~300 MB) are downloaded at first launch to
-#     %USERPROFILE%\.insightface\models\ and are NOT bundled (intentional).
-#   - CUDA/GPU acceleration requires matching CUDA drivers on the Windows host.
-#     The app falls back to CPU automatically when CUDA is unavailable.
+#   - InsightFace models (~300 MB) and the RTMW/YOLOX pose models (~300-400 MB)
+#     are downloaded at first launch to %USERPROFILE%\.insightface\ and
+#     %USERPROFILE%\.cache\rtmlib\ respectively, and are NOT bundled (intentional).
+#   - GPU acceleration uses the DirectML execution provider (onnxruntime-directml),
+#     which runs on any Windows GPU including the AMD Radeon RX 6800. The build
+#     asserts DirectML is active so a silent CPU-only bundle can't ship; the app
+#     still falls back to CPU at runtime if no GPU is present.
 
 set -euo pipefail
 
@@ -62,15 +65,29 @@ echo ">>> Installing dependencies into Windows Python…"
 # rate-controlled, co64-safe H.264 encoding (replacing cv2.VideoWriter, which
 # blew exports past 4 GiB into unplayable files). It is collected into the
 # bundle below so no system ffmpeg install is required on the target machine.
+# tqdm is rtmlib's download-progress dependency; pulled in explicitly so the
+# rtmlib --no-deps install below leaves nothing missing.
 "${WIN_PY[@]}" -m pip install --no-cache-dir \
   "boxmot==21.0.0" \
-  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg
+  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg tqdm
+
+# rtmlib is the default pose backend (RTMDet/YOLOX → RTMW whole-body); it must
+# be installed here so PyInstaller can bundle it, or the .exe dies with
+# "No module named 'rtmlib'" and silently falls back to SCRFD-only.
+#
+# CRITICAL: install it with --no-deps. rtmlib declares a plain `onnxruntime`
+# dependency, which pip would resolve to the CPU-only wheel and silently
+# overwrite the DirectML build below (they share the same `onnxruntime` package
+# directory) — the .exe would then run inference on CPU. All of rtmlib's real
+# runtime deps (numpy, opencv-python, onnxruntime, tqdm) are provided by the
+# other install lines, so --no-deps yields a fully working rtmlib.
+"${WIN_PY[@]}" -m pip install --no-cache-dir --no-deps rtmlib
 
 # GPU: onnxruntime-directml ships the DirectML execution provider, which
-# accelerates inference on any Windows GPU (AMD/Intel/NVIDIA). It installs
-# into the same `onnxruntime` package directory as the CPU-only build that
-# insightface pulls in, so remove BOTH and force-reinstall directml — a plain
-# uninstall of one corrupts the other's shared files.
+# accelerates inference on any Windows GPU including the AMD Radeon RX 6800. It
+# installs into the same `onnxruntime` package directory as the CPU-only build
+# that insightface/rtmlib pull in, so remove BOTH and force-reinstall directml.
+# This MUST be the last pip operation that touches onnxruntime.
 "${WIN_PY[@]}" -m pip uninstall --quiet -y onnxruntime onnxruntime-directml || true
 "${WIN_PY[@]}" -m pip install --no-cache-dir --force-reinstall --no-deps onnxruntime-directml
 
@@ -81,9 +98,17 @@ SRC_WIN_DIR=$(wslpath -w "$SCRIPT_DIR/src")
 "${WIN_PY[@]}" -c "
 import sys
 sys.path.insert(0, r'$SRC_WIN_DIR')
+import rtmlib  # default pose backend — must be importable for bundling
 import ui  # pulls in PyQt6, insightface, boxmot, libs.*
+import onnxruntime as ort
 from libs.utils import best_onnx_providers
-print('imports OK, onnx providers:', best_onnx_providers())
+prov = best_onnx_providers()
+print('imports OK | rtmlib', getattr(rtmlib, '__version__', '?'),
+      '| onnx providers:', prov)
+assert 'DmlExecutionProvider' in ort.get_available_providers(), (
+    'DirectML provider missing — onnxruntime-directml is not active, the .exe '
+    'would run inference on CPU. Re-check the force-reinstall step above.')
+print('OK: DirectML provider present — GPU inference will be used on the RX 6800')
 "
 
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
@@ -135,6 +160,10 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --collect-all "onnxruntime" \
   --collect-all "boxmot" \
   --collect-all "imageio_ffmpeg" \
+  --collect-all "rtmlib" \
+  --hidden-import "tqdm" \
+  --hidden-import "libs.pose_rtmw" \
+  --hidden-import "libs.pipeline" \
   --hidden-import "libs.video_writer" \
   \
   --hidden-import "onnx" \

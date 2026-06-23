@@ -3,7 +3,6 @@
 Usage:
     uv run python src/main.py                        # open GUI inspector
     uv run python src/main.py --input path/to/video.mp4
-    uv run python src/main.py --input 0              # webcam
     uv run python src/main.py --input video.mp4 --output out.mp4
 """
 

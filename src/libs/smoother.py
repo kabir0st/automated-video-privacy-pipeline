@@ -51,6 +51,12 @@ class LandmarkSmoother:
                     confidence; use per-landmark scores if available).
         """
         n = len(landmarks)
+        # A single track can switch landmark source mid-life (SCRFD's 106-point
+        # mesh ⇄ RTMW's 68 face keypoints as the head turns); the per-landmark
+        # history is indexed by position, so a changed count must reset it or
+        # history[i] would index out of range / mix unrelated points.
+        if track_id in self._histories and len(self._histories[track_id]) != n:
+            self.drop(track_id)
         if track_id not in self._histories:
             self._init_track(track_id, n)
 

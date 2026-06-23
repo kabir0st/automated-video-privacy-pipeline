@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+This release rebuilds face finding around **whole-body pose** so the blur holds
+on faces at the hard angles the previous frontal detector missed — two people
+in bed, cuddling, top-down close-ups — and pushes the heavy work onto the GPU.
+
+### Detection & estimation
+
+- **RTMW whole-body pose backend** (`src/libs/pose_rtmw.py`). A RTMDet/YOLOX
+  person detector feeds RTMW, producing 133 COCO-WholeBody keypoints per
+  person; the 68 dense face keypoints (indices 23-90) become a tight face hull
+  that keeps landing on the face when it looks up, down, or away. Built on
+  `rtmlib` (pure ONNX Runtime — no mmcv/mmengine), lazy-loaded and degrading to
+  SCRFD-only if unavailable.
+- **SCRFD ⊕ RTMW ensemble** (`src/libs/pipeline.py`, shared by the CLI and
+  inspector). SCRFD's 106-point mesh still wins on near-frontal faces; RTMW
+  fills in every angle SCRFD misses (in test footage SCRFD found 1 face where
+  the ensemble found 8).
+- **Skin false-positive gating.** SCRFD detections that overlap no RTMW head
+  region — bare skin mistaken for a face, a real problem on nude footage — are
+  dropped instead of blurred. High-confidence detections are always kept so
+  genuine faces are never lost.
+- `--pose-backend {rtmw,mediapipe,none}` and `--pose-mode
+  {performance,balanced,lightweight}` on the CLI; matching fields on the
+  inspector's `Params`/presets. MediaPipe is retained as a legacy backend.
+
+### GPU acceleration
+
+- **All ONNX inference targets the GPU.** Provider preference is now DirectML →
+  CUDA → ROCm → CPU, so an **AMD Radeon RX 6800** runs SCRFD, YOLOX and RTMW on
+  DirectML (Windows). The RTMW session swap is best-effort per model and keeps a
+  working CPU session if a provider rejects a graph.
+- **GPU blur on AMD/Intel.** New OpenCV OpenCL/UMat blur path (`BlurPipeline`)
+  runs the blur stack on any OpenCL GPU, where the previous PyTorch-CUDA path
+  only ever fired on NVIDIA.
+- Startup diagnostics print the active ONNX provider and blur backend.
+
+### Packaging (Windows .exe)
+
+- `build_exe.sh` now installs and bundles **rtmlib** (`--collect-all rtmlib`),
+  fixing the `No module named 'rtmlib'` crash in the frozen `.exe` that dropped
+  it to SCRFD-only. rtmlib is installed with `--no-deps` so its plain
+  `onnxruntime` dependency can't overwrite the DirectML build (which would
+  silently force CPU inference); `onnxruntime-directml` is force-reinstalled
+  last. The build smoke test now asserts `DmlExecutionProvider` is present, so a
+  CPU-only bundle fails the build instead of shipping. Verified end-to-end: a
+  frozen test exe imports `rtmlib.Wholebody` and reports DirectML active.
+
+### Fixes
+
+- `LandmarkSmoother` now resets a track's history when its landmark count
+  changes (SCRFD's 106 points ⇄ RTMW's 68), which would otherwise index out of
+  range as a head turned between backends.
+
 ## [0.2.0] — 2026-06-17
 
 This release is about **tracking and estimating faces more reliably** — keeping

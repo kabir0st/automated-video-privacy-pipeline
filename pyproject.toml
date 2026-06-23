@@ -12,6 +12,7 @@ dependencies = [
     "mediapipe>=0.10.35",
     "onnxruntime>=1.26.0",
     "pyqt6>=6.6.0",
+    "rtmlib>=0.0.15",
     "scipy>=1.17.1",
 ]
 

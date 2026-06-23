@@ -1,9 +1,11 @@
 """Pipeline B CLI — Highest Accuracy Offline face landmark tracking.
 
+Processes a video file only (no webcam/live capture).
+
 Usage (via the main.py dispatcher):
-    uv run python src/main.py --input path/to/video.mp4
-    uv run python src/main.py --input 0              # webcam
-    uv run python src/main.py --input video.mp4 --output out.mp4
+    uv run python src/main.py --input path/to/video.mp4 --output out.mp4
+    uv run python src/main.py --input video.mp4 --privacy-safety-net
+    uv run python src/main.py --input video.mp4 --output out.mp4 --two-pass
 """
 
 import argparse
@@ -14,21 +16,16 @@ import cv2
 import numpy as np
 from libs.face_app import FaceApp
 
-from libs.pose_head import PoseHeadEstimator
+from libs.pipeline import detect, make_pose_backend
 from libs.tracker import KalmanFaceTracker
 from libs.video_writer import make_video_writer, source_bitrate_kbps
-from libs.utils import (
-    BlurPipeline,
-    MaskBuilder,
-    best_onnx_providers,
-    crop_face_patch,
-    is_likely_face,
-    unproject_landmark,
-)
+from libs.utils import BlurPipeline, MaskBuilder, best_onnx_providers
 
 CLOSE_UP_AREA_RATIO = 0.6
 CLOSE_UP_TARGET_SIZE = 1024
 NORMAL_TARGET_SIZE = 640
+DET_SCORE = 0.55          # SCRFD confidence floor
+FACE_ASPECT = 0.40        # min width/height ratio for an SCRFD face
 
 _TRACK_COLOURS = [
     (0, 255, 0),
@@ -46,11 +43,6 @@ _TRACK_COLOURS = [
 
 def track_colour(track_id: int) -> tuple[int, int, int]:
     return _TRACK_COLOURS[track_id % len(_TRACK_COLOURS)]
-
-
-def is_close_up(bbox: np.ndarray, frame_h: int, frame_w: int) -> bool:
-    x1, y1, x2, y2 = bbox[:4]
-    return ((x2 - x1) * (y2 - y1)) / (frame_h * frame_w) > CLOSE_UP_AREA_RATIO
 
 
 def draw_track_outline(
@@ -77,7 +69,7 @@ def draw_track_outline(
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Pipeline B: InsightFace + Kalman face tracking (+ pose assist) + GPU blur")
-    p.add_argument("--input", default="0", help="Video path or webcam index (default: 0)")
+    p.add_argument("--input", required=True, help="Path to the video file to process")
     p.add_argument("--output", default="", help="Optional output video path")
     p.add_argument(
         "--target-size", type=int, default=NORMAL_TARGET_SIZE,
@@ -85,12 +77,35 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-display", action="store_true", help="Suppress cv2.imshow")
     p.add_argument(
-        "--no-pose", action="store_true",
-        help="Disable pose-assisted head tracking for lost faces",
+        "--pose-backend", default="rtmw", choices=["rtmw", "mediapipe", "none"],
+        help="Head/pose source: rtmw (RTMDet+RTMW, robust at odd angles, "
+             "default), mediapipe (legacy), or none",
     )
     p.add_argument(
-        "--hold-secs", type=float, default=2.0,
-        help="Keep blurring a lost face this long on Kalman prediction (default: 2.0)",
+        "--pose-mode", default="performance",
+        choices=["performance", "balanced", "lightweight"],
+        help="RTMW model: performance (RTMW-x, best), balanced, or lightweight "
+             "(RTMW-l, fast)",
+    )
+    p.add_argument(
+        "--no-pose", action="store_true",
+        help="Alias for --pose-backend none (disable pose assist entirely)",
+    )
+    p.add_argument(
+        "--hold-secs", type=float, default=0.6,
+        help="Keep blurring a lost face this long on Kalman prediction (default: 0.6)",
+    )
+    p.add_argument(
+        "--privacy-safety-net", action="store_true",
+        help="Blur the head region of any RF-DETR-detected person even when no "
+             "face/pose is found (fewer missed-face leaks; may over-blur). "
+             "Requires --pose-backend rtmw and an exported RF-DETR ONNX model.",
+    )
+    p.add_argument(
+        "--two-pass", action="store_true",
+        help="Offline two-pass: collect detections over the whole video, then "
+             "forward-backward interpolate to blur faces across their full "
+             "on-screen span (requires --output; no live display).",
     )
     return p
 
@@ -98,14 +113,36 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
 
-    source = int(args.input) if args.input.isdigit() else args.input
+    source = args.input
 
-    app = FaceApp(providers=best_onnx_providers())
+    providers = best_onnx_providers()
+    print(f"[providers] ONNX inference: {providers[0]}  (available: {providers})")
+    if providers[0] == "CPUExecutionProvider":
+        print("[providers] WARNING: no GPU provider — on an AMD RX 6800 install "
+              "onnxruntime-directml (Windows) for GPU inference.", file=sys.stderr)
+    app = FaceApp(providers=providers)
     app.prepare(ctx_id=0, det_size=(args.target_size, args.target_size))
 
     blur = BlurPipeline()
     masks = MaskBuilder()
-    pose = None if args.no_pose else PoseHeadEstimator(on_status=print)
+    backend = "none" if args.no_pose else args.pose_backend
+    pose = make_pose_backend(backend, mode=args.pose_mode, on_status=print)
+
+    if args.two_pass:
+        if not args.output:
+            print("ERROR: --two-pass requires --output", file=sys.stderr)
+            sys.exit(1)
+        from libs.two_pass import run_two_pass
+
+        run_two_pass(
+            source, args.output, app=app, pose=pose, blur=blur,
+            det_score=DET_SCORE, face_aspect=FACE_ASPECT,
+            close_up_ratio=CLOSE_UP_AREA_RATIO,
+            close_up_target=CLOSE_UP_TARGET_SIZE,
+            hold_secs=args.hold_secs, safety_net=args.privacy_safety_net,
+            on_status=lambda m: print(m, file=sys.stderr),
+        )
+        return
 
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -146,37 +183,20 @@ def main() -> None:
             if not ret:
                 break
 
-        # ── detection ────────────────────────────────────────────────────────
-        raw_faces = app.get(frame)
-        faces = [f for f in raw_faces if is_likely_face(f.bbox, float(f.det_score))]
-
-        # Close-up: face fills > 60 % of frame → crop + upsample for precision.
-        refined: list = []
-        for face in faces:
-            if is_close_up(face.bbox, frame_h, frame_w):
-                crop, (ox, oy, scale) = crop_face_patch(
-                    frame, face.bbox[:4], target_size=CLOSE_UP_TARGET_SIZE
-                )
-                crop_faces = app.get(crop)
-                if crop_faces:
-                    cf = crop_faces[0]
-                    if cf.landmark_2d_106 is not None:
-                        cf.landmark_2d_106 = np.array(
-                            [unproject_landmark(x, y, ox, oy, scale) for x, y in cf.landmark_2d_106],
-                            dtype=np.float32,
-                        )
-                        cf.bbox[:4] = [
-                            ox + cf.bbox[0] / scale, oy + cf.bbox[1] / scale,
-                            ox + cf.bbox[2] / scale, oy + cf.bbox[3] / scale,
-                        ]
-                    refined.append(cf)
-                    continue
-            refined.append(face)
+        # ── detection — SCRFD faces ⊕ RTMW pose faces (ensembled) ─────────────
+        faces, head_boxes, anchors, _pf = detect(
+            app, frame, pose,
+            det_score=DET_SCORE, face_aspect=FACE_ASPECT,
+            close_up_ratio=CLOSE_UP_AREA_RATIO,
+            close_up_target=CLOSE_UP_TARGET_SIZE,
+        )
 
         # ── tracking — Kalman predict + face correction; pose head boxes
-        # revive tracks whose face the detector lost this frame ───────────────
-        head_provider = (lambda f=frame: pose.head_boxes(f)) if pose else None
-        tracked = tracker.update(refined, frame.shape, head_provider)
+        # revive tracks whose face the detector lost this frame; RF-DETR person
+        # anchors (opt-in) spawn/sustain blur where no face was ever found ─────
+        head_provider = (lambda: head_boxes) if pose is not None else None
+        anchor_provider = (lambda: anchors) if args.privacy_safety_net else None
+        tracked = tracker.update(faces, frame.shape, head_provider, anchor_provider)
 
         # ── build combined blur mask (one pass for all faces) ─────────────────
         blur_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)

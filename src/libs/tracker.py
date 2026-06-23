@@ -14,11 +14,30 @@ predicts the head position; measurements then correct it:
     it pins position but barely moves the size, since pose head boxes
     are coarser than face detections,
   * with no measurement at all the track coasts on prediction (velocity
-    damped each frame so the box cannot sail away) and is dropped only
-    after `hold_secs` without any correction or when it leaves the frame.
+    damped each frame so the box cannot sail away).
 
-Tracks are only ever *created* from a face detection, so the pose model
-cannot start blurring someone whose face was never seen.
+A track is dropped after `hold_secs` without a *face* correction (a pose head
+box may reposition a momentarily-lost track but does not prolong it) or when it
+leaves the frame. Were head boxes to reset the expiry clock, a body that stays
+in frame would revive a faceless track forever — blurring a bare body long
+after the face was gone.
+
+Tracks are normally only ever *created* from a face detection, so the pose
+model cannot start blurring someone whose face was never seen.
+
+The one deliberate exception is the **privacy safety-net anchor** (opt-in via
+``anchor_provider``). RF-DETR person boxes (see libs/person_detector.py) carry
+head-region boxes that *may* spawn a track and sustain a blur even when SCRFD
+and RTMW both fail on a person who is plainly present (head turned fully away,
+motion blur). For a privacy tool a missed face is the failure that matters, so
+this trades a small over-blur risk for fewer leaks — and it is bounded:
+
+  * an anchor only spawns where it overlaps no existing track (no double-blur);
+  * the instant a real face matches an anchor track it becomes an ordinary face
+    track (SCRFD's tight hull takes over);
+  * a track stays alive while a *face* was seen within ``hold_secs`` OR a person
+    anchor within ``anchor_hold_secs`` — so a lost-face track is sustained only
+    as long as RF-DETR still sees that person, then it expires.
 """
 
 from typing import Any, Callable, NamedTuple, Optional
@@ -26,12 +45,24 @@ from typing import Any, Callable, NamedTuple, Optional
 import numpy as np
 
 _MATCH_IOU = 0.3
-# Pose head boxes are coarse; accept them on loose overlap with the
-# predicted box, or on centre distance when overlap fails entirely.
-_HEAD_MATCH_IOU = 0.1
+# Pose head boxes are coarse, but reviving a lost track on a near-miss let a
+# stray/oversized head box drag a track onto empty space. Require a real
+# overlap, and only fall back to centre distance when it is tight AND the sizes
+# are comparable.
+_HEAD_MATCH_IOU = 0.3
+# Cap how much a single weak (pose head box) correction may grow a track's box.
+_WEAK_GROW_MAX = 1.3
 # Per-coast-frame velocity decay — keeps an undetected box from drifting
 # off across the frame at its last observed speed.
 _COAST_VEL_DAMP = 0.92
+# A person anchor must overlap a track this much to sustain it (same person),
+# and must overlap *no* track this much before it may spawn a fresh anchor
+# track (so an anchor never duplicates an existing blur).
+_ANCHOR_MATCH_IOU = 0.2
+_ANCHOR_SPAWN_IOU = 0.2
+# Sentinel for "never anchor-corrected" — large enough that the OR-aliveness
+# rule ignores it until an anchor actually resets it to 0.
+_NEVER = 1 << 30
 
 # ByteTrack-style noise weights, relative to box height.
 _W_POS = 1.0 / 20.0
@@ -71,7 +102,11 @@ class _Track:
 
     def __init__(self, track_id: int, bbox: np.ndarray) -> None:
         self.id = track_id
-        self.misses = 0          # frames since last correction of any kind
+        self.face_misses = 0     # frames since last *face* correction
+        # Frames since last person-anchor correction. Starts "never" so a
+        # face-born track is held purely by the face rule unless an anchor
+        # actually sustains it.
+        self.anchor_misses = _NEVER
         self.source = "face"
         z = _xyxy_to_z(bbox)
         h = max(z[3], 1.0)
@@ -110,12 +145,18 @@ class _Track:
         else:
             r = [(_W_POS * h) ** 2] * 4
         R = np.diag(r)
+        w0, h0 = float(self.x[2]), float(self.x[3])
         y = z - self._H @ self.x
         S = self._H @ self.P @ self._H.T + R
         K = self.P @ self._H.T @ np.linalg.inv(S)
         self.x = self.x + K @ y
         self.P = (np.eye(6) - K @ self._H) @ self.P
-        self.misses = 0
+        if weak:
+            # A coarse head box must never balloon a face-sized track.
+            self.x[2] = min(self.x[2], w0 * _WEAK_GROW_MAX)
+            self.x[3] = min(self.x[3], h0 * _WEAK_GROW_MAX)
+        if not weak:        # only a real face match resets the expiry clock
+            self.face_misses = 0
 
 
 class KalmanFaceTracker:
@@ -132,7 +173,11 @@ class KalmanFaceTracker:
         self,
         fps: float = 30.0,
         match_iou: float = _MATCH_IOU,
-        hold_secs: float = 2.0,
+        hold_secs: float = 0.6,
+        # A track sustained only by a person anchor (no face) is held this long
+        # after the person also disappears — longer than hold_secs because the
+        # whole point is to keep covering a person whose face we never see.
+        anchor_hold_secs: float = 2.0,
         # Privacy: every detected face must get a track (and therefore a
         # blur) — the cap only bounds pathological detector spam.
         max_tracks: int = 16,
@@ -140,6 +185,7 @@ class KalmanFaceTracker:
         self._fps = max(fps, 1.0)
         self._match_iou = match_iou
         self._hold_secs = hold_secs
+        self._anchor_hold_secs = anchor_hold_secs
         self._max_tracks = max_tracks
         self._tracks: list[_Track] = []
         self._next_id = 1
@@ -163,11 +209,16 @@ class KalmanFaceTracker:
     def _hold_frames(self) -> int:
         return max(1, int(round(self._hold_secs * self._fps)))
 
+    @property
+    def _anchor_hold_frames(self) -> int:
+        return max(1, int(round(self._anchor_hold_secs * self._fps)))
+
     def update(
         self,
         faces: list[Any],
         frame_shape: tuple[int, ...],
         head_provider: Optional[Callable[[], list[tuple[np.ndarray, float]]]] = None,
+        anchor_provider: Optional[Callable[[], list[tuple[np.ndarray, float]]]] = None,
     ) -> list[TrackedFace]:
         fh, fw = frame_shape[:2]
 
@@ -246,23 +297,68 @@ class KalmanFaceTracker:
                 diag = float(np.hypot(t.x[2], t.x[3]))
                 hz = _xyxy_to_z(cand)
                 dist = float(np.hypot(t.x[0] - hz[0], t.x[1] - hz[1]))
-                if score >= _HEAD_MATCH_IOU or dist < 0.7 * diag:
+                area_ratio = (hz[2] * hz[3]) / max(t.x[2] * t.x[3], 1.0)
+                close = dist < 0.35 * diag and 0.3 < area_ratio < 3.0
+                if score >= _HEAD_MATCH_IOU or close:
                     t.correct(cand, weak=True)
                     t.source = "head"
                     head_corrected.add(t)
                     heads = [hb for hb in heads if hb is not cand]
 
-        # Coast uncorrected tracks; drop them once the hold expires or the
-        # predicted box has left the frame entirely.
+        # Privacy safety-net: person anchors sustain or spawn blur where faces
+        # are missing. An anchor that overlaps a face-less track keeps it alive
+        # (a person we see but whose face we lost); a leftover anchor overlapping
+        # no track spawns a fresh anchor track. Anchors never touch a track that
+        # matched a face this frame — its own face already positions it.
+        anchor_corrected: set[_Track] = set()
+        if anchor_provider is not None:
+            remaining = list(anchor_provider())  # [(box, score)]
+            for t in self._tracks:
+                if t in face_of or not remaining:
+                    continue
+                best = max(remaining, key=lambda bs: _iou(bs[0], t.bbox))
+                if _iou(best[0], t.bbox) > _ANCHOR_MATCH_IOU:
+                    t.correct(best[0], weak=True)
+                    t.anchor_misses = 0
+                    t.source = "anchor"
+                    anchor_corrected.add(t)
+                    remaining = [bs for bs in remaining if bs is not best]
+            for box, _score in remaining:
+                if len(self._tracks) >= self._max_tracks:
+                    break
+                # Skip if it overlaps a live track or a face that is about to
+                # spawn its own track this frame — anchors never double-blur.
+                if any(_iou(box, t.bbox) > _ANCHOR_SPAWN_IOU for t in self._tracks):
+                    continue
+                if any(_iou(box, np.asarray(f.bbox[:4], dtype=np.float32))
+                       > _ANCHOR_SPAWN_IOU for f in unmatched_faces):
+                    continue
+                nt = _Track(self._next_id, box)
+                self._next_id += 1
+                nt.anchor_misses = 0
+                nt.source = "anchor"
+                self._tracks.append(nt)
+                anchor_corrected.add(nt)
+
+        # Age every track that saw no face this frame (head-corrected ones
+        # included — a head box repositions but must not prolong); coast the
+        # ones with no correction at all. A track survives while a face was seen
+        # within hold_frames OR a person anchor within anchor_hold_frames; drop
+        # it once both lapse or the predicted box has left the frame entirely.
         survivors: list[_Track] = []
         for t in self._tracks:
-            if t not in face_of and t not in head_corrected:
-                t.source = "coast"
-                t.damp_velocity()
-                t.misses += 1
+            if t not in face_of:
+                t.face_misses += 1
+                if t not in head_corrected and t not in anchor_corrected:
+                    t.source = "coast"
+                    t.damp_velocity()
+            if t not in anchor_corrected:
+                t.anchor_misses += 1
             bb = t.bbox
             inside = bb[2] > 0 and bb[0] < fw and bb[3] > 0 and bb[1] < fh
-            if t.misses <= self._hold_frames and inside:
+            alive = (t.face_misses <= self._hold_frames
+                     or t.anchor_misses <= self._anchor_hold_frames)
+            if alive and inside:
                 survivors.append(t)
         self._tracks = survivors
 

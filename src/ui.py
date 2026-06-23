@@ -64,15 +64,14 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
 from libs.face_app import FaceApp
-from libs.pose_head import PoseHeadEstimator, _VIS_THRESHOLD
+from libs.pose_head import _VIS_THRESHOLD
+from libs.pipeline import detect, make_pose_backend
 from libs.tracker import KalmanFaceTracker
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
     MaskBuilder,
     best_onnx_providers,
-    crop_face_patch,
-    unproject_landmark,
 )
 from libs.video_writer import make_video_writer, source_bitrate_kbps
 
@@ -287,8 +286,13 @@ class Params:
     # Ordered blur stack: ("gaussian", kernel) / ("pixelate", block).
     blur_layers: tuple[tuple[str, int], ...] = DEFAULT_BLUR_LAYERS
     match_iou: float = 0.30
-    hold_secs: float = 2.0      # keep blurring this long after last correction
-    pose_assist: bool = True    # pose-estimated head boxes revive lost tracks
+    hold_secs: float = 0.6      # keep blurring this long after last correction
+    pose_assist: bool = True    # master switch for the pose backend below
+    # Pose backend: "rtmw" (RTMDet+RTMW whole-body — robust at odd angles and
+    # contributes face detections of its own), "mediapipe" (legacy head boxes
+    # only), or "none". pose_mode picks the RTMW model size.
+    pose_backend: str = "rtmw"
+    pose_mode: str = "performance"   # performance | balanced | lightweight
 
 
 # ── Presets — curated Params bundles; Advanced exposes every value ───────────
@@ -303,18 +307,19 @@ PRESETS: dict[str, tuple[str, Params]] = {
         Params(target_size=1024, det_score=0.35, face_aspect=0.25,
                blur_expand=0.80, blur_hair_extra=1.50,
                blur_layers=(("gaussian", 99), ("pixelate", 16)),
-               match_iou=0.20, hold_secs=4.0),
+               match_iou=0.20, hold_secs=1.0,
+               pose_backend="rtmw", pose_mode="performance"),
     ),
     "Crowded Scene": (
         "Many small faces — high-res detection, stricter ID matching",
         Params(target_size=1024, det_score=0.45, face_aspect=0.35,
-               match_iou=0.45),
+               match_iou=0.45, pose_backend="rtmw", pose_mode="performance"),
     ),
     "Fast Preview": (
         "Low-res detection for quick scrubbing on CPU",
         Params(target_size=320,
                blur_layers=(("gaussian", 41), ("pixelate", 12)),
-               pose_assist=False),
+               pose_backend="rtmw", pose_mode="lightweight"),
     ),
 }
 
@@ -335,6 +340,16 @@ _POSE_EDGES = (
     (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
     (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
 )
+# COCO-17 body connections for the RTMW (133-keypoint) skeleton. Only the body
+# joints are drawn as a skeleton; the 68 dense face points are scattered as
+# dots so a glance still confirms the face is being tracked.
+_COCO_EDGES = (
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16),
+    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6),
+)
+_KPT_THR_133 = 0.3   # RTMW per-keypoint confidence to draw
 # Distinct from the per-track palette so the skeleton reads as a separate layer.
 _POSE_EDGE_COLOUR = (220, 220, 220)
 _POSE_BOX_COLOUR = (0, 200, 255)
@@ -370,36 +385,35 @@ def _draw_pose(
     pose: np.ndarray,
     head_box: Optional[np.ndarray] = None,
 ) -> None:
-    """Draw one BlazePose skeleton (and its derived head box) onto frame.
+    """Draw one pose skeleton (and its derived head box) onto frame.
 
-    pose is an (33, 3) array of (x_px, y_px, visibility). Edges and keypoints
-    are drawn only where visibility clears the same threshold the head-box
-    estimator uses; keypoints are coloured by confidence (green = high,
-    red = low) so a glance tells whether pose estimation is healthy.
+    pose is an (N, 3) array of (x_px, y_px, confidence). N selects the layout:
+    33 → BlazePose (legacy MediaPipe), ≥100 → COCO-WholeBody-133 (RTMW). Edges
+    and keypoints draw only above the per-format confidence threshold; points
+    are coloured by confidence (green = high, red = low) so a glance tells
+    whether pose estimation is healthy.
     """
+    if len(pose) >= 100:
+        edges, thr = _COCO_EDGES, _KPT_THR_133
+    else:
+        edges, thr = _POSE_EDGES, _VIS_THRESHOLD
+
     vis = pose[:, 2]
-    for a, b in _POSE_EDGES:
-        if vis[a] > _VIS_THRESHOLD and vis[b] > _VIS_THRESHOLD:
+    for a, b in edges:
+        if vis[a] > thr and vis[b] > thr:
             pa = (int(pose[a, 0]), int(pose[a, 1]))
             pb = (int(pose[b, 0]), int(pose[b, 1]))
             cv2.line(frame, pa, pb, _POSE_EDGE_COLOUR, 1, cv2.LINE_AA)
     for x, y, v in pose:
-        if v <= _VIS_THRESHOLD:
+        if v <= thr:
             continue
         # Lerp red→green over [threshold, 1.0] so weak joints stand out.
-        t = min(1.0, (v - _VIS_THRESHOLD) / max(1.0 - _VIS_THRESHOLD, 1e-6))
+        t = min(1.0, (v - thr) / max(1.0 - thr, 1e-6))
         kp_colour = (0, int(255 * t), int(255 * (1 - t)))
         cv2.circle(frame, (int(x), int(y)), 2, kp_colour, -1, cv2.LINE_AA)
     if head_box is not None:
         x1, y1, x2, y2 = (int(v) for v in head_box[:4])
         cv2.rectangle(frame, (x1, y1), (x2, y2), _POSE_BOX_COLOUR, 1)
-
-
-def _ok_face(bbox: np.ndarray, score: float, p: Params) -> bool:
-    x1, y1, x2, y2 = bbox[:4]
-    bh = y2 - y1
-    bw = x2 - x1
-    return bh > 0 and (bw / bh) >= p.face_aspect and score >= p.det_score
 
 
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -430,8 +444,10 @@ class ProcessWorker(QThread):
         self._app: Optional[FaceApp] = None
         self._model_size = -1
         self._blur = BlurPipeline()
-        # Lazy: no model load (or one-time download) until first head query.
-        self._pose = PoseHeadEstimator(on_status=self.status.emit)
+        # Pose backend is built lazily on first use and only rebuilt when the
+        # backend/mode actually changes (model load is slow); None = disabled.
+        self._pose = None
+        self._pose_key: Optional[tuple[str, str]] = None
         # Preview tracking state persists across sequential frames (Play),
         # so detection-gap coasting is visible live; any scrub/jump resets it.
         self._pv_tracker: Optional[KalmanFaceTracker] = None
@@ -561,40 +577,29 @@ class ProcessWorker(QThread):
         self._model_size = size
         self.status.emit("Ready")
 
-    def _detect_refined(self, frame: np.ndarray, p: Params) -> list:
-        """Detection + close-up refinement with live params."""
-        assert self._app is not None
-        fh, fw = frame.shape[:2]
-
-        raw = self._app.get(frame)
-        faces = [f for f in raw if _ok_face(f.bbox, float(f.det_score), p)]
-
-        refined: list = []
-        for face in faces:
-            x1, y1, x2, y2 = face.bbox[:4]
-            if ((x2 - x1) * (y2 - y1)) / (fh * fw) > p.close_up_ratio:
-                crop, (ox, oy, sc) = crop_face_patch(
-                    frame, face.bbox[:4], target_size=CLOSE_UP_TARGET_SIZE)
-                cfs = self._app.get(crop)
-                if cfs:
-                    cf = cfs[0]
-                    if cf.landmark_2d_106 is not None:
-                        cf.landmark_2d_106 = np.array(
-                            [unproject_landmark(x, y, ox, oy, sc)
-                             for x, y in cf.landmark_2d_106], dtype=np.float32)
-                        cf.bbox[:4] = [
-                            ox + cf.bbox[0] / sc, oy + cf.bbox[1] / sc,
-                            ox + cf.bbox[2] / sc, oy + cf.bbox[3] / sc]
-                    refined.append(cf)
-                    continue
-            refined.append(face)
-        return refined
-
-    def _head_provider(self, frame: np.ndarray, p: Params):
-        """Lazy head-box source for the tracker; None disables pose assist."""
+    def _ensure_pose(self, p: Params):
+        """(Re)build the pose backend only when backend/mode changes."""
         if not p.pose_assist:
             return None
-        return lambda: self._pose.head_boxes(frame)
+        key = (p.pose_backend, p.pose_mode)
+        if self._pose_key != key:
+            self._pose = make_pose_backend(
+                p.pose_backend, mode=p.pose_mode, on_status=self.status.emit)
+            self._pose_key = key
+        return self._pose
+
+    def _detect(
+        self, frame: np.ndarray, p: Params
+    ) -> tuple[list, list, list]:
+        """Ensembled detection: (faces, head_boxes, poses) with live params."""
+        assert self._app is not None
+        pose = self._ensure_pose(p)
+        faces, head_boxes, _anchors, pf = detect(
+            self._app, frame, pose,
+            det_score=p.det_score, face_aspect=p.face_aspect,
+            close_up_ratio=p.close_up_ratio,
+            close_up_target=CLOSE_UP_TARGET_SIZE)
+        return faces, head_boxes, pf.poses
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
@@ -608,7 +613,9 @@ class ProcessWorker(QThread):
         tracking = frame.copy()
         blurred = frame.copy()
 
-        refined = self._detect_refined(frame, p)
+        # Ensembled detection (SCRFD ⊕ pose) — pose runs once here; its head
+        # boxes feed the tracker and its skeletons are drawn on the overlay.
+        faces, head_boxes, poses = self._detect(frame, p)
 
         # Sequential frames (Play) keep the tracker so gap-coasting shows in
         # the live preview; scrubbing or single-frame inspection resets it.
@@ -622,16 +629,9 @@ class ProcessWorker(QThread):
                                        hold_secs=p.hold_secs)
         self._pv_last_idx = frame_idx
 
-        # Run pose every preview frame (even with a face present) so the
-        # skeleton can be drawn live and the tracker can lean on it; the boxes
-        # are precomputed here and handed to the tracker so pose runs once.
-        head_boxes: list[tuple[np.ndarray, float]] = []
-        poses: list[np.ndarray] = []
-        if p.pose_assist:
-            head_boxes, poses = self._pose.estimate(frame)
         tracked = self._pv_tracker.update(
-            refined, frame.shape,
-            (lambda: head_boxes) if p.pose_assist else None)
+            faces, frame.shape,
+            (lambda: head_boxes) if head_boxes else None)
 
         # Build blur mask
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
@@ -682,10 +682,10 @@ class ProcessWorker(QThread):
         self._ensure_model(p.target_size)
         fh, fw = frame.shape[:2]
 
-        refined = self._detect_refined(frame, p)
+        faces, head_boxes, _poses = self._detect(frame, p)
         tracker.configure(match_iou=p.match_iou, hold_secs=p.hold_secs)
         tracked = tracker.update(
-            refined, frame.shape, self._head_provider(frame, p))
+            faces, frame.shape, (lambda: head_boxes) if head_boxes else None)
 
         blur_mask = np.zeros((fh, fw), dtype=np.uint8)
         polys: dict[int, Optional[np.ndarray]] = {}
@@ -1271,7 +1271,7 @@ class MainWindow(QMainWindow):
         self._iou_sl = TunableSlider("Match IoU", 0.05, 0.95, 0.30)
         self._iou_sl.changed.connect(self._on_param_change)
         # How long a lost face keeps its blur, coasting on Kalman prediction.
-        self._hold_sl = TunableSlider("Hold (s)", 0.0, 5.0, 2.0, decimals=1)
+        self._hold_sl = TunableSlider("Hold (s)", 0.0, 5.0, 0.6, decimals=1)
         self._hold_sl.changed.connect(self._on_param_change)
 
         self._pose_btn = QPushButton("Pose Assist")

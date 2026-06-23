@@ -50,22 +50,32 @@ Nothing is uploaded, ever.
 ```mermaid
 flowchart LR
     A([Frame]) --> B[SCRFD detection<br/>+ 106-pt landmarks]
-    B --> C[Kalman tracker<br/>predict + correct]
-    P[MediaPipe pose<br/>head boxes] -.lost faces.-> C
+    A --> P[RTMDet/YOLOX → RTMW<br/>133 whole-body keypoints]
+    B --> M{Ensemble merge<br/>gate skin · fill gaps}
+    P -- 68 face keypoints --> M
+    M --> C[Kalman tracker<br/>predict + correct]
+    P -. head boxes / lost faces .-> C
     C --> D[Savitzky-Golay<br/>smoothing]
     D --> E[Expanded hull<br/>blur mask]
-    E --> F[Blur layer stack<br/>one pass]
+    E --> F[Blur layer stack<br/>one GPU pass]
     F --> G([Anonymized frame])
 ```
 
-Close-up faces (filling most of the frame) are automatically re-detected on an
-upscaled crop for tighter landmarks. When the detector loses a face, its
-Kalman filter keeps predicting the head's position for **Hold (s)** seconds,
-and the last landmark hull rides along with the predicted box, so the blur
-follows someone who turns away or looks down instead of switching off. With
-**Pose Assist** on, MediaPipe body pose supplies coarse head boxes that keep
-correcting a lost track for as long as the person is visible, even from
-behind.
+Two detectors run per frame and are **ensembled**. SCRFD gives a tight
+106-point mesh on near-frontal faces; **RTMW** (a whole-body pose model fronted
+by a RTMDet/YOLOX person detector) estimates 133 keypoints per person, 68 of
+them dense face landmarks. Because those land from body context, they keep
+finding the face at the angles a frontal detector misses — looking up or down,
+top-down close-ups, cheek-to-cheek — which is exactly the footage this tool
+targets. The merge also **gates SCRFD against the pose head regions**, so a
+detection that overlaps no actual head (bare skin mistaken for a face) is
+dropped rather than blurred.
+
+Where both agree, SCRFD's denser mesh wins; RTMW fills in everywhere SCRFD is
+silent. When a face is still lost, its Kalman filter keeps predicting the
+head's position for **Hold (s)** seconds with the last hull riding the predicted
+box, and RTMW head boxes keep correcting the track for as long as the person is
+visible — even from behind.
 
 ## Install
 
@@ -77,10 +87,30 @@ cd automated-video-privacy-pipeline
 uv sync
 ```
 
-> First run downloads the InsightFace `buffalo_l` model pack (~300 MB) to
-> `~/.insightface`, and the first frame that needs Pose Assist fetches the
-> MediaPipe pose model (~5 MB) to `~/.faceblur`. Everything after that is
-> fully offline.
+> First run downloads the InsightFace `buffalo_l` pack (~300 MB) to
+> `~/.insightface` and, for the default RTMW pose backend, the YOLOX person
+> detector (~200 MB) and RTMW pose model (~100-200 MB) to `~/.cache/rtmlib`.
+> The legacy MediaPipe backend fetches a ~5 MB model to `~/.faceblur` instead.
+> Everything after that is fully offline.
+
+### GPU acceleration (AMD RX 6800, NVIDIA, Intel)
+
+All neural-net inference (SCRFD, YOLOX, RTMW) runs through ONNX Runtime, which
+picks the best execution provider automatically: **DirectML** (any Windows GPU,
+including AMD Radeon) → CUDA (NVIDIA) → ROCm (AMD on Linux) → CPU. On an **AMD
+RX 6800** the fast path is **DirectML on Windows** — the default `onnxruntime`
+wheel is CPU-only, so install the DirectML build:
+
+```bash
+uv pip uninstall onnxruntime
+uv pip install onnxruntime-directml      # Windows + any GPU (AMD/NVIDIA/Intel)
+```
+
+The blur stack is GPU-accelerated too: it uses OpenCV's OpenCL/UMat path on AMD
+and Intel GPUs (and PyTorch CUDA on NVIDIA), so the RX 6800 handles the blur as
+well. At startup the CLI prints the active provider and blur backend — look for
+`[providers] ONNX inference: DmlExecutionProvider` and
+`[BlurPipeline] GPU (OpenCL/UMat) blur active` to confirm the GPU is engaged.
 
 ## Quick start
 
@@ -100,9 +130,11 @@ uv run python src/main.py --input talk.mp4 --output talk_blurred.mp4
 | --- | --- | --- |
 | `--input` | `0` | Video path, or a webcam index |
 | `--output` | (none) | Write the blurred video here |
-| `--target-size` | `640` | Detector input size; `1024` for offline accuracy |
+| `--target-size` | `640` | SCRFD input size; `1024` for offline accuracy |
+| `--pose-backend` | `rtmw` | `rtmw` (RTMDet+RTMW, robust at odd angles), `mediapipe` (legacy), or `none` |
+| `--pose-mode` | `performance` | RTMW model: `performance` (RTMW-x, best), `balanced`, or `lightweight` (RTMW-l, fast) |
 | `--no-display` | off | Skip the preview window |
-| `--no-pose` | off | Disable pose-assisted head tracking for lost faces |
+| `--no-pose` | off | Alias for `--pose-backend none` |
 | `--hold-secs` | `2.0` | Keep blurring a lost face this long on Kalman prediction |
 
 ## Windows build
@@ -117,6 +149,15 @@ interpreter through WSL interop so PyInstaller emits a native executable:
 
 You need a Windows Python 3.10-3.13 on the host (boxmot does not support
 3.14+). Models are still downloaded on first launch, not bundled.
+
+The build installs and bundles **rtmlib** (the default RTMW pose backend) and
+force-installs **onnxruntime-directml** so inference runs on the GPU — the RX
+6800 via DirectML. `rtmlib` is installed with `--no-deps` because its plain
+`onnxruntime` dependency would otherwise overwrite the DirectML build and
+silently drop the bundle back to CPU. The build's smoke test asserts
+`DmlExecutionProvider` is present, so a CPU-only bundle fails loudly instead of
+shipping. If you ever see `No module named 'rtmlib'` from a `.exe`, it was built
+before this step — rebuild with `./build_exe.sh`.
 
 ## Using the inspector
 
@@ -207,10 +248,12 @@ src/
   ui.py              the inspector (PyQt6): presets, panels, export
   libs/
     face_app.py      minimal InsightFace loader (DirectML-safe)
+    pose_rtmw.py     RTMDet/YOLOX → RTMW whole-body pose (face keypoints + head boxes)
+    pipeline.py      shared detection front-end: SCRFD ⊕ RTMW ensemble + skin gating
     tracker.py       Kalman face tracker with detection-gap coasting
-    pose_head.py     MediaPipe pose to head boxes, for lost-track revival
+    pose_head.py     legacy MediaPipe pose to head boxes, for lost-track revival
     smoother.py      Savitzky-Golay landmark smoother with occlusion hold
-    utils.py         hull masks + stackable blur layers + mask continuity
+    utils.py         hull masks + GPU blur (CUDA / OpenCL) + provider selection
     video_writer.py  streaming ffmpeg exporter (handles >4 GiB output)
 scripts/
   capture_screenshots.py   regenerates the README screenshots, headless

@@ -24,19 +24,28 @@ DEFAULT_BLUR_LAYERS: tuple[BlurLayer, ...] = (
     ("pixelate", BLUR_PIXELATE_BLOCK),
 )
 
-# ── face-detection filter ────────────────────────────────────────────────────
-_MIN_FACE_ASPECT = 0.4
-_MIN_DET_SCORE = 0.55
-
 
 def best_onnx_providers() -> list[str]:
     """Pick GPU execution providers when available, in preference order:
-    DirectML (any Windows GPU incl. AMD) > CUDA (NVIDIA) > CPU."""
+    DirectML (any Windows GPU incl. AMD Radeon) > CUDA (NVIDIA) > ROCm (AMD on
+    Linux) > CPU. On an AMD RX 6800 the winning provider is DirectML on Windows
+    (install ``onnxruntime-directml``) or ROCm on native Linux."""
     import onnxruntime as ort
 
-    preferred = ("DmlExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider")
+    preferred = (
+        "DmlExecutionProvider",      # Windows, any GPU incl. AMD Radeon
+        "CUDAExecutionProvider",     # NVIDIA
+        "ROCMExecutionProvider",     # AMD on native Linux
+        "CPUExecutionProvider",
+    )
     available = ort.get_available_providers()
     return [p for p in preferred if p in available] or list(available)
+
+
+def has_gpu_provider() -> bool:
+    """True when a non-CPU ONNX execution provider is available."""
+    prov = best_onnx_providers()
+    return bool(prov) and prov[0] != "CPUExecutionProvider"
 
 
 # ── crop / unproject helpers ─────────────────────────────────────────────────
@@ -66,16 +75,6 @@ def unproject_landmark(
     scale: float,
 ) -> tuple[float, float]:
     return origin_x + lx / scale, origin_y + ly / scale
-
-
-# ── detection filter ─────────────────────────────────────────────────────────
-
-def is_likely_face(bbox: np.ndarray, det_score: float) -> bool:
-    x1, y1, x2, y2 = bbox[:4]
-    bw, bh = x2 - x1, y2 - y1
-    if bh <= 0:
-        return False
-    return (bw / bh) >= _MIN_FACE_ASPECT and det_score >= _MIN_DET_SCORE
 
 
 # ── mask builders ─────────────────────────────────────────────────────────────
@@ -134,6 +133,18 @@ def add_bbox_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
         mask[y1:y2, x1:x2] = 255
 
 
+def add_ellipse_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
+    """Fill an ellipse inscribed in bbox — head-shaped fallback for a privacy
+    safety-net anchor track, which has only a coarse head box and no landmarks."""
+    fh, fw = mask.shape[:2]
+    x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    ax, ay = max(1.0, (x2 - x1) / 2), max(1.0, (y2 - y1) / 2)
+    if 0 <= cx < fw and 0 <= cy < fh:
+        cv2.ellipse(mask, (int(cx), int(cy)), (int(ax), int(ay)),
+                    0, 0, 360, 255, -1)
+
+
 def _map_landmarks(
     landmarks: np.ndarray, src_bbox: np.ndarray, dst_bbox: np.ndarray
 ) -> np.ndarray:
@@ -148,7 +159,7 @@ def _map_landmarks(
     sh = max(float(src_bbox[3] - src_bbox[1]), 1.0)
     scale = np.clip(
         [float(dst_bbox[2] - dst_bbox[0]) / sw, float(dst_bbox[3] - dst_bbox[1]) / sh],
-        0.5, 2.0,
+        0.7, 1.4,
     )
     return ((landmarks - sc) * scale + dc).astype(np.float32)
 
@@ -189,7 +200,20 @@ class MaskBuilder:
             lm0, bb0 = self._mem[tid]
             moved = _map_landmarks(lm0, bb0, bbox)
             return add_face_mask(mask, moved, expand=expand, hair_extra=hair_extra)
-        add_bbox_mask(mask, bbox)
+        # Privacy safety-net anchor: a person RF-DETR sees but whose face was
+        # never detected, so there is no landmark history to remap. Blur the
+        # coarse head region as an ellipse, bypassing the area guard below — the
+        # box is a fresh, bounded RF-DETR head region, not a runaway coast box.
+        if getattr(tracked, "source", "") == "anchor":
+            add_ellipse_mask(mask, bbox)
+            return None
+        # No landmark history: only paint a bare box if it is a plausible head
+        # size. A runaway/oversized coasting box with no prior face must not
+        # blur a huge swath of the frame.
+        fh, fw = mask.shape[:2]
+        box_area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+        if box_area <= 0.08 * fh * fw:
+            add_bbox_mask(mask, bbox)
         return None
 
     def evict(self, active_ids: set[int]) -> None:
@@ -210,20 +234,40 @@ class BlurPipeline:
     """Applies a configurable stack of blur layers to a masked region.
 
     Layers (Gaussian / pixelate, in any order and multiplicity) are applied
-    in sequence to the whole frame once, then composited where the mask is
-    set. Uses CUDA via PyTorch when available (one GPU round-trip per frame
-    regardless of how many faces are present). Falls back to CPU cv2.
+    in sequence to the whole frame once, then composited where the mask is set,
+    in a single GPU round-trip per frame regardless of how many faces present.
+
+    Backend is picked once at construction:
+      * "cuda"   — PyTorch CUDA (NVIDIA).
+      * "opencl" — OpenCV Transparent-API / UMat on any OpenCL device. This is
+                   the path that lights up an AMD Radeon (e.g. RX 6800) where
+                   torch-CUDA never applies, so the blur runs on the GPU too.
+      * "cpu"    — OpenCV on CPU (fallback).
     """
 
     def __init__(self) -> None:
-        self.use_gpu = _TORCH_AVAILABLE and torch.cuda.is_available()  # type: ignore[possibly-undefined]
+        self.backend = self._select_backend()
         self._layers: tuple[BlurLayer, ...] = DEFAULT_BLUR_LAYERS
-        if self.use_gpu:
+        if self.backend == "cuda":
             self._device = torch.device("cuda")  # type: ignore[possibly-undefined]
             self._kernels: dict[int, "torch.Tensor"] = {}
-        print(
-            f"[BlurPipeline] {'GPU (CUDA)' if self.use_gpu else 'CPU'} blur active"
-        )
+        label = {"cuda": "GPU (CUDA/PyTorch)",
+                 "opencl": "GPU (OpenCL/UMat)",
+                 "cpu": "CPU"}[self.backend]
+        print(f"[BlurPipeline] {label} blur active")
+
+    @staticmethod
+    def _select_backend() -> str:
+        if _TORCH_AVAILABLE and torch.cuda.is_available():  # type: ignore[possibly-undefined]
+            return "cuda"
+        try:
+            if cv2.ocl.haveOpenCL():
+                cv2.ocl.setUseOpenCL(True)
+                if cv2.ocl.useOpenCL():
+                    return "opencl"
+        except Exception:  # noqa: BLE001 — any OpenCL probe failure → CPU
+            pass
+        return "cpu"
 
     def reconfigure(self, layers: tuple[BlurLayer, ...]) -> None:
         """Update the blur layer stack without re-constructing the pipeline."""
@@ -245,10 +289,35 @@ class BlurPipeline:
         """Apply the blur stack to frame in-place, only where mask == 255."""
         if not self._layers or not np.any(mask):
             return
-        if self.use_gpu:
+        if self.backend == "cuda":
             self._apply_gpu(frame, mask)
+        elif self.backend == "opencl":
+            self._apply_opencl(frame, mask)
         else:
             self._apply_cpu(frame, mask)
+
+    # ── OpenCL path (UMat / Transparent API — AMD, Intel, any OpenCL GPU) ──────
+
+    def _apply_opencl(self, frame: np.ndarray, mask: np.ndarray) -> None:
+        """Run the layer stack on the GPU via OpenCV UMat, composite by mask.
+
+        UMat operations are dispatched to the OpenCL device transparently; the
+        single upload/download pair keeps the host round-trip to one per frame.
+        """
+        h, w = frame.shape[:2]
+        src = cv2.UMat(np.ascontiguousarray(frame))
+        out = src
+        for kind, strength in self._layers:
+            if kind == "gaussian":
+                out = cv2.GaussianBlur(out, (strength, strength), 0)
+            else:
+                b = strength
+                small = cv2.resize(out, (max(1, w // b), max(1, h // b)),
+                                   interpolation=cv2.INTER_AREA)
+                out = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
+        # Composite blurred pixels into the original where the mask is set.
+        src = cv2.copyTo(out, cv2.UMat(np.ascontiguousarray(mask)), src)
+        np.copyto(frame, src.get())
 
     # ── CPU path ──────────────────────────────────────────────────────────────
 
