@@ -10,7 +10,7 @@ video is opened.
 Locations are the per-library defaults (kept as-is, just centralised here):
   * InsightFace buffalo_l → ``~/.insightface/models/buffalo_l/``
   * RTMW pose + YOLOX     → ``~/.cache/rtmlib/hub/checkpoints/`` (rtmlib's cache)
-  * RF-DETR person det    → ``~/.cache/avpp/rfdetr/rf-detr.onnx`` (or
+  * RF-DETR person det    → ``~/.cache/avpp/rfdetr/<variant>.onnx`` (or
     ``$AVPP_RFDETR_ONNX``)
 
 Downloads are idempotent and best-effort: any failure is reported and skipped so
@@ -93,7 +93,7 @@ def _preflight_rfdetr(status: StatusCb, download: bool) -> None:
     if path is not None:
         status(f"RF-DETR person detector: {path}  [found]")
         return
-    status(f"RF-DETR person detector: {person_detector._DEFAULT_CACHE}  [MISSING]")
+    status(f"RF-DETR person detector: {person_detector._default_cache()}  [MISSING]")
     if not download:
         return
     person_detector.download_model(on_status=status)

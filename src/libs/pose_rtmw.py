@@ -36,6 +36,7 @@ libs/face_app.py).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -216,6 +217,10 @@ class RTMWPoseEstimator:
         self._retired: list = []   # never-destroy: keep old sessions alive
         self.available: Optional[bool] = None  # None = not yet attempted
         self.kpt_format = "coco133"
+        # Wall-clock (ms) of the last pose-model call only (the per-person RTMW
+        # inference, excluding the RF-DETR person detect, which times itself).
+        # For the worker's per-stage timing log; 0 until the first call.
+        self.last_pose_ms = 0.0
         # Optional RF-DETR person detector: replaces rtmlib's bundled YOLOX as
         # the box source feeding RTMW pose (better recall on hard poses) and
         # supplies the person boxes the privacy safety-net anchors are built
@@ -285,11 +290,13 @@ class RTMWPoseEstimator:
             person_boxes, person_masks = self._person.detect(frame_bgr)
         else:
             person_boxes, person_masks = [], []
+        t0 = time.perf_counter()
         if person_boxes:
             bboxes = [b.tolist() for b, _s in person_boxes]
             kpts, scores = self._wb.pose_model(frame_bgr, bboxes=bboxes)
         else:
             kpts, scores = self._wb(frame_bgr)
+        self.last_pose_ms = (time.perf_counter() - t0) * 1e3
         kpts = np.asarray(kpts, dtype=np.float32)
         scores = np.asarray(scores, dtype=np.float32)
         out = PoseFrame(person_boxes=person_boxes, person_masks=person_masks)

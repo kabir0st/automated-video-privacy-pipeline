@@ -14,7 +14,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from libs.pipeline import (  # noqa: E402
     Subject,
     _best_face_for_head,
-    _head_from_mask,
     build_subjects,
     locate_head,
 )
@@ -60,33 +59,6 @@ def _pose_with_head(cx, cy):
     return pose
 
 
-def test_head_from_mask_upright():
-    head = _head_from_mask(_tadpole_mask(0), np.array([100, 40, 220, 270], np.float32))
-    assert head is not None, "should locate a head on a clear tadpole"
-    cx, cy = _box_centre(head)
-    # Head is the narrow top: centre should be in the upper part of the body.
-    assert cy < 150, f"head should be near the top, got cy={cy}"
-    assert 130 < cx < 190, f"head should be horizontally centred, got cx={cx}"
-    print("  ok: head_from_mask upright")
-
-
-def test_head_from_mask_orientation_tracks_rotation():
-    """The head end must follow the silhouette when rotated, not stay at 'top'."""
-    # 180°: head end now at the bottom.
-    head = _head_from_mask(_tadpole_mask(2), np.array([100, 40, 220, 280], np.float32))
-    assert head is not None
-    _, cy = _box_centre(head)
-    assert cy > 170, f"after 180° rotation head should be low, got cy={cy}"
-    print("  ok: head_from_mask follows rotation")
-
-
-def test_head_from_mask_rejects_tiny():
-    m = np.zeros((FH, FW), dtype=np.uint8)
-    m[10:14, 10:14] = 1  # 16 px < _MIN_MASK_PX
-    assert _head_from_mask(m, np.array([0, 0, FW, FH], np.float32)) is None
-    print("  ok: head_from_mask rejects tiny mask")
-
-
 def test_locate_head_prefers_pose_on_body():
     mask = _tadpole_mask(0)
     pose = _pose_with_head(160, 95)  # head over the narrow top, on the body
@@ -98,20 +70,20 @@ def test_locate_head_prefers_pose_on_body():
 
 
 def test_locate_head_rejects_offbody_pose():
-    """A pose head box over empty background is dropped; the mask relocates it."""
+    """A pose head box over empty background is dropped → no head (no guess)."""
     mask = _tadpole_mask(0)
     pose = _pose_with_head(20, 20)  # head anchors far off the body (background)
     head = locate_head(mask, np.array([100, 40, 220, 270], np.float32), pose, FW, FH)
-    assert head is not None, "should fall back to the silhouette head"
-    cx, cy = _box_centre(head)
-    # Must be relocated onto the body, not left at the off-body (20,20).
-    assert cy > 50 and 120 < cx < 200, f"off-body pose should relocate to body, got ({cx},{cy})"
-    print("  ok: locate_head rejects off-body pose, relocates to silhouette")
+    assert head is None, "off-body pose head must not be trusted, and the body shape is never guessed from"
+    print("  ok: locate_head rejects off-body pose (no silhouette guess)")
 
 
-def test_locate_head_none_without_mask_or_pose():
+def test_locate_head_none_without_pose():
+    # No pose → no head, regardless of whether a mask is present.
     assert locate_head(None, np.array([0, 0, 10, 10], np.float32), None, FW, FH) is None
-    print("  ok: locate_head None when nothing available")
+    assert locate_head(_tadpole_mask(0), np.array([100, 40, 220, 270], np.float32),
+                       None, FW, FH) is None
+    print("  ok: locate_head None without pose (mask alone never guesses a head)")
 
 
 class _FakeFace:
@@ -214,6 +186,38 @@ def test_build_subjects_face_only_fallback():
     subjects = build_subjects(pf, [face], (FH, FW))
     assert len(subjects) == 1 and subjects[0].mask is None
     print("  ok: build_subjects face-only fallback")
+
+
+def test_build_subjects_skips_body_without_head():
+    """Person detected but no pose and no face → not blurred (the bug fix).
+
+    The top-down false positive: a body silhouette with no head evidence must
+    no longer fabricate a head from its shape and blur a leg/torso.
+    """
+    pf = PoseFrame(
+        person_boxes=[(np.array([100, 40, 220, 270], np.float32), 0.9)],
+        person_masks=[_tadpole_mask(0)],
+        poses=[],
+    )
+    subjects = build_subjects(pf, [], (FH, FW))
+    assert subjects == [], "a body with no head/face evidence must not be blurred"
+    print("  ok: build_subjects skips a body with no head evidence")
+
+
+def test_build_subjects_face_without_pose():
+    """No pose, but a face on the body → one subject, head = the face box."""
+    pf = PoseFrame(
+        person_boxes=[(np.array([100, 40, 220, 270], np.float32), 0.9)],
+        person_masks=[_tadpole_mask(0)],
+        poses=[],
+    )
+    face = _FakeFace([150, 80, 180, 120], 106, 0.85)  # centre (165,100) on the body
+    subjects = build_subjects(pf, [face], (FH, FW))
+    assert len(subjects) == 1, "a face on a body must be blurred even without pose"
+    s = subjects[0]
+    assert s.face is face
+    assert np.allclose(s.head, face.bbox[:4]), "head region should be the face box"
+    print("  ok: build_subjects uses the face box as head when pose is absent")
 
 
 def main():

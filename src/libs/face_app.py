@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os.path as osp
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,9 @@ class FaceApp:
         # needs no such handling.
         self._det_by_size: dict[tuple[int, int], object] = {}
         self.det_model = None
+        # Wall-clock of the last get() (detection + landmarks), for the worker's
+        # per-stage timing log. 0 until the first call.
+        self.last_ms = 0.0
 
     def prepare(self, ctx_id: int, det_size: tuple[int, int],
                 det_thresh: float = 0.5) -> None:
@@ -100,6 +104,7 @@ class FaceApp:
         self.lmk_model.prepare(ctx_id)
 
     def get(self, img: np.ndarray, max_num: int = 0) -> list[Face]:
+        t0 = time.perf_counter()
         bboxes, kpss = self.det_model.detect(img, max_num=max_num, metric="default")
         faces: list[Face] = []
         for i in range(bboxes.shape[0]):
@@ -108,4 +113,5 @@ class FaceApp:
                         det_score=bboxes[i, 4])
             self.lmk_model.get(img, face)
             faces.append(face)
+        self.last_ms = (time.perf_counter() - t0) * 1e3
         return faces

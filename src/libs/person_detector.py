@@ -23,7 +23,7 @@ Design mirrors libs/pose_rtmw.py exactly:
 
 The exported ONNX model is loaded from the first path that exists:
   1. the ``AVPP_RFDETR_ONNX`` environment variable, or
-  2. ``~/.cache/avpp/rfdetr/rf-detr.onnx``.
+  2. ``~/.cache/avpp/rfdetr/<RFDETR_URL basename>`` (e.g. ``rf-detr-seg-nano.onnx``).
 If neither exists, :func:`download_model` fetches a pre-exported ``.onnx`` from
 ``RFDETR_URL`` (overridable via ``AVPP_RFDETR_URL``) into the default cache path
 above — this is what the startup preflight in :mod:`libs.models` calls. You can
@@ -40,6 +40,7 @@ needed, keeping the strict ONNX-Runtime-only architecture intact.
 from __future__ import annotations
 
 import os
+import time
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
@@ -56,24 +57,39 @@ _PERSON_CLASS = int(os.environ.get("AVPP_RFDETR_PERSON_CLASS", "1"))
 # A person box must clear this score before it may anchor a blur.
 _PERSON_SCORE_MIN = 0.50
 
-_DEFAULT_CACHE = Path.home() / ".cache" / "avpp" / "rfdetr" / "rf-detr.onnx"
+_CACHE_DIR = Path.home() / ".cache" / "avpp" / "rfdetr"
 
 # Pre-exported RF-DETR ONNX, fetched on first run when no local copy exists.
-# Overridable so a different export (e.g. the detection variant, or a self-hosted
-# mirror) can be swapped in without code changes.
+# Overridable so a different export (a larger/smaller variant, or a self-hosted
+# mirror) can be swapped in without code changes. Default is the *nano* seg
+# variant: the seg exports are all ~120–140 MB, but nano's lighter backbone and
+# lower input resolution make it markedly faster than xxlarge — and the masks
+# here only clip the blur / validate head boxes, so the precision trade is
+# negligible for this app's close-up footage. Use a larger variant via
+# AVPP_RFDETR_URL if small/distant people are being missed.
 RFDETR_URL = os.environ.get(
     "AVPP_RFDETR_URL",
     "https://huggingface.co/PierreMarieCurie/rf-detr-onnx/resolve/main/"
-    "rf-detr-seg-xxlarge.onnx",
+    "rf-detr-seg-nano.onnx",
 )
+
+
+def _default_cache() -> Path:
+    """Cache path for the active :data:`RFDETR_URL`, named after the URL file.
+
+    Keying the cache on the URL's basename (mirroring rtmlib's hub layout) means
+    switching variants — e.g. the xxlarge default → nano — downloads the new file
+    instead of silently reusing a stale ``rf-detr.onnx`` from a prior version."""
+    return _CACHE_DIR / os.path.basename(RFDETR_URL)
 
 
 def _model_path() -> Optional[Path]:
     env = os.environ.get("AVPP_RFDETR_ONNX")
     if env and Path(env).is_file():
         return Path(env)
-    if _DEFAULT_CACHE.is_file():
-        return _DEFAULT_CACHE
+    cache = _default_cache()
+    if cache.is_file():
+        return cache
     return None
 
 
@@ -89,8 +105,9 @@ def download_model(on_status: Optional[Callable[[str], None]] = None) -> Path:
     if existing is not None:
         return existing
 
-    _DEFAULT_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _DEFAULT_CACHE.with_suffix(".onnx.part")
+    cache = _default_cache()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".onnx.part")
 
     def _report(block: int, block_size: int, total: int) -> None:
         if on_status and total > 0:
@@ -101,8 +118,8 @@ def download_model(on_status: Optional[Callable[[str], None]] = None) -> Path:
     if on_status:
         on_status(f"Downloading RF-DETR from {RFDETR_URL}")
     urllib.request.urlretrieve(RFDETR_URL, tmp, reporthook=_report)
-    tmp.replace(_DEFAULT_CACHE)
-    return _DEFAULT_CACHE
+    tmp.replace(cache)
+    return cache
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -124,6 +141,9 @@ class PersonDetector:
         self._in_name: str = ""
         self._in_hw: tuple[int, int] = (0, 0)
         self.available: Optional[bool] = None  # None = not yet attempted
+        # Wall-clock (ms) of the last detect() inference, for the worker's
+        # per-stage timing log. 0 until the first call.
+        self.last_ms = 0.0
 
     def _status(self, msg: str) -> None:
         if self._on_status:
@@ -137,7 +157,7 @@ class PersonDetector:
             if path is None:
                 raise FileNotFoundError(
                     "no RF-DETR ONNX found (set AVPP_RFDETR_ONNX or place it at "
-                    f"{_DEFAULT_CACHE})")
+                    f"{_default_cache()})")
             import onnxruntime as ort
 
             from .utils import best_onnx_providers, make_session
@@ -228,8 +248,10 @@ class PersonDetector:
         if not self._ensure():
             return [], []
         try:
+            t0 = time.perf_counter()
             inp = self._preprocess(frame_bgr)
             outs = self._sess.run(None, {self._in_name: inp})
+            self.last_ms = (time.perf_counter() - t0) * 1e3
             boxes, logits, masks = self._split_outputs(outs)
             if boxes is None or logits is None:
                 return [], []

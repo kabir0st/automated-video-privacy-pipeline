@@ -401,16 +401,42 @@ class BlurPipeline:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    # Below this masked-area fraction of the frame, blur only the mask's
+    # bounding-box ROI instead of the whole frame — at 4K a few small faces
+    # then cost a tiny upload/blur/download instead of a full-frame one. Above
+    # it the ROI covers most of the frame and the crop overhead isn't worth it.
+    _ROI_MAX_FRAC = 0.6
+
     def apply(self, frame: np.ndarray, mask: np.ndarray) -> None:
         """Apply the blur stack to frame in-place, only where mask == 255."""
-        if not self._layers or not np.any(mask):
+        if not self._layers:
             return
-        if self.backend == "cuda":
-            self._apply_gpu(frame, mask)
-        elif self.backend == "opencl":
-            self._apply_opencl(frame, mask)
+        ys, xs = np.nonzero(mask)
+        if xs.size == 0:
+            return
+
+        fh, fw = frame.shape[:2]
+        # Pad the ROI so the blur has valid context around the masked region
+        # (a Gaussian reads its kernel's worth of neighbours; pixelate a block).
+        gmax = max((s for k, s in self._layers if k == "gaussian"), default=0)
+        pmax = max((s for k, s in self._layers if k == "pixelate"), default=0)
+        pad = gmax + pmax + 4
+        x1 = max(0, int(xs.min()) - pad); x2 = min(fw, int(xs.max()) + 1 + pad)
+        y1 = max(0, int(ys.min()) - pad); y2 = min(fh, int(ys.max()) + 1 + pad)
+
+        if (x2 - x1) * (y2 - y1) >= self._ROI_MAX_FRAC * fw * fh:
+            f_roi, m_roi = frame, mask          # ROI ≈ whole frame; skip the crop
         else:
-            self._apply_cpu(frame, mask)
+            f_roi, m_roi = frame[y1:y2, x1:x2], mask[y1:y2, x1:x2]
+
+        # The backends write the result back through f_roi, which is a view onto
+        # frame, so the in-place contract holds for both the ROI and full paths.
+        if self.backend == "cuda":
+            self._apply_gpu(f_roi, m_roi)
+        elif self.backend == "opencl":
+            self._apply_opencl(f_roi, m_roi)
+        else:
+            self._apply_cpu(f_roi, m_roi)
 
     # ── OpenCL path (UMat / Transparent API — AMD, Intel, any OpenCL GPU) ──────
 
