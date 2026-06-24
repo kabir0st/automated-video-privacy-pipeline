@@ -12,9 +12,17 @@ yields a reliable head region for *every* detected person (see libs/pipeline.py
 
 There is deliberately no motion model, no coasting across the frame, and no
 "only blur a face we have seen" rule — a head that leaves the frame simply ages
-out. Association is greedy IoU on the head box (with a centre-distance fallback
-for fast motion); at most a couple of people are ever in frame, so nothing
-fancier is needed.
+out.
+
+Association is keyed on the **person box** first, not the head box. The body box
+barely shifts between frames, so a head darting across the frame stays a single
+track that follows the head — instead of (the old head-box-only matching) failing
+the IoU test on the jump, spawning a *new* track at the new position while the
+old track coasts at the stale spot, which painted a trail of ghost heads down the
+motion path. Head-box IoU and a head-centre fallback are kept as lower tiers so
+the face-only path (no person box) and momentary segmentation dropouts still
+re-acquire. At most a couple of people are ever in frame, so greedy matching is
+plenty.
 """
 
 from typing import Any, NamedTuple, Optional
@@ -37,6 +45,10 @@ class TrackedFace(NamedTuple):
     mask: Any | None          # body silhouette (uint8) for this person, or None
 
 
+def _arr(x) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32)
+
+
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
     ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
     ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
@@ -55,16 +67,28 @@ def _centre(box: np.ndarray) -> tuple[float, float]:
 class _Track:
     def __init__(self, track_id: int, subject) -> None:
         self.id = track_id
-        self.head = np.asarray(subject.head, dtype=np.float32).copy()
+        self.head = _arr(subject.head).copy()
+        self.person = _arr(subject.person_box).copy()
         self.face = subject.face
         self.mask = subject.mask
         self.source = "face" if subject.face is not None else "head"
         self.misses = 0
 
     def update(self, subject) -> None:
-        meas = np.asarray(subject.head, dtype=np.float32)
-        self.head = (_HEAD_SMOOTH * self.head + (1.0 - _HEAD_SMOOTH) * meas
-                     ).astype(np.float32)
+        meas = _arr(subject.head)
+        # Adaptive smoothing: snap toward the measurement on fast head motion so
+        # the blur never lags an exposed head, but smooth hard when the head is
+        # still so the blur does not jitter. motion = 1 ⇒ the head centre moved a
+        # full head-diagonal this frame (genuinely fast) → a≈0 (take the new box);
+        # motion = 0 ⇒ still → a = _HEAD_SMOOTH (heavy smoothing).
+        diag = float(np.hypot(self.head[2] - self.head[0],
+                              self.head[3] - self.head[1])) or 1.0
+        mcx, mcy = _centre(meas)
+        tcx, tcy = _centre(self.head)
+        motion = min(1.0, float(np.hypot(mcx - tcx, mcy - tcy)) / diag)
+        a = _HEAD_SMOOTH * (1.0 - motion)
+        self.head = (a * self.head + (1.0 - a) * meas).astype(np.float32)
+        self.person = _arr(subject.person_box).copy()
         self.face = subject.face
         self.mask = subject.mask
         self.source = "face" if subject.face is not None else "head"
@@ -112,43 +136,63 @@ class SubjectTracker:
     def _hold_frames(self) -> int:
         return max(1, int(round(self._hold_secs * self._fps)))
 
-    def update(self, subjects: list, frame_shape: tuple) -> list[TrackedFace]:
-        fh, fw = frame_shape[:2]
-        unmatched = list(subjects)
-        matched: dict[_Track, Any] = {}
+    def _greedy_match(
+        self,
+        unmatched: list,
+        matched: dict,
+        score_fn,
+        thr: float,
+    ) -> list:
+        """Greedily pair leftover tracks↔subjects by ``score_fn`` (≥ ``thr``).
 
-        # Greedy IoU matching of subjects to existing tracks.
-        while unmatched:
+        Highest score wins each round; a matched track/subject is removed from
+        contention. Returns the still-unmatched subjects.
+        """
+        while True:
             best: tuple[float, _Track, Any] | None = None
             for t in self._tracks:
                 if t in matched:
                     continue
                 for s in unmatched:
-                    score = _iou(t.head, np.asarray(s.head, dtype=np.float32))
-                    if score >= self._match_iou and (best is None or score > best[0]):
-                        best = (score, t, s)
+                    sc = score_fn(t, s)
+                    if sc >= thr and (best is None or sc > best[0]):
+                        best = (sc, t, s)
             if best is None:
-                break
+                return unmatched
             _, t, s = best
             matched[t] = s
             unmatched = [x for x in unmatched if x is not s]
 
-        # Centre-distance fallback: fast motion can drop IoU to zero between
-        # frames; accept a subject whose head centre is within one head-diagonal.
-        for s in list(unmatched):
-            scx, scy = _centre(np.asarray(s.head, dtype=np.float32))
-            best_d: tuple[float, _Track] | None = None
-            for t in self._tracks:
-                if t in matched:
-                    continue
-                tcx, tcy = _centre(t.head)
-                diag = float(np.hypot(t.head[2] - t.head[0], t.head[3] - t.head[1]))
-                d = float(np.hypot(tcx - scx, tcy - scy))
-                if d < diag and (best_d is None or d < best_d[0]):
-                    best_d = (d, t)
-            if best_d is not None:
-                matched[best_d[1]] = s
-                unmatched = [x for x in unmatched if x is not s]
+    @staticmethod
+    def _centre_score(t: "_Track", s) -> float:
+        """1 − (head-centre distance / track head-diagonal): ≥0 within one
+        diagonal, used as the fast-motion fallback when IoU has dropped to 0."""
+        diag = float(np.hypot(t.head[2] - t.head[0], t.head[3] - t.head[1]))
+        if diag <= 0:
+            return -1.0
+        scx, scy = _centre(_arr(s.head))
+        tcx, tcy = _centre(t.head)
+        return 1.0 - float(np.hypot(tcx - scx, tcy - scy)) / diag
+
+    def update(self, subjects: list, frame_shape: tuple) -> list[TrackedFace]:
+        fh, fw = frame_shape[:2]
+        unmatched = list(subjects)
+        matched: dict[_Track, Any] = {}
+
+        # 1) Stable person-box IoU — the body barely moves between frames, so a
+        #    head darting across the frame stays one track that follows the head
+        #    rather than spawning a ghost and leaving the old spot blurred.
+        unmatched = self._greedy_match(
+            unmatched, matched,
+            lambda t, s: _iou(t.person, _arr(s.person_box)), self._match_iou)
+        # 2) Head-box IoU — the face-only path (person_box == head) and re-acquiry
+        #    across a momentary segmentation dropout, where the body box vanished.
+        unmatched = self._greedy_match(
+            unmatched, matched,
+            lambda t, s: _iou(t.head, _arr(s.head)), self._match_iou)
+        # 3) Head-centre proximity — fast motion that drops every IoU to zero.
+        unmatched = self._greedy_match(
+            unmatched, matched, self._centre_score, 0.0)
 
         for t, s in matched.items():
             t.update(s)

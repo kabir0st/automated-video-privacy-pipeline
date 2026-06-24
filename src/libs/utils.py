@@ -247,6 +247,28 @@ def add_ellipse_mask(mask: np.ndarray, bbox: np.ndarray) -> None:
                     0, 0, 360, 255, -1)
 
 
+# Maskless blur cap: when there is no silhouette to clip to (face-only /
+# MediaPipe / a dropped mask) bound the blur to the head box grown by this
+# fraction per side (×2 upward for the hairline). This caps the expanded-hull
+# explosion (BLUR_EXPAND + BLUR_HAIR_EXTRA push a hull to ~2.3× its box) so a
+# spurious large face can no longer smear a huge slab of the frame, while still
+# covering a correctly-sized face+hairline. No-op effect when a body mask is
+# present, since clip_to_body constrains the blur far more tightly there.
+_MASKLESS_GROW = 0.35
+
+
+def _clip_to_box(scratch: np.ndarray, bbox: np.ndarray, grow: float = _MASKLESS_GROW) -> None:
+    """Zero scratch outside ``bbox`` grown by ``grow`` per side (×2 up), in-place."""
+    fh, fw = scratch.shape[:2]
+    w = float(bbox[2] - bbox[0]); h = float(bbox[3] - bbox[1])
+    x1 = max(0, int(bbox[0] - grow * w)); x2 = min(fw, int(bbox[2] + grow * w))
+    y1 = max(0, int(bbox[1] - 2.0 * grow * h)); y2 = min(fh, int(bbox[3] + grow * h))
+    scratch[:y1, :] = 0
+    scratch[y2:, :] = 0
+    scratch[:, :x1] = 0
+    scratch[:, x2:] = 0
+
+
 def clip_to_body(scratch: np.ndarray, body: "np.ndarray | None", bbox: np.ndarray) -> None:
     """Zero out scratch (uint8 0/255) outside the person's silhouette, in-place.
 
@@ -328,7 +350,13 @@ class MaskBuilder:
         else:
             add_ellipse_mask(scratch, bbox)
 
-        clip_to_body(scratch, body, bbox)
+        if body is not None and np.any(body):
+            clip_to_body(scratch, body, bbox)
+        else:
+            # No silhouette: bound the blur to a capped box around the head so a
+            # spurious large face can't paint the whole frame (the random
+            # huge-blur). With a body present clip_to_body already constrains it.
+            _clip_to_box(scratch, bbox)
         mask[scratch == 255] = 255
         return poly
 

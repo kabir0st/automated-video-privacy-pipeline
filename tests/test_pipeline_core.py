@@ -14,12 +14,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from libs.pipeline import (  # noqa: E402
     Subject,
     _best_face_for_head,
+    _head_fits_person,
     build_subjects,
     locate_head,
 )
 from libs.pose_rtmw import PoseFrame  # noqa: E402
 from libs.tracker import SubjectTracker  # noqa: E402
-from libs.utils import clip_to_body  # noqa: E402
+from libs.utils import _clip_to_box, clip_to_body  # noqa: E402
 
 FW, FH = 320, 320
 
@@ -218,6 +219,76 @@ def test_build_subjects_face_without_pose():
     assert s.face is face
     assert np.allclose(s.head, face.bbox[:4]), "head region should be the face box"
     print("  ok: build_subjects uses the face box as head when pose is absent")
+
+
+def _subj_pb(person_box, head, score=0.9, face=None, mask=None):
+    """Subject with an explicit person box distinct from the head box."""
+    return Subject(np.asarray(person_box, np.float32), mask,
+                   np.asarray(head, np.float32), face, score)
+
+
+def test_tracker_no_ghost_on_fast_head_move():
+    """A head darting across the frame stays ONE track (the ghost-trail fix).
+
+    Body box barely moves; the head jumps far enough that head-box IoU and the
+    centre-distance fallback both fail. Old behaviour: old track coasts at the
+    stale spot while a new track is born at the new head → two blurred heads on
+    the motion path. New behaviour: person-box IoU keeps it a single track.
+    """
+    tr = SubjectTracker(fps=30.0, match_iou=0.3, hold_secs=0.5)
+    body = [100, 40, 220, 270]
+    out1 = tr.update([_subj_pb(body, [150, 50, 185, 95])], (FH, FW))
+    assert len(out1) == 1
+    tid = out1[0].track_id
+    # Frame 2: body unchanged, head jumped to the far corner (IoU 0, far centre).
+    out2 = tr.update(
+        [_subj_pb([102, 42, 222, 272], [40, 220, 75, 265])], (FH, FW))
+    assert len(out2) == 1, f"fast head move must not spawn a ghost track, got {len(out2)}"
+    assert out2[0].track_id == tid, "the same person must keep its id across a fast head move"
+    # The single track followed the head (snap-on-motion), not held at the old spot.
+    cx, cy = _box_centre(out2[0].bbox)
+    assert cx < 120 and cy > 180, f"head should have followed the move, got ({cx},{cy})"
+    print("  ok: fast head move keeps one track (no ghost trail)")
+
+
+def test_head_fits_person_rejects_oversized():
+    person = np.array([100, 40, 220, 270], np.float32)   # 120 × 230
+    small = np.array([150, 60, 185, 110], np.float32)     # a real head
+    assert _head_fits_person(small, person)
+    huge = np.array([100, 40, 220, 230], np.float32)       # ~69 % of the body
+    assert not _head_fits_person(huge, person), "a head spanning most of the body is a misfit"
+    print("  ok: _head_fits_person rejects an oversized head")
+
+
+def test_build_subjects_rejects_oversized_pose_head():
+    """A pose whose head box covers most of the body → no head → skipped (no face)."""
+    mask = _tadpole_mask(0)
+    pose = _pose_with_head(160, 95)
+    # Blow the ears far apart so the anchor head box becomes huge.
+    pose[3] = (40, 150, 0.9)    # L ear
+    pose[4] = (280, 150, 0.9)   # R ear
+    pf = PoseFrame(
+        person_boxes=[(np.array([100, 40, 220, 270], np.float32), 0.9)],
+        person_masks=[mask], poses=[pose])
+    subjects = build_subjects(pf, [], (FH, FW))
+    assert subjects == [], "an oversized pose head with no face must not blur the body"
+    print("  ok: build_subjects rejects an oversized pose head")
+
+
+def test_clip_to_box_bounds_maskless():
+    """The maskless cap zeroes everything outside the grown head box."""
+    scratch = np.full((FH, FW), 255, dtype=np.uint8)
+    head = np.array([120, 120, 160, 160], np.float32)   # 40 × 40
+    _clip_to_box(scratch, head, grow=0.35)
+    # Inside the head box always survives.
+    assert scratch[140, 140] == 255
+    # Far outside (a frame corner) is always cleared — no full-frame smear.
+    assert scratch[10, 10] == 0 and scratch[300, 300] == 0
+    # The kept region is bounded: nothing past head ± grow (×2 up) remains.
+    ys, xs = np.nonzero(scratch)
+    assert xs.min() >= 120 - 0.35 * 40 - 1 and xs.max() <= 160 + 0.35 * 40 + 1
+    assert ys.min() >= 120 - 0.7 * 40 - 1 and ys.max() <= 160 + 0.35 * 40 + 1
+    print("  ok: _clip_to_box bounds a maskless blur")
 
 
 def main():

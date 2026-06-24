@@ -52,6 +52,14 @@ _MIN_HEAD_MASK_PX = 12
 # A face detection counts as "this head's face" when it overlaps the head region
 # this much, or its centre lands inside the (slightly grown) region.
 _FACE_IN_HEAD_IOU = 0.15
+# A head region covering more than this fraction of its person box is a skeleton/
+# landmark misfit (a "head" spread over most of the body), not a head — reject it
+# so it cannot anchor a blur over the torso/legs.
+_HEAD_MAX_PERSON_FRAC = 0.6
+# Face-only degrade path (no RF-DETR person boxes): a single face box covering
+# more than this fraction of the frame is almost certainly a detector misfire,
+# not a real close-up — skip it so the maskless path can't smear the frame.
+_FACE_ONLY_MAX_FRAME_FRAC = 0.5
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -84,6 +92,20 @@ def _mask_px_in_box(box: np.ndarray, mask: np.ndarray) -> int:
     if x2 <= x1 or y2 <= y1:
         return 0
     return int(np.count_nonzero(mask[y1:y2, x1:x2]))
+
+
+def _head_fits_person(head: np.ndarray, person_box: np.ndarray) -> bool:
+    """True when ``head`` is a plausible size for a head on ``person_box``.
+
+    Rejects a "head" that spans most of the body box — the skeleton/landmark
+    misfit (legs read as a torso, scattered keypoints) that fabricated a blur
+    over the whole person. A head genuinely larger than its body box is never
+    real, so this never drops a legitimate head."""
+    pw = float(person_box[2] - person_box[0]); ph = float(person_box[3] - person_box[1])
+    if pw <= 0 or ph <= 0:
+        return True
+    hw = float(head[2] - head[0]); hh = float(head[3] - head[1])
+    return (hw * hh) <= _HEAD_MAX_PERSON_FRAC * pw * ph
 
 
 # ── SCRFD detection + close-up refinement ────────────────────────────────────
@@ -213,9 +235,14 @@ def _face_only_subjects(faces: list, fh: int, fw: int) -> list[Subject]:
     subject whose head region is the face box.
     """
     out: list[Subject] = []
+    frame_area = float(fh * fw)
     for f in faces:
         fb = np.asarray(f.bbox[:4], dtype=np.float32)
         if fb[2] - fb[0] < 4 or fb[3] - fb[1] < 4:
+            continue
+        # A face box eating half the frame in the no-body degrade path is a
+        # detector misfire; blurring it (maskless) is the random huge smear.
+        if (fb[2] - fb[0]) * (fb[3] - fb[1]) > _FACE_ONLY_MAX_FRAME_FRAC * frame_area:
             continue
         out.append(Subject(fb.copy(), None, fb.copy(), f, float(f.det_score)))
     return out
@@ -243,6 +270,9 @@ def build_subjects(pf: PoseFrame, scrfd_faces: list, frame_shape: tuple) -> list
         mask = pf.person_masks[i] if i < len(pf.person_masks) else None
         pose_kpts = pf.poses[i] if poses_aligned else _best_pose_in_box(pf.poses, pbox)
         head = locate_head(mask, pbox, pose_kpts, fw, fh)
+        # A pose head spanning most of the body is a skeleton misfit, not a head.
+        if head is not None and not _head_fits_person(head, pbox):
+            head = None
         if head is not None:
             # Pose found a head on the body; a face on it refines the blur.
             face = _best_face_for_head(head, faces)
