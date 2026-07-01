@@ -372,7 +372,61 @@ class MaskBuilder:
         self._smoother.drop_all()
 
 
+def render_head_mask(
+    shape_hw: tuple[int, int],
+    boxes: "list[np.ndarray] | np.ndarray",
+    *,
+    pad: float = 0.18,
+    feather: float = 0.12,
+) -> np.ndarray:
+    """Soft blur mask (uint8 0..255) — one feathered ellipse per head box.
+
+    Every head is rendered the same way every frame: an axis-aligned ellipse
+    inscribed in the box expanded by ``pad`` per side, edge-feathered by a
+    single Gaussian over the whole mask (kernel ∝ mean head diagonal). One
+    consistent shape means no popping between evidence types, and the feather
+    both hides residual per-frame jitter and reads far less harsh than a hard
+    mask edge. The ellipse is pre-grown by the feather radius so the fully
+    opaque core still covers the padded box (feathering never shrinks
+    coverage).
+    """
+    mask = np.zeros(shape_hw, dtype=np.uint8)
+    boxes = list(boxes)
+    if not boxes:
+        return mask
+    diags = [float(np.hypot(b[2] - b[0], b[3] - b[1])) for b in boxes]
+    k = 0
+    if feather > 0:
+        k = max(3, int(round(feather * (sum(diags) / len(diags)))) | 1)
+    r = k / 2.0
+    for b in boxes:
+        x1, y1, x2, y2 = (float(v) for v in b[:4])
+        w, h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        ax = max(1.0, w / 2.0 * (1.0 + 2.0 * pad) + r)
+        ay = max(1.0, h / 2.0 * (1.0 + 2.0 * pad) + r)
+        # cv2.ellipse clips to the frame itself — no centre-in-bounds guard,
+        # so a head half out of frame keeps its sliver of blur.
+        cv2.ellipse(mask, (int(round(cx)), int(round(cy))),
+                    (int(round(ax)), int(round(ay))), 0, 0, 360, 255, -1)
+    if k >= 3:
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    return mask
+
+
 # ── GPU-accelerated stacked blur pipeline ────────────────────────────────────
+
+def _is_soft(mask: np.ndarray) -> bool:
+    """True when the mask has intermediate values (a feathered alpha mask)."""
+    return bool(((mask > 0) & (mask < 255)).any())
+
+
+def _blend(frame: np.ndarray, blurred: np.ndarray, mask: np.ndarray) -> None:
+    """Alpha-composite ``blurred`` over ``frame`` in-place, weighted by mask."""
+    a = mask.astype(np.float32)[..., None] / 255.0
+    np.copyto(frame, (frame.astype(np.float32) * (1.0 - a)
+                      + blurred.astype(np.float32) * a).astype(np.uint8))
+
 
 class BlurPipeline:
     """Applies a configurable stack of blur layers to a masked region.
@@ -436,7 +490,11 @@ class BlurPipeline:
     _ROI_MAX_FRAC = 0.6
 
     def apply(self, frame: np.ndarray, mask: np.ndarray) -> None:
-        """Apply the blur stack to frame in-place, only where mask == 255."""
+        """Apply the blur stack to frame in-place where the mask is set.
+
+        A binary mask (0/255) composites hard, exactly as before; a soft mask
+        (any value in between, e.g. from ``render_head_mask``'s feathering)
+        alpha-blends, so blur fades out over the feather band."""
         if not self._layers:
             return
         ys, xs = np.nonzero(mask)
@@ -486,8 +544,13 @@ class BlurPipeline:
                                    interpolation=cv2.INTER_AREA)
                 out = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
         # Composite blurred pixels into the original where the mask is set.
-        src = cv2.copyTo(out, cv2.UMat(np.ascontiguousarray(mask)), src)
-        np.copyto(frame, src.get())
+        # Soft masks blend on the host — the blur itself (the heavy part)
+        # already ran on the GPU, and the ROI crop keeps this cheap.
+        if _is_soft(mask):
+            _blend(frame, out.get(), mask)
+        else:
+            src = cv2.copyTo(out, cv2.UMat(np.ascontiguousarray(mask)), src)
+            np.copyto(frame, src.get())
 
     # ── CPU path ──────────────────────────────────────────────────────────────
 
@@ -506,7 +569,10 @@ class BlurPipeline:
                                    interpolation=cv2.INTER_AREA)
                 out = cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        frame[mask == 255] = out[mask == 255]
+        if _is_soft(mask):
+            _blend(frame, out, mask)
+        else:
+            frame[mask == 255] = out[mask == 255]
 
     # ── GPU path ──────────────────────────────────────────────────────────────
 
@@ -539,15 +605,16 @@ class BlurPipeline:
                 out = F.avg_pool2d(out, kernel_size=b, stride=b, padding=0)  # type: ignore[possibly-undefined]
                 out = F.interpolate(out, size=(h, w), mode="nearest")  # type: ignore[possibly-undefined]
 
-        # Composite: use blurred result where mask is set, original elsewhere
+        # Composite: alpha-blend by the mask (a binary mask degenerates to
+        # the old hard select; a feathered one fades the blur out).
         mask_t = (
             torch.from_numpy(mask)  # type: ignore[possibly-undefined]
             .to(device)
-            .bool()
+            .float()
             .unsqueeze(0)
             .unsqueeze(0)
-        )  # (1, 1, H, W)
-        result = torch.where(mask_t, out, t)  # type: ignore[possibly-undefined]
+        ) / 255.0  # (1, 1, H, W)
+        result = t * (1.0 - mask_t) + out * mask_t
 
         # Write back to the original numpy buffer
         result_np = result.squeeze(0).permute(1, 2, 0).clamp(0, 255).byte().cpu().numpy()
