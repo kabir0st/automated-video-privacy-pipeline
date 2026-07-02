@@ -177,6 +177,19 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --collect-all "imageio_ffmpeg" \
   --add-data "$MODEL_WIN;models" \
   \
+  \
+  `# utils.py optionally imports torch for the CUDA blur path; on this` \
+  `# DirectML/OpenCL target that path never activates, and leftover torch in` \
+  `# the build env would add ~200 MB. Excluding it flips the runtime to the` \
+  `# same OpenCL blur it would pick anyway.` \
+  --exclude-module "torch" \
+  --exclude-module "torchvision" \
+  --exclude-module "torchaudio" \
+  --exclude-module "pandas" \
+  --exclude-module "matplotlib" \
+  --exclude-module "sklearn" \
+  --exclude-module "IPython" \
+  \
   --hidden-import "onnx" \
   --hidden-import "onnxruntime.tools.onnx_model_utils" \
   --collect-all "onnxconverter_common" \
