@@ -2,8 +2,8 @@
 
 # Automated Video Privacy Pipeline
 
-On-device face anonymization for video: detect, track, blur. Comes with a
-live inspector for tuning every step before you export.
+On-device head anonymization for video: detect, track, clean up offline, blur.
+Comes with a live inspector for tuning every step before you export.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-7C5CFF.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-3DD68C.svg)](pyproject.toml)
@@ -17,65 +17,69 @@ live inspector for tuning every step before you export.
 
 ---
 
-This tool finds every face in a video, follows it across frames, and paints an
+This tool finds every head in a video, follows it across frames, and paints an
 irreversible Gaussian and mosaic blur over it, entirely on your machine.
 Nothing is uploaded, ever.
 
 ## Features
 
-- **Three-panel live inspector.** Before, Tracking, and After side by side, so
-  you see exactly what the pipeline sees and exactly what gets exported. The
-  Tracking panel overlays the MediaPipe pose skeleton and the coarse head box fed
-  to the tracker, so you can watch pose assist keep a lost face covered.
-- **Presets first, sliders when you want them.** Pick a preset chip for the
-  common cases, or open the Advanced panel for full control of every tunable.
-  Changes re-render the current frame live.
-- **Real tracking, not per-frame detection.** InsightFace SCRFD detection with
-  106-point landmarks feeds a per-face Kalman filter; detections correct it,
-  and when the detector loses a face (head turn, looking down, occlusion) the
-  track coasts on prediction so the blur never flickers off. Body-pose head
-  estimation (MediaPipe) revives lost tracks even when no face is visible.
+- **Whole-head coverage at any angle.** One detector (PINTO YOLOv9-Wholebody17)
+  finds bodies, heads and faces in a single pass. The head class is trained on
+  all 360° orientations — back of head, profile, top-down, lying sideways — so
+  the person stays anonymous even when no face is visible. Optional **rotation
+  assist** re-detects on ±90°-rotated frames to recover sideways heads in bed
+  angles.
+- **Two-pass export with hindsight.** Pass 1 detects and tracks; the tracklets
+  are then cleaned *offline* — false positives pruned, detection gaps bridged
+  and interpolated along the head's path, positions smoothed with zero lag —
+  and pass 2 renders the blur from the cleaned table. No flicker, no ghost
+  blurs frozen at stale positions, no missed re-entries.
+- **Real tracking.** A constant-velocity Kalman filter per head with
+  BYTE-style two-stage association: low-confidence detections keep a blur
+  alive through occlusion but can never start one, and a new blur needs
+  several consecutive hits — one-frame false positives never flash.
+- **Consistent, tight masks.** Every head gets the same shape every frame: a
+  padded ellipse with a feathered edge. No hull/box popping, no giant safety
+  margins.
+- **Three-panel live inspector.** Before, Tracking, and After side by side.
+  The Tracking panel shows the raw evidence live: body boxes, head detections
+  (green = confident, grey = sustain-only), faces, pseudo-heads, and the
+  Kalman tracks with their state.
 - **Stackable blur layers.** Add, remove and reorder Gaussian and pixelate
-  passes to taste. The default is the classic combo: Gaussian first, mosaic
-  on top.
-- **Landmark-fitted masks.** The blur region is an expanded convex hull of the
-  face landmarks, with extra headroom for the hairline, not a crude box.
-- **Pause mid-export and retune.** Exports re-read the sliders every frame:
-  pause, adjust, watch the held frame update, resume.
-- **GPU where it helps.** ONNX Runtime picks DirectML, then CUDA, then CPU
-  automatically; the blur pass runs on CUDA via PyTorch when available.
+  passes. Mask padding, feather and the blur stack stay live-tunable even
+  during the render pass.
+- **Audio preserved.** The source audio track is stream-copied into the
+  export — no re-encode, no cost.
+- **GPU where it helps.** ONNX Runtime picks DirectML (AMD RX 6800), then
+  CUDA, then CPU automatically; the blur runs on OpenCL/UMat on AMD.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    A([Frame]) --> B[SCRFD detection<br/>+ 106-pt landmarks]
-    A --> P[RTMDet/YOLOX → RTMW<br/>133 whole-body keypoints]
-    B --> M{Ensemble merge<br/>gate skin · fill gaps}
-    P -- 68 face keypoints --> M
-    M --> C[Kalman tracker<br/>predict + correct]
-    P -. head boxes / lost faces .-> C
-    C --> D[Savitzky-Golay<br/>smoothing]
-    D --> E[Expanded hull<br/>blur mask]
-    E --> F[Blur layer stack<br/>one GPU pass]
-    F --> G([Anonymized frame])
+    A([Video]) --> B["Detect (1 model)<br/>body · head · face"]
+    B --> C[Kalman tracker<br/>BYTE association]
+    C --> D[("Tracklets")]
+    D --> E["Offline cleanup<br/>prune · bridge · interpolate · smooth"]
+    E --> F[Feathered ellipse masks]
+    F --> G[Blur layer stack<br/>one GPU pass]
+    G --> H([Anonymized MP4 + original audio])
 ```
 
-Two detectors run per frame and are **ensembled**. SCRFD gives a tight
-106-point mesh on near-frontal faces; **RTMW** (a whole-body pose model fronted
-by a RTMDet/YOLOX person detector) estimates 133 keypoints per person, 68 of
-them dense face landmarks. Because those land from body context, they keep
-finding the face at the angles a frontal detector misses — looking up or down,
-top-down close-ups, cheek-to-cheek — which is exactly the footage this tool
-targets. The merge also **gates SCRFD against the pose head regions**, so a
-detection that overlaps no actual head (bare skin mistaken for a face) is
-dropped rather than blurred.
+The export runs **two passes**. The analysis pass runs the detector on every
+frame and records the Kalman tracks. Between passes the tracklets are cleaned
+with knowledge a live tracker can never have — the future: coasted guesses are
+trimmed, short low-confidence tracklets are dropped, a head that vanishes and
+reappears nearby is re-joined with the gap *interpolated along its path*
+(gated so two close heads can never be smeared into one), and the trajectory is
+smoothed with a zero-phase filter. The render pass then just paints masks from
+that table and encodes — no inference, so it's fast and deterministic.
 
-Where both agree, SCRFD's denser mesh wins; RTMW fills in everywhere SCRFD is
-silent. When a face is still lost, its Kalman filter keeps predicting the
-head's position for **Hold (s)** seconds with the last hull riding the predicted
-box, and RTMW head boxes keep correcting the track for as long as the person is
-visible — even from behind.
+The live preview runs the same detector and tracker in streaming mode. It is
+deliberately approximate: the exported file always gets the extra offline
+cleanup, so the export is strictly better than the preview.
+
+See [docs/DATAFLOW.md](docs/DATAFLOW.md) for the full dataflow.
 
 ## Install
 
@@ -87,176 +91,132 @@ cd automated-video-privacy-pipeline
 uv sync
 ```
 
-> First run downloads the InsightFace `buffalo_l` pack (~300 MB) to
-> `~/.insightface` and, for the default RTMW pose backend, the YOLOX person
-> detector (~200 MB) and RTMW pose model (~100-200 MB) to `~/.cache/rtmlib`.
-> The legacy MediaPipe backend fetches a ~5 MB model to `~/.faceblur` instead.
-> Everything after that is fully offline.
+> First run downloads the detector model (~28 MB extracted from the PINTO
+> model zoo archive) to `~/.cache/avpp/detector/`. The Windows .exe bundles it,
+> so the .exe never downloads anything. Everything is fully offline after that.
 
 ### GPU acceleration (AMD RX 6800, NVIDIA, Intel)
 
-All neural-net inference (SCRFD, YOLOX, RTMW) runs through ONNX Runtime, which
-picks the best execution provider automatically: **DirectML** (any Windows GPU,
-including AMD Radeon) → CUDA (NVIDIA) → ROCm (AMD on Linux) → CPU. On an **AMD
-RX 6800** the fast path is **DirectML on Windows** — the default `onnxruntime`
-wheel is CPU-only, so install the DirectML build:
+Inference runs through ONNX Runtime, which picks the best execution provider
+automatically: **DirectML** (any Windows GPU, including AMD Radeon) → CUDA →
+ROCm → CPU. On an **AMD RX 6800** the fast path is **DirectML on Windows** —
+the default `onnxruntime` wheel is CPU-only, so install the DirectML build:
 
 ```bash
 uv pip uninstall onnxruntime
 uv pip install onnxruntime-directml      # Windows + any GPU (AMD/NVIDIA/Intel)
 ```
 
-The blur stack is GPU-accelerated too: it uses OpenCV's OpenCL/UMat path on AMD
-and Intel GPUs (and PyTorch CUDA on NVIDIA), so the RX 6800 handles the blur as
-well. At startup the CLI prints the active provider and blur backend — look for
-`[providers] ONNX inference: DmlExecutionProvider` and
-`[BlurPipeline] GPU (OpenCL/UMat) blur active` to confirm the GPU is engaged.
+The blur stack is GPU-accelerated too: OpenCV's OpenCL/UMat path on AMD and
+Intel (PyTorch CUDA on NVIDIA when installed). The debug log
+(`%TEMP%\FaceBlurInspector-debug.log`) records the resolved provider — look
+for `detector ready on DmlExecutionProvider`.
 
 ## Quick start
-
-**GUI inspector** (recommended):
 
 ```bash
 uv run python src/main.py
 ```
 
-**Headless CLI** for batch jobs:
+1. **Open Video** and scrub the timeline. All three panels update live.
+2. Pick a **preset**, or open **Advanced** and drag sliders; the current
+   frame re-renders so you can judge the result immediately.
+3. **Export**: pass 1 analyses (watch the Tracking panel), pass 2 renders.
+   **Pause** any time; mask padding, feather and blur layers apply live even
+   during rendering.
 
-```bash
-uv run python src/main.py --input talk.mp4 --output talk_blurred.mp4
-```
+### Presets
 
-| Flag | Default | Meaning |
+| Preset | Use it for |
+| --- | --- |
+| **Balanced** | Sensible defaults for most footage |
+| **Max Privacy** | Catch every head and blur hard; favours coverage over precision |
+| **Strict** | Fewer false blurs: higher confidence bar, shorter gap bridging |
+
+Touch any slider and the chips deselect: you're in **custom** territory.
+
+## Tuning guide
+
+### Detection
+
+| Tunable | Default | What it does |
 | --- | --- | --- |
-| `--input` | `0` | Video path, or a webcam index |
-| `--output` | (none) | Write the blurred video here |
-| `--target-size` | `640` | SCRFD input size; `1024` for offline accuracy |
-| `--pose-backend` | `rtmw` | `rtmw` (RTMDet+RTMW, robust at odd angles), `mediapipe` (legacy), or `none` |
-| `--pose-mode` | `performance` | RTMW model: `performance` (RTMW-x, best), `balanced`, or `lightweight` (RTMW-l, fast) |
-| `--no-display` | off | Skip the preview window |
-| `--no-pose` | off | Alias for `--pose-backend none` |
-| `--hold-secs` | `2.0` | Keep blurring a lost face this long on Kalman prediction |
+| **Confidence** | 0.50 | A head detection at or above this can start and drive a blur. *Lower* to catch more heads; the tracker and offline cleanup absorb most of the extra noise. |
+| **Sustain floor** | 0.10 | Detections between this and Confidence only *sustain* an existing blur through occlusion — they can never start one. |
+| **Rotation Assist** | on | Also detect on ±90°-rotated frames — recovers sideways heads (lying down, bed angles) at ~3× the detection cost. |
+
+### Tracking · Cleanup
+
+| Tunable | Default | What it does |
+| --- | --- | --- |
+| **Confirm frames** | 3 | Consecutive detections before a new head is blurred. Kills one-frame false positives; the export's end-extension repairs the onset. |
+| **Min track (s)** | 0.25 | Export cleanup: tracklets with fewer hits are detector noise and are dropped. |
+| **Bridge gap (s)** | 1.5 | Export cleanup: a head that vanishes and reappears within this window is re-joined, the gap blurred along its interpolated path. |
+| **Coast (s)** | 1.75 | How long a lost track stays alive as a re-acquire/bridge candidate (never blurred while coasting). |
+| **Smooth (s)** | 0.5 | Zero-phase smoothing window for the blur's position and size. |
+
+### Blur
+
+| Tunable | Default | What it does |
+| --- | --- | --- |
+| **Mask Pad** | 0.18 | How far the ellipse extends beyond the detected head box, per side. |
+| **Edge Feather** | 0.12 | Soft fade at the mask edge, as a fraction of head size. |
+| **Layer Stack** | Gaussian 71 → Pixelate 10 | Ordered blur passes. Gaussian strength is the kernel size (3–151, odd); Pixelate is the mosaic cell size (2–40). |
+
+### Recipes
+
+- **Heads slipping through?** Confidence `0.35`, Confirm frames `2`, Bridge
+  gap `2.5` — that's the *Max Privacy* preset.
+- **Something blurred that isn't a head?** Confidence `0.60`, Confirm frames
+  `5`, Min track `0.4` — that's *Strict*.
+- **Identity still readable after blur?** Raise Pixelate before Gaussian.
+  Mosaic size is what defeats deblurring; the Gaussian only feeds it.
+- **Blur box looks loose?** Mask Pad down to `0.10`; keep some Edge Feather so
+  residual jitter stays invisible.
 
 ## Windows build
 
 `build_exe.sh` produces a standalone `dist/FaceBlurInspector.exe` (single
-file, no console window). Run it from WSL2; it drives the Windows Python
-interpreter through WSL interop so PyInstaller emits a native executable:
+file, no console window, detector model bundled). Run it from WSL2; it drives
+the Windows Python interpreter through WSL interop:
 
 ```bash
 ./build_exe.sh
 ```
 
-You need a Windows Python 3.10-3.13 on the host (boxmot does not support
-3.14+). Models are still downloaded on first launch, not bundled.
-
-The build installs and bundles **rtmlib** (the default RTMW pose backend) and
-force-installs **onnxruntime-directml** so inference runs on the GPU — the RX
-6800 via DirectML. `rtmlib` is installed with `--no-deps` because its plain
-`onnxruntime` dependency would otherwise overwrite the DirectML build and
-silently drop the bundle back to CPU. The build's smoke test asserts
-`DmlExecutionProvider` is present, so a CPU-only bundle fails loudly instead of
-shipping. If you ever see `No module named 'rtmlib'` from a `.exe`, it was built
-before this step — rebuild with `./build_exe.sh`.
-
-## Using the inspector
-
-1. **Open Video** and scrub the timeline. All three panels update live.
-2. Pick a **preset**, or open **Advanced** and drag sliders; the current
-   frame re-renders so you can judge the result immediately.
-3. **Export**: choose a destination and watch progress frame by frame.
-   **Pause** any time to retune on the held frame, then **Resume**.
-
-### Presets
-
-<div align="center">
-<img src="docs/screenshots/preset-max-privacy.png" alt="Max Privacy preset selected" width="850"/>
-</div>
-
-| Preset | Use it for |
-| --- | --- |
-| **Balanced** | Sensible defaults for most footage |
-| **Max Privacy** | Catch every face and blur hard; favours coverage over speed |
-| **Crowded Scene** | Many small faces; high-res detection and stricter ID matching |
-| **Fast Preview** | Quick scrubbing on CPU while you find the right moment |
-
-Touch any slider and the chips deselect: you're in **custom** territory, shown
-next to the preset row.
-
-### Advanced: every tunable
-
-<div align="center">
-<img src="docs/screenshots/advanced.png" alt="Advanced panel with Detection, Blur and Tracking groups" width="850"/>
-</div>
-
-## Tuning guide
-
-### Tracking faces better
-
-| Tunable | Default | Range | What it does |
-| --- | --- | --- | --- |
-| **Target Size** | 640 | 320-1024 | Detector input resolution. The single biggest lever: small or distant faces need `1024`; drop to `320` for speed. |
-| **Det Score** | 0.55 | 0.10-1.00 | Minimum detection confidence. *Lower* to catch blurry, tilted or partially hidden faces; *raise* if non-faces get blurred. |
-| **Face Aspect** | 0.40 | 0.10-1.50 | Minimum width/height ratio a box must have to count as a face. *Lower* to keep extreme profile views; *raise* to reject tall false positives. |
-| **Close-up Thr** | 0.60 | 0.10-1.00 | Frame-area fraction above which a face is re-detected on an upscaled crop. *Lower* it for interview/talking-head footage to get tighter landmarks. |
-| **Match IoU** | 0.30 | 0.05-0.95 | Overlap required to attach a detection to an existing track. *Lower* if IDs flicker on fast motion; *raise* if IDs swap between people in crowds. |
-| **Hold (s)** | 2.0 | 0-5 | How long a lost face keeps its blur, coasting on Kalman prediction, before the track is dropped. |
-| **Pose Assist** | on | n/a | Track the head via body pose when the face detector loses it (head turns, looking down), keeping the track corrected indefinitely while the person is visible. |
-
-### Blurring videos better
-
-| Tunable | Default | Range | What it does |
-| --- | --- | --- | --- |
-| **Hull Expand** | 0.45 | 0-2 | Grows the landmark hull outward in every direction. Raise if ears or jawlines peek out. |
-| **Hair Extra** | 0.90 | 0-3 | Additional *upward* growth above the face centroid. Raise to cover hairlines, hats and hoods. |
-| **Layer Stack** | Gaussian 71, then Pixelate 10 | up to 5 layers | Ordered blur passes applied in sequence. Gaussian strength is the kernel size (3-151, odd); Pixelate strength is the mosaic cell size (2-40). Stack more layers for harder anonymization. |
-
-| Soft Gaussian wash | Heavy pixelation | Wide mask coverage |
-| --- | --- | --- |
-| ![Gaussian](docs/screenshots/tunables-blur-gaussian.png) | ![Pixelate](docs/screenshots/tunables-blur-pixelate.png) | ![Hull expand](docs/screenshots/tunables-hull-expand.png) |
-| `Gaussian K 151, Block 2` | `Gaussian K 3, Block 40` | `Hull Expand 1.5, Hair Extra 2.5` |
-
-### Recipes
-
-- **Faces slipping through?** Target Size `1024`, Det Score `0.35`, Face
-  Aspect `0.25`. Recall first; tighten afterwards if false positives appear.
-- **IDs swapping in a crowd?** Match IoU `0.45`+ and keep Target Size high so
-  small faces produce stable boxes.
-- **Identity still readable after blur?** Raise Pixelate Block before Gaussian
-  K. Mosaic size is what defeats deblurring; the Gaussian only feeds it.
-- **Hoodies or hair still visible?** Hair Extra `1.5`+, then Hull Expand. The
-  *Max Privacy* preset is exactly this dial-up.
-- **Export too slow?** Tune on *Fast Preview*, then switch up to *Balanced* or
-  *Max Privacy* right before exporting, or pause mid-export and adjust.
+You need a Windows Python 3.10–3.13 on the host. The build force-installs
+**onnxruntime-directml** last so inference runs on the GPU, and its smoke test
+asserts `DmlExecutionProvider` is present — a CPU-only bundle fails loudly
+instead of shipping. `test_pipeline_win.py` is a standalone smoke test you can
+run against the repo with Windows Python.
 
 ## Privacy by design
 
 - All inference and rendering happen locally; the network is only touched to
-  fetch the model packs, once each.
+  fetch the detector model once (and never by the .exe, which bundles it).
 - Blur is destructive (a flat-color mosaic over a Gaussian wash), not a
   reversible filter.
-- Occlusion handling errs on the side of coverage: when detection drops out,
-  the last known mask is held rather than removed.
+- The cleanup pass errs on the side of coverage: detection gaps are bridged
+  and interpolated, track ends are extended, and interpolated segments get
+  extra padding.
 
 ## Project structure
 
 ```
 src/
-  main.py            entry point; dispatches to the GUI or the CLI
+  main.py            entry point; shows the splash, hands off to the GUI
   splash.py          lightweight splash screen shown while heavy imports load
-  cli.py             headless pipeline for batch jobs
-  ui.py              the inspector (PyQt6): presets, panels, export
+  ui.py              the inspector (PyQt6): presets, panels, two-pass export
   libs/
-    face_app.py      minimal InsightFace loader (DirectML-safe)
-    pose_rtmw.py     RTMDet/YOLOX → RTMW whole-body pose (face keypoints + head boxes)
-    pipeline.py      shared detection front-end: SCRFD ⊕ RTMW ensemble + skin gating
-    tracker.py       Kalman face tracker with detection-gap coasting
-    pose_head.py     legacy MediaPipe pose to head boxes, for lost-track revival
-    smoother.py      Savitzky-Golay landmark smoother with occlusion hold
-    utils.py         hull masks + GPU blur (CUDA / OpenCL) + provider selection
-    video_writer.py  streaming ffmpeg exporter (handles >4 GiB output)
+    detector.py      single ONNX detector (body/head/face) + rotation assist
+    head_tracker.py  Kalman + BYTE association + Hungarian assignment
+    tracklets.py     pass-1 recording + offline cleanup → render table
+    models.py        startup preflight: locate/download the detector
+    utils.py         providers, fp16, feathered masks, GPU blur stack
+    video_writer.py  streaming ffmpeg exporter (>4 GiB safe, audio copy)
 scripts/
   capture_screenshots.py   regenerates the README screenshots, headless
+test_pipeline_win.py       Windows/DirectML smoke test (run with py.exe)
 build_exe.sh         standalone Windows .exe via PyInstaller (run from WSL2)
 ```
 
@@ -273,3 +233,8 @@ QT_QPA_PLATFORM=offscreen uv run python scripts/capture_screenshots.py
 ## License
 
 [MIT](LICENSE) © 2026 Kabir S. Tamari
+
+The default detector model (YOLOv9-Wholebody17 from the
+[PINTO model zoo](https://github.com/PINTO0309/PINTO_model_zoo)) is GPLv3 and
+is downloaded/bundled as data, not linked; the Apache-2.0
+YOLOX-Body-Head-Hand-Face spec is available via `AVPP_DETECTOR=yolox_bhhf`.

@@ -2,327 +2,172 @@
 
 ## Overview
 
-The Automated Video Privacy Pipeline is built as a modular detection → tracking → smoothing → masking → blurring system. Each component uses a specific technology chosen for accuracy, performance, and reliability.
+The pipeline is a **single-detector, two-pass** anonymiser: one ONNX model
+finds body/head/face boxes, a Kalman tracker links them across frames, an
+offline cleanup pass turns the raw tracklets into a per-frame render table,
+and the render pass paints feathered ellipse masks and blurs them.
 
-> For the end-to-end dataflow diagram (Mermaid) and a per-stage tech table, see
-> [DATAFLOW.md](DATAFLOW.md).
+> For the end-to-end dataflow diagram (Mermaid) and a per-stage tech table,
+> see [DATAFLOW.md](DATAFLOW.md).
 
 ```
-Video Frame
-    ↓
-[Detection] → InsightFace SCRFD (faces + 106 landmarks)
-              ⊕ RTMW Wholebody pose (faces + head boxes)
-              → merge_detections() ensemble
-    ↓
-[Tracking] → Kalman Filter (per-face state estimation)
-              ↑ pose head box = weak correction (revives lost tracks)
-    ↓
-[Smoothing] → Savitzky-Golay Filter (landmark noise reduction)
-    ↓
-[Masking] → Convex Hull + Expansion (landmark-fitted mask)
-    ↓
-[Blurring] → PyTorch (CUDA) / OpenCV UMat (OpenCL) / CPU (Gaussian + Pixelate)
-    ↓
-Anonymized Frame
+Video ──▶ Pass 1 (analyse)                       Pass 2 (render)
+          Detection  → YOLOv9-Wholebody17        RenderTable lookup
+          Fusion     → fuse_heads()              render_head_mask()
+          Tracking   → Kalman + BYTE             BlurPipeline (GPU)
+          Recording  → TrackRecorder             FFmpegWriter (+audio copy)
+                   ╲                            ╱
+                    ▶ tracklets.postprocess() ─▶
+                      trim · prune · bridge · interpolate · smooth
 ```
 
 ---
 
-## Component Breakdown
+## Components and why they were chosen
 
-### 1. **Detection: InsightFace SCRFD**
+### Detection — PINTO 457_YOLOv9-Wholebody17 (`src/libs/detector.py`)
 
-**What it does:** Finds all faces in a frame and extracts 106 facial landmarks (eyes, nose, mouth, jaw, etc.).
+One post-processed ONNX graph (NMS, BGR handling and normalisation embedded)
+emits `[N, 7]` rows of `[batchno, classid, score, x1, y1, x2, y2]`. Only the
+Body (0), Head (7) and Face (8) classes are consumed.
 
-**Where:** `libs/face_app.py`
+- **Why a head detector, not a face detector.** The head class is annotated
+  for all 360° orientations — "Head does not mean Face". Faces vanish when a
+  person looks away or lies face-down; heads don't. The previous stack
+  (SCRFD faces + RTMW pose + RF-DETR persons, ensembled) missed exactly those
+  frames and cost 4 model passes per frame; this costs one.
+- **Rotation assist.** Detection recall drops on in-plane-rotated (sideways)
+  heads, which bed-angle footage is full of. `detect(rotations=(0, 90, 270))`
+  re-runs the same session on rotated copies and merges unrotated results.
+  Rotated passes are *assist-only*: stricter score floor, and any rotated
+  "head" that contains an upright-detected head is discarded (a rotated scene
+  can hallucinate one giant frame-sized head — verified and gated in tests).
+- **Face fusion.** A face detection with no covering head box grows a
+  head-proportioned pseudo-head (`fuse_heads`) — the recall backstop when the
+  head class misses but the face class fires.
+- **Swappable spec.** `AVPP_DETECTOR=yolox_bhhf` switches to the Apache-2.0
+  434_YOLOX-Body-Head-Hand-Face model; `AVPP_DETECTOR_ONNX`/`_URL` override
+  the file or mirror. Specs are read once at startup.
 
-**Why InsightFace?**
-- SCRFD is fast (384×640 at 30+ fps on CPU) and accurate even on small/tilted faces
-- 106-point landmarks let us fit a precise mask around the face contour, not just a bounding box
-- Works offline (models ship locally)
-- Mature codebase with DirectML/CUDA/CPU backends
+### Tracking — `src/libs/head_tracker.py`
 
-**How it's used:**
-```python
-# Get face detections on the frame
-faces = face_app.get(frame, target_size=640)
-# Each face has: bbox, landmarks (106 points), confidence score
-```
+Constant-velocity Kalman filter per head (`[cx, cy, w, h]` + velocities,
+ByteTrack noise convention) with a three-stage association cascade, all solved
+by the Hungarian method (`scipy.optimize.linear_sum_assignment`):
 
----
+1. all tracks × high-score detections, IoU-gated;
+2. **BYTE**: leftover tracks × low-score detections (sustain-only — the
+   anti-flicker mechanism through occlusion);
+3. fast-motion recovery: centre-distance + size-ratio gated (never a bare
+   nearest-neighbour grab — that caused the old detection-stealing ghosts).
 
-### 1b. **Detection ensemble: SCRFD ⊕ RTMW**
+Lifecycle: births only from confident detections, `min_hits` consecutive hits
+to confirm (one-frame false positives never render), confirmed tracks coast on
+prediction up to `max_age_s` as bridge candidates only — coasted frames are
+never blurred directly.
 
-**What it does:** Combines the SCRFD face detector with RTMW pose so the two cover
-each other's blind spots before anything reaches the tracker.
+### Offline cleanup — `src/libs/tracklets.py`
 
-**Where:** `libs/pipeline.py` → `detect()` / `merge_detections()`
+The export's second brain. With the whole timeline recorded,
+`postprocess()`:
 
-**Why an ensemble?** On the footage this app targets (two people, odd top-down
-angles, nude scenes) SCRFD has two failure modes the pose model fixes:
+1. **trims** coasted tails (predictions that never met a detection are not
+   blurred — the old static-hold ghost fix);
+2. **prunes** tracklets that are too short / never confident / mostly coasted;
+3. **bridges** gaps ≤ `bridge_gap_s`: velocity-extrapolated distance gate,
+   size-ratio gate, a **corridor gate** (never bridge through a region another
+   surviving track occupies — the identity-smear guard) and an **ambiguity
+   gate** (two near-equal candidates → bridge neither), then linear
+   interpolation with mid-gap size padding;
+4. **extends** each tracklet ~0.12 s at both ends (covers detector spin-up);
+5. **smooths** cx/cy/w/h with zero-phase Savitzky-Golay — steady blur, no lag.
 
-- **Missed faces at odd angles** — SCRFD only fires near-frontal, so a face looking
-  up/down/away is never detected. RTMW estimates the head from whole-body context
-  and contributes a face detection there.
-- **Skin blurred as a face** — SCRFD occasionally fires on bare skin. Any SCRFD box
-  overlapping *no* RTMW head region is dropped (skin on a torso has no head
-  keypoints near it), while high-confidence SCRFD boxes (≥ 0.70) are always kept so
-  genuine frontal faces are never lost.
+### Masking & blur — `src/libs/utils.py`
 
-Where both agree, SCRFD's denser 106-point mesh wins; RTMW fills in everywhere
-SCRFD is silent.
+`render_head_mask()` draws one padded axis-aligned ellipse per head box and
+feathers the whole mask with a single Gaussian — one consistent shape every
+frame (no hull/ellipse popping), pre-grown by the feather radius so feathering
+never shrinks coverage. `BlurPipeline` applies the configurable
+Gaussian/pixelate stack once per frame (CUDA → OpenCL/UMat → CPU) and
+alpha-composites soft masks; binary masks keep the fast hard path.
 
----
+### Encoding — `src/libs/video_writer.py`
 
-### 2. **Tracking: Kalman Filter**
+Raw BGR frames pipe to an FFmpeg subprocess (libx264, source-matched bitrate,
+`+faststart`, co64-safe past 4 GiB). The source's audio track is
+**stream-copied** into the output (`-map 1:a:0? -c:a copy`) — a remux, zero
+cost. No `-shortest`: AAC priming makes audio fractionally shorter and it
+would drop the final video frame.
 
-**What it does:** Tracks each detected face across frames so the blur stays attached even if detection temporarily fails.
+### Runtime — ONNX Runtime with DirectML
 
-**Where:** `libs/tracker.py` → `KalmanFaceTracker`
+`best_onnx_providers()` resolves **DirectML → CUDA → ROCm → CPU**. Two
+DirectML survival rules shape the code:
 
-**Why Kalman?**
-- Per-frame detection is fragile: occlusions, head turns, and motion blur cause detections to drop out
-- A Kalman filter predicts where a face *should be* based on its motion, so the blur coasts smoothly instead of disappearing
-- Simple, fast, and battle-tested (used in robotics, autonomous vehicles, etc.)
+1. **Never destroy a session.** Destroying one corrupts the provider's device
+   state; the next inference dies with a native access violation. The detector
+   session is created lazily, exactly once, per process.
+2. **Pin graph shapes.** DirectML validates strictly; the detector input is
+   fixed to `1×3×640×640` (`make_input_shape_fixed`) before the session is
+   built.
 
-**How it works:**
-- **State:** Position (cx, cy), size (w, h), velocity (vx, vy) — 6 numbers per face
-- **Prediction:** "If this face was moving right at 10 px/frame, it's probably 10 px further right now"
-- **Correction:** When a new detection arrives, the filter updates the state to match observed position
-- **Coasting:** If detection drops, the filter keeps predicting for up to `hold_secs` (default 2.0), then the track dies. Velocity is damped on each coasting frame so a lost box cannot drift across the frame
-- **Fallbacks:** Detections are matched to tracks by IoU, with a centre-distance fallback so fast motion (which drops IoU to zero between frames) doesn't break the association
+fp16 conversion (`fp16_model_path`, ~2× on RDNA2) exists but the detector
+ships fp32 first — fp16 across the embedded-NMS partition boundary is a known
+risk; `AVPP_FP16=0` is the kill switch.
 
-**Example:**
-```
-Frame 1: Face detected at (100, 200), velocity (5, 0)
-Frame 2: No detection, but Kalman predicts (105, 200) and blur follows
-Frame 3: Still no detection, Kalman predicts (110, 200)
-Frame 4: After 2 seconds, track is dropped if no new detection arrives
-```
+### GUI — PyQt6 (`src/ui.py`)
 
----
-
-### 3. **Pose assist & recovery: RTMW (default) / MediaPipe (legacy)**
-
-**What it does:** Whole-body pose estimation finds heads that the face detector
-can't — both to *contribute face detections* (the ensemble above) and to *recover
-lost tracks* (when a head turns away, looking down). It also supplies the head
-regions SCRFD detections are gated against.
-
-**Where:** `libs/pose_rtmw.py` → `RTMWPoseEstimator` (**default**); legacy
-`libs/pose_head.py` → `PoseHeadEstimator` (MediaPipe). The backend is chosen by
-`make_pose_backend()` in `libs/pipeline.py` and the `--pose-backend
-{rtmw,mediapipe,none}` flag.
-
-**Why RTMW (rtmlib `Wholebody`: YOLOX person detector → RTMW pose)?**
-- Estimates 133 COCO-WholeBody keypoints *per person*; 68 of those are dense face
-  landmarks that keep landing on the real face at angles that kill a frontal
-  detector
-- Anchored to a coherent body skeleton, it does **not** fire on random bare skin —
-  exactly the false-positive that plagued the old pipeline on nude footage
-- Degrades gracefully: if rtmlib/model load fails, it flips to SCRFD-only instead
-  of crashing
-- `--pose-mode performance` (RTMW-x, best) / `balanced` / `lightweight` (RTMW-l,
-  fast CPU preview)
-
-**MediaPipe (legacy `--pose-backend mediapipe`):** detects 33 body landmarks and
-builds a coarse head box (ear-to-ear width when visible, falling back to eye span,
-then an estimate above the shoulders). It yields head boxes for tracker assist but
-**no** face landmarks, so it contributes no face detections and gates nothing —
-SCRFD behaves as before, just with head-box revival of lost tracks.
-
-**How it feeds the tracker:**
-- A head box is fed to the Kalman filter as a *weak correction* (pins position,
-  barely moves size)
-- Strong corrections (a new face detection) override weak ones, so when the face
-  returns the filter snaps to the real detection
-- The inspector's Tracking panel overlays the pose skeleton and head box, so you
-  can confirm pose assist is alive frame by frame
-
-**Example:**
-```
-Person turns their head (SCRFD face detection drops)
-  ↓
-RTMW still estimates the head from the body skeleton
-  ↓
-Head box → Kalman filter (weak correction), track revived
-  ↓
-Blur stays on as the person turns / walks out of frame
-```
+Three-panel inspector (Before / Tracking / After), preset chips + advanced
+sliders, live preview on a worker thread (latest-wins mailbox), and the
+two-pass export with pass-aware progress. Detection/tracking sliders drive
+pass 1 and the preview; mask padding, feather and blur layers stay live even
+during pass 2.
 
 ---
 
-### 4. **Smoothing: Savitzky-Golay Filter**
+## Packaging
 
-**What it does:** Reduces jitter in the 106 landmarks so the blur mask doesn't wiggle frame-to-frame.
+`build_exe.sh` (WSL2 → Windows Python interop → PyInstaller onefile/windowed):
 
-**Where:** `libs/smoother.py` → `LandmarkSmoother`
+- installs the trimmed dependency set (PyQt6, scipy, opencv-python, numpy,
+  onnx, onnxconverter-common, imageio-ffmpeg);
+- force-installs **onnxruntime-directml last** so no CPU-only wheel can
+  clobber it, and asserts `DmlExecutionProvider` before building;
+- **bundles the detector ONNX** (`--add-data … models`) so the .exe's first
+  run downloads nothing — `libs.detector.model_path()` checks
+  `sys._MEIPASS/models/` first, then `~/.cache/avpp/detector/`, then env
+  overrides.
 
-**Why Savitzky-Golay?**
-- Preserves the shape of the landmark cloud while removing high-frequency noise
-- Handles occlusion (if a landmark is missing, hold the last known value)
-- Better than simple averaging because it doesn't blur edges
+## Environment variables
 
-**How it's used:**
-- Runs over a sliding window of recent frames (default: 15-frame window, polynomial order 2)
-- Fits the polynomial to each landmark's trajectory and reads off the smoothed latest point
-- Outputs smoothed positions that track real motion without jitter
+| Variable | Effect |
+| --- | --- |
+| `AVPP_DETECTOR` | Spec name: `wholebody17` (default) or `yolox_bhhf` |
+| `AVPP_DETECTOR_ONNX` | Absolute path to a local detector ONNX |
+| `AVPP_DETECTOR_URL` | Mirror URL (`.onnx` or PINTO `.tar.gz`) |
+| `AVPP_FP16` | `0` disables the fp16 model derivative |
+| `AVPP_SKIP_MODEL_DOWNLOAD` | Preflight checks locations only |
 
----
-
-### 5. **Masking: Convex Hull + Expansion**
-
-**What it does:** Converts the 106 landmarks into a polygon mask that covers the face and ears.
-
-**Where:** `libs/utils.py` → `MaskBuilder`
-
-**How it works:**
-- Compute the convex hull of the 106 landmarks (outermost points form a polygon)
-- Expand the polygon outward by `hull_expand` pixels in all directions (catch ears, jawline)
-- Expand additional pixels *upward* by `hair_extra` to cover hair and hats
-- Render the polygon as a binary mask
-
-**Why this approach?**
-- Landmark-fitted masks are tighter than axis-aligned boxes
-- You can tune coverage without changing detection or tracking
-- Expansion parameters are intuitive: bigger = more coverage
-
-**Example:**
-```
-Face landmarks: 106 points scattered around the face
-    ↓
-Convex hull: Outline of the face perimeter
-    ↓
-Expand by 0.45: Outward in all directions
-    ↓
-Hair extra 0.9: Additional upward growth
-    ↓
-Mask polygon: A shape that covers face + ears + hair
-```
-
----
-
-### 6. **Blurring: PyTorch + NumPy**
-
-**What it does:** Applies stackable Gaussian and pixelate blur layers to the masked region.
-
-**Where:** `libs/utils.py` → `BlurPipeline`
-
-**Tech choice (backend picked once at construction):**
-- **CUDA / PyTorch** — NVIDIA GPUs (`F.conv2d` Gaussian, `avg_pool2d` mosaic)
-- **OpenCL / OpenCV UMat** — any OpenCL device; this is the path that lights up an
-  AMD Radeon (e.g. RX 6800) where torch-CUDA never applies, so the blur still runs
-  on the GPU
-- **CPU / OpenCV** — fallback
-
-Both Gaussian and pixelate run as one stacked composite pass per frame, regardless
-of how many faces are present.
-
-**Why stack layers?**
-- Gaussian alone is reversible (image forensics can sometimes recover faces)
-- Pixelate (mosaic) is hard to reverse, but can look crude on its own
-- Gaussian → Pixelate gives you a soft wash + hard mosaic = maximum privacy with good aesthetics
-
-**How to use:**
-```python
-# Stack layers: Gaussian 71 kernel, then Pixelate 10 px blocks
-layers = [("gaussian", 71), ("pixelate", 10)]
-pipeline.reconfigure(layers)
-pipeline.apply(frame, mask)  # blurs the masked region of `frame` in place
-```
-
----
-
-### 7. **UI: PyQt6**
-
-**What it does:** Provides the inspector with three live panels (Before / Tracking / After), preset chips, and export controls.
-
-**Where:** `src/ui.py`
-
-**Key pattern: Preview Mailbox**
-- Don't emit numpy frames through Qt signals (GUI can't keep up with 3×1080×1920 pixmap builds)
-- Instead, `ProcessWorker` writes the latest preview to a shared memory slot (`_emit_preview`)
-- GUI reads it (`take_preview`) on demand, avoiding the queue backlog
-
-**GPU acceleration:**
-- ONNX Runtime auto-selects DirectML (Windows) → CUDA (NVIDIA) → CPU
-
----
-
-## Dependency Graph
-
-```
-InsightFace SCRFD (faces + 106 landmarks)
-    │                                   RTMW Wholebody pose (faces + head boxes)
-    └────────────┬──────────────────────────────┘
-                 ↓
-        merge_detections() ensemble (libs/pipeline.py)
-                 ↓
-            Kalman Filter (tracking)  ←─ pose head box (weak correction)
-                 ↓
-            Smoothing (Savitzky-Golay)
-                 ↓
-            MaskBuilder (convex hull)
-                 ↓
-            BlurPipeline (Gaussian + Pixelate · CUDA / OpenCL / CPU)
-```
-
----
-
-## Performance Notes
-
-| Component | GPU | CPU (WSL2) | Notes |
-|-----------|-----|-----------|-------|
-| InsightFace detection | ~6 fps (1080p) | ~1 fps (1080p) | DirectML/CUDA accelerated |
-| Kalman tracking | — | Real-time | No GPU needed |
-| RTMW pose (default) | ~10 fps | ~2 fps | rtmlib YOLOX→RTMW; bottleneck if enabled. MediaPipe legacy backend is lighter/faster |
-| Blur (Gaussian) | Real-time | ~3 fps | PyTorch CUDA speeds this up |
-| Blur (Pixelate) | — | Real-time | NumPy, no GPU needed |
-| **Overall** | ~6 fps | ~4 fps | Limited by detection |
-
----
-
-## Key Design Decisions
-
-### Why not ByteTrack?
-We initially used ByteTrack (popular in sports) but it only returns tracks *matched this frame*. On detection dropout, tracks vanish immediately. Kalman filtering solves this by predicting position when detection fails.
-
-### Why Kalman + whole-body pose (RTMW)?
-Kalman alone coasts until detection returns. Adding pose estimation keeps the track *corrected* as long as the person is visible, even from behind. RTMW is the default (it also contributes face detections and suppresses skin false-positives via the ensemble); MediaPipe remains a lighter legacy backend that only supplies head boxes. This is especially useful in scenarios where faces turn away but blur must remain.
-
-### Why convex hull, not a tight ellipse?
-Ellipses can miss ears and asymmetric hairstyles. Convex hulls fit the actual landmark cloud shape and let you tune coverage with simple parameters (expand, hair extra).
-
-### Why Savitzky-Golay smoothing?
-Simple averaging blurs edges. Savitzky-Golay fits a polynomial, preserving landmark shape while removing jitter. This prevents the blur mask from wiggling frame-to-frame.
-
----
-
-## File Organization
+## File organization
 
 ```
 src/
-  main.py                 entry point
-  cli.py                  headless pipeline
-  ui.py                   PyQt6 inspector
-  
-libs/
-  pipeline.py            shared detection front-end + SCRFD⊕RTMW ensemble
-  face_app.py            InsightFace loader (DirectML-safe)
-  tracker.py             Kalman filter
-  pose_rtmw.py           RTMW whole-body pose → faces + head boxes (default)
-  pose_head.py           MediaPipe pose → head boxes (legacy backend)
-  smoother.py            Savitzky-Golay smoothing
-  utils.py               MaskBuilder + BlurPipeline
-  video_writer.py        streaming ffmpeg exporter (handles >4 GiB output)
+  main.py            entry point; splash → GUI
+  splash.py          loading splash
+  ui.py              PyQt6 inspector + two-pass export worker
+  libs/
+    detector.py      single ONNX detector (body/head/face) + rotation assist
+    head_tracker.py  Kalman + BYTE + Hungarian tracker
+    tracklets.py     pass-1 recorder + offline cleanup → render table
+    models.py        startup preflight (bundle/cache/download)
+    utils.py         providers, fp16, feathered masks, GPU blur stack
+    video_writer.py  streaming ffmpeg exporter (>4 GiB safe, audio copy)
 ```
 
----
+## Debug artifacts (Windows)
 
-## Getting Started
-
-1. **Install:** `uv sync`
-2. **Run GUI:** `uv run python src/main.py`
-3. **Run CLI:** `uv run python src/main.py --input video.mp4 --output blurred.mp4`
-
-All models download on first run. Everything else is offline.
+- `%TEMP%\FaceBlurInspector-debug.log` — status lines, resolved providers,
+  per-stage timings every 30 frames (`[analyse f…]` / `[render f…]`), and the
+  between-pass tracklet summary (`N raw tracklets → M heads, blur on X/Y
+  frames`).
+- `%TEMP%\FaceBlurInspector-error.log` — tracebacks + faulthandler dumps.

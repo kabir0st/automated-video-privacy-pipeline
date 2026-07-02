@@ -21,10 +21,13 @@ are embedded in the graph. Input is raw BGR float32 ``1×3×H×W``; output is on
 ``[N, 7]`` tensor of ``[batchno, classid, score, x1, y1, x2, y2]`` with
 coordinates in model-input pixel space.
 
-DirectML rules (see libs/face_app.py): the session is created lazily, exactly
-once, and never destroyed; the graph input is shape-pinned to the spec's fixed
-resolution before the session is built. The active spec is read from the
-environment once at import — there is deliberately no runtime model switching.
+DirectML rules (learned the hard way in earlier revisions): destroying an ORT
+session corrupts the DirectML provider's device state and the next inference
+dies with a native access violation, and DirectML validates graph shapes
+strictly. Hence: the session is created lazily, exactly once, and never
+destroyed; the graph input is shape-pinned to the spec's fixed resolution
+before the session is built. The active spec is read from the environment once
+at import — there is deliberately no runtime model switching.
 
 Model file resolution order (first hit wins):
   1. ``AVPP_DETECTOR_ONNX`` — explicit path to a local ``.onnx``;
@@ -160,7 +163,8 @@ def download_model(
     PINTO's default hosting is a per-size ``.tar.gz`` containing every export
     resolution; only the single ``spec.member`` file is extracted into the
     cache and the archive is deleted. A direct ``.onnx`` URL is saved as-is.
-    ``.part`` temp + atomic rename, mirroring person_detector's pattern."""
+    ``.part`` temp + atomic rename so a killed download can never leave a
+    truncated model behind."""
     spec = spec or active_spec()
     existing = model_path(spec)
     if existing is not None:
@@ -209,8 +213,9 @@ def _pinned_model(path: str, hw: tuple[int, int]) -> str:
     """Return a copy of the model with its input pinned to ``1×3×H×W``.
 
     PINTO's per-resolution exports still declare symbolic H/W on the graph
-    input; DirectML validates shapes strictly, so pin + re-infer downstream
-    shapes exactly as face_app._det_model_for_size does. Cached on disk.
+    input; DirectML validates shapes strictly and rejects symbolic dims inside
+    Reshape nodes, so pin the input and re-infer the downstream shapes.
+    Cached on disk.
     """
     import onnx
     from onnxruntime.tools.onnx_model_utils import (

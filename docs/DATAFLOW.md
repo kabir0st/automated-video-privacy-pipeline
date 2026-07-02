@@ -1,85 +1,87 @@
 # Pipeline Dataflow
 
-This is the end-to-end dataflow of the Automated Video Privacy Pipeline — the
-**detect → track → smooth → mask → blur → encode** loop run once per frame.
+The Automated Video Privacy Pipeline anonymises heads in video with a
+**single-detector, two-pass** design: one ONNX model finds body/head/face
+boxes, a Kalman tracker links them over time, and the export renders blur from
+an *offline-cleaned* track table — so the output is judged with hindsight, not
+frame by frame.
 
-Entry point [`src/main.py`](../src/main.py) dispatches to either the headless CLI
-([`src/cli.py`](../src/cli.py)) or the PyQt6 inspector GUI
-([`src/ui.py`](../src/ui.py)). Both share the detection front-end in
-[`src/libs/pipeline.py`](../src/libs/pipeline.py).
-
-> For component-level rationale and tuning notes, see
-> [TECH_STACK.md](TECH_STACK.md). This document focuses on *how data moves*.
+Entry point [`src/main.py`](../src/main.py) shows the splash and hands off to
+the PyQt6 inspector ([`src/ui.py`](../src/ui.py)) — the GUI is the sole entry
+point.
 
 ## Diagram
 
 ```mermaid
 flowchart TD
     subgraph Input
-        VID[Video file / webcam]
+        VID[Video file]
         VC["OpenCV VideoCapture<br/>(BGR frame)"]
         VID --> VC
     end
 
     VC --> FRAME([frame])
 
-    subgraph Detection["Detection front-end · pipeline.detect()"]
+    subgraph P1["Export pass 1 · analyse (no blur)"]
         direction TB
-        FRAME --> SCRFD["SCRFD face detect + 106 landmarks<br/>InsightFace buffalo_l · det_10g + 2d106det<br/>(FaceApp, ONNX Runtime)"]
-        FRAME --> POSE["RTMW Wholebody pose<br/>rtmlib: YOLOX → RTMW<br/>133 COCO-WholeBody keypoints (ONNX Runtime)"]
-        SCRFD --> MERGE{{"merge_detections()<br/>gate skin false-positives · add missed faces"}}
-        POSE -->|68 face kpts + head boxes| MERGE
+        FRAME --> DET["HeadDetector<br/>PINTO YOLOv9-Wholebody17 (ONNX)<br/>body + head + face boxes, NMS in-graph<br/>optional ±90° rotation assist"]
+        DET --> FUSE{{"fuse_heads()<br/>orphan faces → pseudo-heads"}}
+        FUSE --> TRK["HeadTracker<br/>constant-velocity Kalman ·<br/>BYTE two-stage association · Hungarian"]
+        TRK --> REC["TrackRecorder<br/>per-frame TrackObs, full-res coords"]
     end
 
-    MERGE -->|ensembled faces| TRK["Kalman tracker<br/>KalmanFaceTracker (NumPy)<br/>constant-velocity · coast on loss"]
-    POSE -.->|head boxes = weak correction| TRK
+    REC --> POST["tracklets.postprocess()<br/>trim coasted tails · prune noise ·<br/>bridge gaps (corridor + ambiguity gates) ·<br/>interpolate · zero-phase SavGol smooth"]
+    POST --> TABLE[("RenderTable<br/>frame → [(id, head box)]")]
 
-    TRK --> SMOOTH["Landmark smoothing<br/>Savitzky-Golay (SciPy)"]
-    SMOOTH --> MASK["MaskBuilder<br/>convex hull + expand (OpenCV)"]
-    MASK --> BLUR["BlurPipeline · Gaussian + pixelate<br/>CUDA/PyTorch · OpenCL/UMat · CPU/OpenCV"]
-    FRAME -.->|pixels to blur| BLUR
+    subgraph P2["Export pass 2 · render (no inference)"]
+        direction TB
+        VC2["fresh VideoCapture"] --> FRAME2([frame])
+        TABLE --> MASK["render_head_mask()<br/>padded feathered ellipses"]
+        FRAME2 --> BLUR["BlurPipeline · Gaussian + pixelate<br/>CUDA/PyTorch · OpenCL/UMat · CPU"]
+        MASK --> BLUR
+        BLUR --> WRITE["FFmpegWriter · libx264<br/>+ audio stream-copy from source"]
+        WRITE --> OUT[Anonymised MP4]
+    end
 
-    BLUR --> OVL["Overlays: hulls, IDs, FPS (OpenCV)"]
-    OVL --> WRITE["FFmpegWriter<br/>libx264 via imageio-ffmpeg<br/>(cv2.VideoWriter fallback)"]
-    OVL --> DISP["cv2.imshow / PyQt6 inspector"]
-    WRITE --> OUT[Anonymised MP4]
-
-    PROV["best_onnx_providers()<br/>DirectML → CUDA → ROCm → CPU"] -.-> SCRFD
-    PROV -.-> POSE
+    PROV["best_onnx_providers()<br/>DirectML → CUDA → ROCm → CPU"] -.-> DET
 
     classDef tech fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
-    class SCRFD,POSE,TRK,SMOOTH,MASK,BLUR,WRITE tech;
+    class DET,TRK,POST,MASK,BLUR,WRITE tech;
 ```
+
+The **live preview** runs the same detector + tracker as pass 1 in streaming
+mode (confirmed tracks only, short hold) and blurs a display-resolution copy —
+approximate by design; the export's offline cleanup is what the written file
+gets.
 
 ## Stage-by-stage
 
 | # | Stage | Tech | Source | Purpose |
 |---|-------|------|--------|---------|
-| 1 | Decode | OpenCV `VideoCapture` | [cli.py](../src/cli.py) | Read BGR frames from file/webcam |
-| 2a | Face detection | InsightFace SCRFD (`det_10g` + `2d106det`), ONNX Runtime | [face_app.py](../src/libs/face_app.py) | Face boxes + 106 landmarks; close-ups re-detected on a 1024px crop |
-| 2b | Pose detection | rtmlib `Wholebody` (YOLOX → RTMW), ONNX Runtime | [pose_rtmw.py](../src/libs/pose_rtmw.py) | 133 keypoints → synthetic face dets (68 face kpts) + coarse head boxes |
-| 2c | Ensemble | NumPy geometry (`merge_detections`) | [pipeline.py](../src/libs/pipeline.py) | Gate SCRFD against RTMW head regions (drop skin FPs unless conf ≥ 0.70); add faces SCRFD missed at odd angles |
-| 3 | Tracking | Constant-velocity Kalman filter (NumPy) | [tracker.py](../src/libs/tracker.py) | Per-face state; pose head boxes are *weak* corrections that revive lost tracks; coasts up to `hold_secs` |
-| 4 | Smoothing | Savitzky-Golay (SciPy) | [smoother.py](../src/libs/smoother.py) | De-jitter landmarks per track, hold on occlusion |
-| 5 | Masking | Convex hull + expansion (OpenCV) | [utils.py](../src/libs/utils.py) `MaskBuilder` | Landmark-fitted polygon mask; coasting tracks reuse a remembered hull mapped onto the Kalman box |
-| 6 | Blur | Gaussian + pixelate stack — CUDA/PyTorch · OpenCL/UMat · CPU/OpenCV | [utils.py](../src/libs/utils.py) `BlurPipeline` | One masked composite pass per frame |
-| 7 | Overlay | OpenCV drawing | [cli.py](../src/cli.py) / [ui.py](../src/ui.py) | Hull outlines, track IDs, FPS |
-| 8 | Encode / display | FFmpeg libx264 via imageio-ffmpeg (cv2 fallback) | [video_writer.py](../src/libs/video_writer.py) | Source-bitrate-matched MP4, valid past 4 GiB; live preview via `cv2.imshow` / PyQt6 |
+| 1 | Decode | OpenCV `VideoCapture` on a reader thread | [ui.py](../src/ui.py) | Read BGR frames; overlaps GPU inference |
+| 2 | Detection | PINTO YOLOv9-Wholebody17 post-ONNX (ONNX Runtime) | [detector.py](../src/libs/detector.py) | One pass → body/head/face boxes. Head class covers all 360° orientations; optional ±90° rotated passes (gated against hallucinations) recover sideways heads |
+| 3 | Head fusion | NumPy geometry (`fuse_heads`) | [detector.py](../src/libs/detector.py) | Faces with no covering head box grow a pseudo-head — recall backstop |
+| 4 | Tracking | Constant-velocity Kalman + BYTE association + Hungarian (NumPy/SciPy) | [head_tracker.py](../src/libs/head_tracker.py) | Stable ids; low-score detections sustain tracks through occlusion but never spawn; min-hits confirmation kills 1-frame false positives |
+| 5 | Offline cleanup | `tracklets.postprocess` (NumPy/SciPy) | [tracklets.py](../src/libs/tracklets.py) | Trim coasted tails, prune noise tracklets, bridge detection gaps with interpolation (corridor + ambiguity gates against identity smears), zero-phase Savitzky-Golay smoothing |
+| 6 | Masking | Padded feathered ellipses (OpenCV) | [utils.py](../src/libs/utils.py) `render_head_mask` | One consistent shape per head, every frame — no popping; feather hides jitter |
+| 7 | Blur | Gaussian + pixelate stack — CUDA/PyTorch · OpenCL/UMat · CPU | [utils.py](../src/libs/utils.py) `BlurPipeline` | One masked composite per frame; soft (alpha) compositing for feathered masks |
+| 8 | Encode | FFmpeg libx264 via imageio-ffmpeg (cv2 fallback) | [video_writer.py](../src/libs/video_writer.py) | Source-bitrate-matched MP4, valid past 4 GiB; source audio stream-copied |
 
-The ONNX execution provider for both detectors is selected once by
+The ONNX execution provider is selected once by
 [`best_onnx_providers()`](../src/libs/utils.py): **DirectML → CUDA → ROCm → CPU**.
+The detector session is created once and never destroyed, with its input
+shape-pinned — both DirectML survival rules.
 
 ## Tech inventory
 
-- **Language / tooling:** Python 3, `uv`
-- **Video I/O & geometry:** OpenCV (`cv2`) — also the OpenCL/UMat blur path
-- **Face detection + landmarks:** InsightFace `buffalo_l` (SCRFD `det_10g`,
-  `2d106det`)
-- **Pose estimation:** rtmlib `Wholebody` (YOLOX person detector + RTMW pose);
-  MediaPipe Pose ([pose_head.py](../src/libs/pose_head.py)) remains as a legacy
-  `--pose-backend mediapipe` option
-- **Inference runtime:** ONNX Runtime (DirectML / CUDA / ROCm / CPU)
-- **Numerics:** NumPy (Kalman tracker, geometry), SciPy (Savitzky-Golay)
-- **Blur acceleration:** PyTorch (CUDA), OpenCV UMat (OpenCL), OpenCV (CPU)
-- **Encoding:** FFmpeg / libx264 via imageio-ffmpeg
+- **Language / tooling:** Python 3.12, `uv`, PyInstaller (Windows .exe)
+- **Detection:** PINTO model zoo 457_YOLOv9-Wholebody17 (`s` variant, ~28 MB,
+  bundled into the exe); swappable via `AVPP_DETECTOR*` env vars
+  (434_YOLOX-Body-Head-Hand-Face spec included)
+- **Inference runtime:** ONNX Runtime (DirectML on the RX 6800 / CUDA / ROCm /
+  CPU), fp32 by default (`AVPP_FP16` gates the fp16 derivative)
+- **Numerics:** NumPy (Kalman, geometry), SciPy (Hungarian assignment,
+  Savitzky-Golay)
+- **Video I/O & blur:** OpenCV (`cv2`), OpenCL/UMat GPU blur path
+- **Encoding:** FFmpeg / libx264 via imageio-ffmpeg, audio stream-copy
 - **GUI:** PyQt6

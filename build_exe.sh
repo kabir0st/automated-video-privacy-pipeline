@@ -14,16 +14,14 @@
 #   - Python for Windows installed on the host (python.org installer or
 #     Microsoft Store), accessible as py.exe or python.exe from WSL2
 #   - All project dependencies must be installable on the Windows Python
-#     (insightface, boxmot, onnxruntime, pyqt6, scipy, opencv-python, etc.)
+#     (onnxruntime-directml, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - Models are NOT bundled (intentional). A startup preflight (libs/models.py)
-#     checks each model's location and downloads any that are missing, reporting
-#     progress on the loading splash and to %TEMP%\FaceBlurInspector-debug.log:
-#       * InsightFace buffalo_l (~300 MB) → %USERPROFILE%\.insightface\
-#       * RTMW/YOLOX pose models (~300-400 MB) → %USERPROFILE%\.cache\rtmlib\
-#       * RF-DETR person detector (HuggingFace) → %USERPROFILE%\.cache\avpp\rfdetr\
-#     Set AVPP_SKIP_MODEL_DOWNLOAD=1 to check-and-report only (no downloads).
+#   - The single detector model (PINTO YOLOv9-Wholebody17, ~28 MB) IS bundled
+#     into the exe (--add-data below), so a first run needs no downloads at
+#     all. The startup preflight (libs/models.py) still reports its location
+#     and can download to %USERPROFILE%\.cache\avpp\detector\ if the bundle is
+#     bypassed with AVPP_DETECTOR/AVPP_DETECTOR_URL.
 #   - GPU acceleration uses the DirectML execution provider (onnxruntime-directml),
 #     which runs on any Windows GPU including the AMD Radeon RX 6800. The build
 #     asserts DirectML is active so a silent CPU-only bundle can't ship; the app
@@ -35,8 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ── locate Windows Python ─────────────────────────────────────────────────────
-# boxmot 21.0.0 (the version this project uses) requires Python >=3.10,<3.14,
-# so we need a 3.10–3.13 interpreter — NOT 3.14+.
+# onnxruntime-directml ships wheels for 3.10–3.13; stay off 3.14+ until it does.
 echo ">>> Locating Windows Python (3.10–3.13)…"
 WIN_PY=()
 if command -v py.exe &>/dev/null; then
@@ -49,7 +46,7 @@ if command -v py.exe &>/dev/null; then
 fi
 if [[ ${#WIN_PY[@]} -eq 0 ]]; then
   echo ""
-  echo "ERROR: No Windows Python 3.10–3.13 found (boxmot does not support 3.14+)."
+  echo "ERROR: No Windows Python 3.10–3.13 found."
   echo "  Install Python 3.12 for Windows from https://python.org, then re-run."
   echo "  Check installed versions with:  py.exe --list"
   exit 1
@@ -62,38 +59,21 @@ echo ""
 echo ">>> Installing dependencies into Windows Python…"
 "${WIN_PY[@]}" -m pip install --no-cache-dir --upgrade pip
 
-# boxmot pinned to the same version as the Linux venv (see uv.lock) so the
-# import paths and tracker API match. Its full dep tree (torch CPU, pandas,
-# pyyaml, regex, yacs, …) resolves to pre-built wheels on Python 3.10–3.13.
 # imageio-ffmpeg ships a static ffmpeg binary that the export path uses for
-# rate-controlled, co64-safe H.264 encoding (replacing cv2.VideoWriter, which
-# blew exports past 4 GiB into unplayable files). It is collected into the
-# bundle below so no system ffmpeg install is required on the target machine.
-# tqdm is rtmlib's download-progress dependency; pulled in explicitly so the
-# rtmlib --no-deps install below leaves nothing missing.
+# rate-controlled, co64-safe H.264 encoding + audio stream-copy (replacing
+# cv2.VideoWriter, which blew exports past 4 GiB into unplayable files). It is
+# collected into the bundle below so no system ffmpeg install is required.
 # onnxconverter-common provides the float16 graph conversion that gives the
 # RX 6800 its ~2× fp16 inference speedup (see libs/utils.fp16_model_path).
+# onnx is needed at runtime to shape-pin the detector graph for DirectML.
 "${WIN_PY[@]}" -m pip install --no-cache-dir \
-  "boxmot==21.0.0" \
-  pyinstaller insightface pyqt6 scipy opencv-python scikit-learn imageio-ffmpeg tqdm \
+  pyinstaller pyqt6 scipy opencv-python imageio-ffmpeg numpy onnx \
   onnxconverter-common
-
-# rtmlib is the default pose backend (RTMDet/YOLOX → RTMW whole-body); it must
-# be installed here so PyInstaller can bundle it, or the .exe dies with
-# "No module named 'rtmlib'" and silently falls back to SCRFD-only.
-#
-# CRITICAL: install it with --no-deps. rtmlib declares a plain `onnxruntime`
-# dependency, which pip would resolve to the CPU-only wheel and silently
-# overwrite the DirectML build below (they share the same `onnxruntime` package
-# directory) — the .exe would then run inference on CPU. All of rtmlib's real
-# runtime deps (numpy, opencv-python, onnxruntime, tqdm) are provided by the
-# other install lines, so --no-deps yields a fully working rtmlib.
-"${WIN_PY[@]}" -m pip install --no-cache-dir --no-deps rtmlib
 
 # GPU: onnxruntime-directml ships the DirectML execution provider, which
 # accelerates inference on any Windows GPU including the AMD Radeon RX 6800. It
 # installs into the same `onnxruntime` package directory as the CPU-only build
-# that insightface/rtmlib pull in, so remove BOTH and force-reinstall directml.
+# that other packages may pull in, so remove BOTH and force-reinstall directml.
 # This MUST be the last pip operation that touches onnxruntime.
 "${WIN_PY[@]}" -m pip uninstall --quiet -y onnxruntime onnxruntime-directml || true
 "${WIN_PY[@]}" -m pip install --no-cache-dir --force-reinstall --no-deps onnxruntime-directml
@@ -105,18 +85,29 @@ SRC_WIN_DIR=$(wslpath -w "$SCRIPT_DIR/src")
 "${WIN_PY[@]}" -c "
 import sys
 sys.path.insert(0, r'$SRC_WIN_DIR')
-import rtmlib  # default pose backend — must be importable for bundling
-import ui  # pulls in PyQt6, insightface, boxmot, libs.*
+import ui  # pulls in PyQt6, cv2, scipy, libs.*
 import onnxruntime as ort
 from libs.utils import best_onnx_providers
 prov = best_onnx_providers()
-print('imports OK | rtmlib', getattr(rtmlib, '__version__', '?'),
-      '| onnx providers:', prov)
+print('imports OK | onnx providers:', prov)
 assert 'DmlExecutionProvider' in ort.get_available_providers(), (
     'DirectML provider missing — onnxruntime-directml is not active, the .exe '
     'would run inference on CPU. Re-check the force-reinstall step above.')
 print('OK: DirectML provider present — GPU inference will be used on the RX 6800')
 "
+
+# ── ensure the detector model exists, for bundling ───────────────────────────
+# The single ONNX (~28 MB) is bundled into the exe so first run downloads
+# nothing. libs.detector resolves sys._MEIPASS/models/<name> first at runtime.
+echo ""
+echo ">>> Ensuring detector model for bundling…"
+MODEL_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.detector import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $MODEL_PATH"
+MODEL_WIN=$(wslpath -w "$MODEL_PATH")
 
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
 # Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
@@ -168,10 +159,11 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --paths "$PATHS_WIN" \
   \
   --hidden-import "libs.utils" \
-  --hidden-import "libs.tracker" \
-  --hidden-import "libs.smoother" \
-  --hidden-import "libs.face_app" \
+  --hidden-import "libs.detector" \
+  --hidden-import "libs.head_tracker" \
+  --hidden-import "libs.tracklets" \
   --hidden-import "libs.models" \
+  --hidden-import "libs.video_writer" \
   --hidden-import "splash" \
   --hidden-import "ui" \
   \
@@ -181,23 +173,15 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --hidden-import "PyQt6.QtGui" \
   --hidden-import "PyQt6.sip" \
   \
-  --collect-all "insightface" \
   --collect-all "onnxruntime" \
-  --collect-all "boxmot" \
   --collect-all "imageio_ffmpeg" \
-  --collect-all "rtmlib" \
-  --hidden-import "tqdm" \
-  --hidden-import "libs.pose_rtmw" \
-  --hidden-import "libs.pipeline" \
-  --hidden-import "libs.video_writer" \
+  --add-data "$MODEL_WIN;models" \
   \
   --hidden-import "onnx" \
   --hidden-import "onnxruntime.tools.onnx_model_utils" \
   --collect-all "onnxconverter_common" \
   --hidden-import "scipy.signal" \
-  --hidden-import "scipy.ndimage" \
-  --hidden-import "scipy.spatial" \
-  --hidden-import "sklearn.utils._cython_blas" \
+  --hidden-import "scipy.optimize" \
   \
   --hidden-import "cv2" \
   --hidden-import "numpy" \

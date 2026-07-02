@@ -130,11 +130,11 @@ def main() -> None:
     win._on_param_change()
     submit_and_grab("tunables-blur-pixelate.png")
 
-    # 6. Wide mask coverage (large hull expand + hairline extra). Reset blur.
+    # 6. Wide mask coverage (large pad + heavy feather). Reset blur.
     win._set_blur_layers((("gaussian", 71), ("pixelate", 10)))
     win._on_param_change()
-    win._expand_sl.set_value(1.50)
-    win._hair_sl.set_value(2.50)
+    win._pad_sl.set_value(0.50)
+    win._feather_sl.set_value(0.30)
     submit_and_grab("tunables-hull-expand.png")
 
     win._cap.release()
