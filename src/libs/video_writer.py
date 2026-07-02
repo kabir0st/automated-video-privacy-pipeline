@@ -77,6 +77,7 @@ class FFmpegWriter:
         bitrate_kbps: int = 0,
         crf: int = 18,
         preset: str = "medium",
+        audio_source: Optional[str] = None,
     ) -> None:
         self._w, self._h = width, height
         self._frame_bytes = width * height * 3
@@ -93,12 +94,24 @@ class FFmpegWriter:
         else:
             rate_args = ["-crf", str(crf)]
 
+        if audio_source:
+            # Stream-copy the source's audio (a remux — no re-encode, no
+            # measurable cost). `1:a:0?` makes a silent source still encode.
+            # No -shortest: AAC priming makes audio fractionally shorter than
+            # the video and -shortest would truncate the final video frame.
+            audio_in = ["-i", audio_source]
+            audio_map = ["-map", "0:v:0", "-map", "1:a:0?", "-c:a", "copy"]
+        else:
+            audio_in = []
+            audio_map = ["-an"]
+
         cmd = [
             ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{width}x{height}", "-r", f"{fps}",
             "-i", "-",
-            "-an",  # video only — audio intentionally dropped
+            *audio_in,
+            *audio_map,
             "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p",
             *rate_args,
             "-movflags", "+faststart",
@@ -191,12 +204,14 @@ def make_video_writer(
     bitrate_kbps: int = 0,
     crf: int = 18,
     on_status: Optional[Callable[[str], None]] = None,
+    audio_source: Optional[str] = None,
 ):
     """Build the best available writer for ``path``.
 
     Returns an FFmpeg-backed writer when ffmpeg is available (the robust path),
     otherwise falls back to ``cv2.VideoWriter``. Returns ``None`` if no writer
-    could be opened at all.
+    could be opened at all. ``audio_source`` stream-copies that file's audio
+    into the output (FFmpeg path only; the cv2 fallback stays video-only).
     """
     ffmpeg = find_ffmpeg()
     if ffmpeg:
@@ -204,6 +219,7 @@ def make_video_writer(
             w = FFmpegWriter(
                 path, width, height, fps,
                 ffmpeg=ffmpeg, bitrate_kbps=bitrate_kbps, crf=crf,
+                audio_source=audio_source,
             )
             if w.isOpened():
                 return w

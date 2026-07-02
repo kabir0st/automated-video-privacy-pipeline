@@ -64,22 +64,23 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-from libs.face_app import FaceApp
+from libs.detector import Detections, HeadDetector, fuse_heads
+from libs.head_tracker import HeadTracker, TrackObs
 from libs.models import preflight as preflight_models
-from libs.pose_head import _VIS_THRESHOLD
-from libs.pipeline import detect, make_pose_backend
-from libs.tracker import SubjectTracker
+from libs.tracklets import PostParams, TrackRecorder, postprocess
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
-    MaskBuilder,
-    best_onnx_providers,
     debug_log,
+    render_head_mask,
 )
 from libs.video_writer import make_video_writer, source_bitrate_kbps
 from splash import show_splash, update as splash_update
 
-CLOSE_UP_TARGET_SIZE = 1024
+# Preview panels render at this long edge — computing/drawing at 4K would be
+# wasted on panels a third of the window wide. Detection is unaffected (the
+# detector resizes to its own fixed input internally).
+_DISPLAY_LONG_EDGE = 1280
 _TRACK_COLOURS = [
     (0, 255, 0), (255, 128, 0), (0, 128, 255), (255, 0, 255),
     (0, 255, 255), (255, 255, 0), (128, 0, 255), (0, 200, 100),
@@ -281,29 +282,34 @@ def _letterspace(lbl: QLabel, px: float = 1.5) -> None:
 
 @dataclass
 class Params:
-    target_size: int = 640
-    # Working resolution for detection + mask building: the frame is downscaled
-    # so its long edge is at most this many pixels before any model runs, then
-    # only the final binary blur mask is upscaled back to blur the full-res
-    # frame. On 4K this removes the per-frame full-res mask/clip work and shrinks
-    # the detector inputs for a large speedup; 0 = process at full resolution.
-    # Raise it if small/distant faces start slipping through.
-    proc_long_edge: int = 1600
-    det_score: float = 0.55
-    face_aspect: float = 0.40
-    close_up_ratio: float = 0.60
-    blur_expand: float = 0.45
-    blur_hair_extra: float = 0.90
+    # Detection / track gating. det_conf is the one knob that matters: a
+    # detection at or above it can spawn and drive a blur; the band between
+    # det_conf_low and det_conf only *sustains* an existing blur through
+    # occlusion (BYTE association) and can never start one.
+    det_conf: float = 0.50
+    det_conf_low: float = 0.10
+    # Consecutive hits before a new track may blur — kills 1-frame false
+    # positives at the cost of a few frames of onset (repaired offline by the
+    # export's end-extension).
+    min_hits: int = 3
+    # How long a lost track keeps coasting as a bridge *candidate* (it is not
+    # blurred while coasting; the offline pass decides whether the gap joins).
+    max_age_s: float = 1.75
+    # Offline cleanup (export pass 1 → 2).
+    bridge_gap_s: float = 1.5    # max detection gap to interpolate across
+    min_track_s: float = 0.25    # tracklets with fewer hits are noise
+    smooth_win_s: float = 0.5    # zero-phase SavGol window
+    # Mask geometry.
+    mask_pad: float = 0.18       # ellipse expansion per side of the head box
+    mask_feather: float = 0.12   # edge feather as a fraction of head diagonal
+    # Live preview only: how long a lost head keeps its blur on screen.
+    preview_hold_s: float = 0.3
+    # Also detect on ±90°-rotated frames and merge — recovers sideways heads
+    # (lying down / bed angles) that upright-trained detectors miss. ~3× the
+    # (single, small) detection cost.
+    rot_assist: bool = True
     # Ordered blur stack: ("gaussian", kernel) / ("pixelate", block).
     blur_layers: tuple[tuple[str, int], ...] = DEFAULT_BLUR_LAYERS
-    match_iou: float = 0.30
-    hold_secs: float = 0.6      # keep blurring this long after last correction
-    pose_assist: bool = True    # master switch for the pose backend below
-    # Pose backend: "rtmw" (RTMDet+RTMW whole-body — robust at odd angles and
-    # contributes face detections of its own), "mediapipe" (legacy head boxes
-    # only), or "none". pose_mode picks the RTMW model size.
-    pose_backend: str = "rtmw"
-    pose_mode: str = "performance"   # performance | balanced | lightweight
 
 
 # ── Presets — curated Params bundles; Advanced exposes every value ───────────
@@ -314,65 +320,25 @@ PRESETS: dict[str, tuple[str, Params]] = {
         Params(),
     ),
     "Max Privacy": (
-        "Catch every face and blur hard — favours coverage over speed",
-        Params(target_size=1024, proc_long_edge=0, det_score=0.35,
-               face_aspect=0.25,
-               blur_expand=0.80, blur_hair_extra=1.50,
-               blur_layers=(("gaussian", 99), ("pixelate", 16)),
-               match_iou=0.20, hold_secs=1.0,
-               pose_backend="rtmw", pose_mode="performance"),
+        "Catch every head and blur hard — favours coverage over precision",
+        Params(det_conf=0.35, det_conf_low=0.05, min_hits=2,
+               max_age_s=2.5, bridge_gap_s=2.5, min_track_s=0.15,
+               mask_pad=0.30, mask_feather=0.15,
+               blur_layers=(("gaussian", 99), ("pixelate", 16))),
     ),
-    "Crowded Scene": (
-        "Many small faces — high-res detection, stricter ID matching",
-        Params(target_size=1024, proc_long_edge=1920, det_score=0.45,
-               face_aspect=0.35,
-               match_iou=0.45, pose_backend="rtmw", pose_mode="performance"),
-    ),
-    "Fast Preview": (
-        "Low-res detection for quick scrubbing on CPU",
-        Params(target_size=320, proc_long_edge=1280,
-               blur_layers=(("gaussian", 41), ("pixelate", 12)),
-               pose_backend="rtmw", pose_mode="lightweight"),
+    "Strict": (
+        "Fewer false blurs — higher confidence bar, shorter bridging",
+        Params(det_conf=0.60, min_hits=5, bridge_gap_s=0.8,
+               min_track_s=0.4, mask_pad=0.15),
     ),
 }
 
-# Overlay tag per tracking source, drawn after the track id.
-_SOURCE_TAGS = {"face": "", "head": "·seg", "hold": "·hold"}
-
-# Standard BlazePose 33-point skeleton connections, used to draw the pose
-# overlay on the tracking panel so pose estimation is visibly alive.
-_POSE_EDGES = (
-    # Face
-    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10),
-    # Arms
-    (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
-    (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
-    # Torso
-    (11, 12), (11, 23), (12, 24), (23, 24),
-    # Legs
-    (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
-    (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
-)
-# COCO-17 body connections for the RTMW (133-keypoint) skeleton. Only the body
-# joints are drawn as a skeleton; the 68 dense face points are scattered as
-# dots so a glance still confirms the face is being tracked.
-_COCO_EDGES = (
-    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-    (5, 11), (6, 12), (11, 12),
-    (11, 13), (13, 15), (12, 14), (14, 16),
-    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6),
-)
-_KPT_THR_133 = 0.3   # RTMW per-keypoint confidence to draw
-# Distinct from the per-track palette so the skeleton reads as a separate layer.
-_POSE_EDGE_COLOUR = (220, 220, 220)
-_POSE_BOX_COLOUR = (0, 200, 255)
-# RF-DETR's contribution, drawn only on the TRACKING panel: whole-person boxes
-# (magenta) and the head region located on each person's silhouette (amber).
-# Distinct from the pose/track palettes so it reads as a separate layer.
-_PERSON_BOX_COLOUR = (255, 0, 255)
-_HEAD_REGION_COLOUR = (0, 140, 255)
-# Translucent person silhouette from the RF-DETR ``-seg`` masks (spring green).
-_SEG_MASK_COLOUR = (80, 220, 120)
+# TRACKING panel palette: layers distinct from the per-track colours.
+_BODY_BOX_COLOUR = (180, 60, 180)      # faint magenta — context only
+_HEAD_DET_COLOUR = (0, 220, 0)         # confident head detections
+_HEAD_LOW_COLOUR = (140, 140, 140)     # low-score band (BYTE sustain food)
+_FACE_DET_COLOUR = (255, 220, 0)       # face detections (cyan-ish in BGR)
+_PSEUDO_HEAD_COLOUR = (0, 170, 255)    # face-derived pseudo-heads (amber)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -381,123 +347,78 @@ def _track_colour(tid: int) -> tuple[int, int, int]:
     return _TRACK_COLOURS[tid % len(_TRACK_COLOURS)]
 
 
-def _draw_outline(
+def _draw_box(
     frame: np.ndarray,
-    poly: Optional[np.ndarray],
-    bbox: np.ndarray,
-    tid: int,
+    box: np.ndarray,
     colour: tuple[int, int, int],
-    tag: str = "",
+    thickness: int = 1,
+    label: str = "",
 ) -> None:
-    if poly is not None:
-        cv2.polylines(frame, [poly], True, colour, 1, cv2.LINE_AA)
-        x, y = int(poly[:, 0].min()), int(poly[:, 1].min())
-    else:
-        x1, y1, x2, y2 = (int(v) for v in bbox[:4])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 1)
-        x, y = x1, y1
-    cv2.putText(frame, f"id:{tid}{tag}", (x, max(0, y - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA)
+    x1, y1, x2, y2 = (int(v) for v in box[:4])
+    cv2.rectangle(frame, (x1, y1), (x2, y2), colour, thickness)
+    if label:
+        cv2.putText(frame, label, (x1, max(10, y1 - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA)
 
 
-def _draw_pose(
+def _draw_mask_ellipse(
     frame: np.ndarray,
-    pose: np.ndarray,
-    head_box: Optional[np.ndarray] = None,
+    box: np.ndarray,
+    pad: float,
+    colour: tuple[int, int, int],
+    label: str = "",
 ) -> None:
-    """Draw one pose skeleton (and its derived head box) onto frame.
-
-    pose is an (N, 3) array of (x_px, y_px, confidence). N selects the layout:
-    33 → BlazePose (legacy MediaPipe), ≥100 → COCO-WholeBody-133 (RTMW). Edges
-    and keypoints draw only above the per-format confidence threshold; points
-    are coloured by confidence (green = high, red = low) so a glance tells
-    whether pose estimation is healthy.
-    """
-    if len(pose) >= 100:
-        edges, thr = _COCO_EDGES, _KPT_THR_133
-    else:
-        edges, thr = _POSE_EDGES, _VIS_THRESHOLD
-
-    vis = pose[:, 2]
-    for a, b in edges:
-        if vis[a] > thr and vis[b] > thr:
-            pa = (int(pose[a, 0]), int(pose[a, 1]))
-            pb = (int(pose[b, 0]), int(pose[b, 1]))
-            cv2.line(frame, pa, pb, _POSE_EDGE_COLOUR, 1, cv2.LINE_AA)
-    for x, y, v in pose:
-        if v <= thr:
-            continue
-        # Lerp red→green over [threshold, 1.0] so weak joints stand out.
-        t = min(1.0, (v - thr) / max(1.0 - thr, 1e-6))
-        kp_colour = (0, int(255 * t), int(255 * (1 - t)))
-        cv2.circle(frame, (int(x), int(y)), 2, kp_colour, -1, cv2.LINE_AA)
-    if head_box is not None:
-        x1, y1, x2, y2 = (int(v) for v in head_box[:4])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), _POSE_BOX_COLOUR, 1)
+    """Outline of the blur ellipse render_head_mask will paint for this box,
+    so the AFTER panel shows exactly where the blur lands."""
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    w, h = x2 - x1, y2 - y1
+    cx, cy = int(round((x1 + x2) / 2)), int(round((y1 + y2) / 2))
+    ax = max(1, int(round(w / 2 * (1.0 + 2.0 * pad))))
+    ay = max(1, int(round(h / 2 * (1.0 + 2.0 * pad))))
+    cv2.ellipse(frame, (cx, cy), (ax, ay), 0, 0, 360, colour, 1, cv2.LINE_AA)
+    if label:
+        cv2.putText(frame, label, (cx - ax, max(10, cy - ay - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA)
 
 
-def _draw_seg_masks(
-    frame: np.ndarray,
-    masks: list,
-    colour: tuple[int, int, int] = _SEG_MASK_COLOUR,
-    alpha: float = 0.4,
-) -> None:
-    """Blend the RF-DETR person silhouettes onto the tracking panel.
-
-    ``masks`` is the per-person list from the ``-seg`` detector (uint8, 1 inside
-    the person); entries may be None on a detection-only export. Their union is
-    filled translucently and outlined so the segmentation is visibly running —
-    tracking panel only; the blur is unaffected.
-    """
-    union = None
-    for m in masks:
-        if m is None:
-            continue
-        union = m if union is None else np.maximum(union, m)
-    if union is None or not union.any():
-        return
-    sel = union > 0
-    tint = np.empty_like(frame)
-    tint[:] = colour
-    frame[sel] = (frame[sel] * (1.0 - alpha) + tint[sel] * alpha).astype(frame.dtype)
-    contours, _ = cv2.findContours(union, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(frame, contours, -1, colour, 1, cv2.LINE_AA)
+def _obs_tag(o: TrackObs) -> str:
+    if not o.confirmed:
+        return "·tent"
+    if not o.hit:
+        return "·coast"
+    return ""
 
 
 def _draw_tracking_overlay(
     tracking: np.ndarray,
-    tracked: list,
-    polys: dict,
-    subjects: list,
-    pf,
+    dets: Detections,
+    fused: np.ndarray,
+    obs: list[TrackObs],
+    det_conf: float,
 ) -> None:
     """Composite every detection layer onto the TRACKING panel copy.
 
-    Shared by the live-preview and export paths so the middle panel shows the
-    same thing in both, bottom layer up: RF-DETR seg silhouettes (the body
-    truth, translucent green), RF-DETR person boxes (magenta), pose skeletons
-    (white), each subject's located head region (amber), and the per-track blur
-    outlines. Drawn on a frame copy only — never on the written/blurred output.
+    Bottom layer up: body boxes (faint, context), raw head detections (green
+    when they clear det_conf, grey in the low band that only sustains tracks),
+    face detections (cyan), face-derived pseudo-heads (amber — the recall
+    backstop when the head class misses), and the Kalman tracks with id and
+    state tag. Drawn on a frame copy only — never on the written output.
     """
-    _draw_seg_masks(tracking, pf.person_masks)
-    for pb, _score in pf.person_boxes:
-        x1, y1 = int(pb[0]), int(pb[1])
-        cv2.rectangle(tracking, (x1, y1), (int(pb[2]), int(pb[3])),
-                      _PERSON_BOX_COLOUR, 1)
-        cv2.putText(tracking, "rf-detr", (x1, max(0, y1 - 4)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, _PERSON_BOX_COLOUR, 1,
-                    cv2.LINE_AA)
-    for pose in pf.poses:
-        _draw_pose(tracking, pose)
-    for s in subjects:
-        hb = s.head
-        cv2.rectangle(tracking, (int(hb[0]), int(hb[1])),
-                      (int(hb[2]), int(hb[3])), _HEAD_REGION_COLOUR, 1)
-    for t in tracked:
-        bbox = t.face.bbox if t.face is not None else t.bbox
-        _draw_outline(tracking, polys.get(t.track_id), bbox, t.track_id,
-                      _track_colour(t.track_id), _SOURCE_TAGS.get(t.source, ""))
+    for b in dets.bodies:
+        _draw_box(tracking, b, _BODY_BOX_COLOUR, 1)
+    for b in dets.heads:
+        strong = b[4] >= det_conf
+        _draw_box(tracking, b,
+                  _HEAD_DET_COLOUR if strong else _HEAD_LOW_COLOUR,
+                  1, f"{b[4]:.2f}")
+    for b in dets.faces:
+        _draw_box(tracking, b, _FACE_DET_COLOUR, 1)
+    for b in fused[len(dets.heads):]:
+        _draw_box(tracking, b, _PSEUDO_HEAD_COLOUR, 1, "pseudo")
+    for o in obs:
+        colour = _track_colour(o.track_id)
+        _draw_box(tracking, o.box, colour, 2 if o.confirmed else 1,
+                  f"id:{o.track_id}{_obs_tag(o)}")
 
 
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -516,7 +437,8 @@ class ProcessWorker(QThread):
     # panels stuck displaying stale frames.
     preview_ready = pyqtSignal()
     status = pyqtSignal(str)
-    export_progress = pyqtSignal(int, int)
+    # (pass_no 1|2, current_frame, total_frames) — export runs two passes.
+    export_progress = pyqtSignal(int, int, int)
     export_finished = pyqtSignal(bool, str)
 
     def __init__(self) -> None:
@@ -525,17 +447,13 @@ class ProcessWorker(QThread):
         self._pending: Optional[tuple[np.ndarray, Params, int, float]] = None
         self._wake = threading.Event()
         self._running = True
-        self._app: Optional[FaceApp] = None
-        self._model_size = -1
+        # One detector session for the process lifetime — built lazily, never
+        # rebuilt (destroying a DirectML session corrupts the provider).
+        self._detector: Optional[HeadDetector] = None
         self._blur = BlurPipeline()
-        # Pose backend is built lazily on first use and only rebuilt when the
-        # backend/mode actually changes (model load is slow); None = disabled.
-        self._pose = None
-        self._pose_key: Optional[tuple[str, str]] = None
         # Preview tracking state persists across sequential frames (Play),
-        # so head smoothing/hold is visible live; any scrub/jump resets it.
-        self._pv_tracker: Optional[SubjectTracker] = None
-        self._pv_masks = MaskBuilder()
+        # so Kalman smoothing/hold is visible live; any scrub/jump resets it.
+        self._pv_tracker: Optional[HeadTracker] = None
         self._pv_last_idx = -2
         self._preview_lock = threading.Lock()
         self._preview: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, float]] = None
@@ -649,185 +567,92 @@ class ProcessWorker(QThread):
                     f"   (full trace: {_CRASH_LOG})"
                 )
 
-    def _ensure_model(self, size: int) -> None:
-        if size == self._model_size and self._app is not None:
-            return
-        self.status.emit(f"Loading model  det_size={size}×{size} …")
-        # FaceApp loads only detection + 2D landmarks (the other buffalo_l
-        # models would crash DirectML when their probe sessions are destroyed,
-        # and the 3D model's meanshape_68.pkl lookup breaks in PyInstaller
-        # bundles). On det-size changes the existing instance is re-prepared
-        # in place — recreating it would destroy live DirectML sessions and
-        # poison the provider.
-        if self._app is None:
-            self._app = FaceApp(providers=best_onnx_providers())
-        self._app.prepare(ctx_id=0, det_size=(size, size))
-        self._model_size = size
-        # Log the provider the SCRFD detection session actually resolved to, so
-        # a silent CPU fallback (the inconsistent-GPU / slow-export symptom) is
-        # visible in the debug log alongside the RTMW/RF-DETR provider lines.
-        try:
-            prov = self._app.det_model.session.get_providers()[0]
-            debug_log(f"FaceApp SCRFD det on {prov}")
-        except Exception:  # noqa: BLE001 — diagnostics only, never block load
-            pass
-        self.status.emit("Ready")
+    def _ensure_detector(self) -> HeadDetector:
+        if self._detector is None:
+            self._detector = HeadDetector(on_status=self.status.emit)
+        return self._detector
 
-    def _ensure_pose(self, p: Params):
-        """(Re)build the pose backend only when backend/mode changes."""
-        if not p.pose_assist:
-            return None
-        key = (p.pose_backend, p.pose_mode)
-        if self._pose_key != key:
-            self._pose = make_pose_backend(
-                p.pose_backend, mode=p.pose_mode, on_status=self.status.emit)
-            self._pose_key = key
-        return self._pose
-
-    def _detect(self, frame: np.ndarray, p: Params) -> tuple[list, Any]:
-        """Detection: ``(subjects, pose_frame)``.
-
-        ``subjects`` are the per-person anonymisation targets (body box +
-        silhouette + on-body head region + refining face); ``pose_frame`` carries
-        the people/masks/poses drawn on the TRACKING panel so the segmentation
-        and pose layers stay visible.
-        """
-        assert self._app is not None
-        pose = self._ensure_pose(p)
-        subjects, pf = detect(
-            self._app, frame, pose,
-            det_score=p.det_score, face_aspect=p.face_aspect,
-            close_up_ratio=p.close_up_ratio,
-            close_up_target=CLOSE_UP_TARGET_SIZE)
-        return subjects, pf
-
-    def _proc_scale(self, p: Params, fw: int, fh: int) -> float:
-        """Downscale factor (≤1.0) so the frame's long edge ≤ p.proc_long_edge.
-
-        1.0 (no downscale) when proc_long_edge is 0/disabled or the frame is
-        already small enough. Detection, tracking and mask building all run in
-        this reduced space; only the final blur mask is upscaled back."""
-        le = getattr(p, "proc_long_edge", 0) or 0
+    @staticmethod
+    def _display_copy(frame: np.ndarray) -> np.ndarray:
+        """Downscale for the preview panels (long edge ≤ _DISPLAY_LONG_EDGE)."""
+        fh, fw = frame.shape[:2]
         longest = max(fw, fh)
-        if le <= 0 or longest <= le:
-            return 1.0
-        return le / float(longest)
+        if longest <= _DISPLAY_LONG_EDGE:
+            return frame.copy()
+        s = _DISPLAY_LONG_EDGE / float(longest)
+        return cv2.resize(frame, (round(fw * s), round(fh * s)),
+                          interpolation=cv2.INTER_AREA)
 
     def _compute(
-        self, frame: np.ndarray, p: Params,
-        tracker: SubjectTracker, masks: MaskBuilder,
-    ) -> tuple[np.ndarray, list, Any, list, dict, np.ndarray]:
-        """Detection → tracking → mask building, all at the working resolution.
+        self, frame: np.ndarray, p: Params, tracker: HeadTracker,
+    ) -> tuple[Detections, np.ndarray, list[TrackObs]]:
+        """Detection → head fusion → tracking on ``frame``.
 
-        Returns ``(proc, subjects, pf, tracked, polys, blur_mask)`` where ``proc``
-        is the (possibly downscaled) frame everything was computed on and
-        ``blur_mask`` is the binary mask in that same reduced space. Callers blur
-        ``proc`` for the preview, or upscale the mask to blur the full frame for
-        the written file. IoU/smoothing/hull geometry are all scale-relative, so
-        nothing needs per-coordinate rescaling — only the final mask does.
+        Returns ``(dets, fused_heads, obs)`` with every box in ``frame``'s
+        coordinate space. The detector resizes to its own fixed input
+        internally, so this costs the same at any frame resolution.
         """
-        fh, fw = frame.shape[:2]
-        scale = self._proc_scale(p, fw, fh)
-        if scale < 1.0:
-            proc = cv2.resize(frame, (round(fw * scale), round(fh * scale)),
-                              interpolation=cv2.INTER_AREA)
-        else:
-            proc = frame
+        detector = self._ensure_detector()
+        rots = (0, 90, 270) if p.rot_assist else (0,)
+        dets = detector.detect(frame, rotations=rots)
+        fused = fuse_heads(dets)
+        tracker.configure(det_conf=p.det_conf, det_conf_low=p.det_conf_low,
+                          min_hits=p.min_hits, max_age_s=p.max_age_s)
+        obs = tracker.update(fused, frame.shape)
+        return dets, fused, obs
 
-        # Segmentation-first detection: RF-DETR people + masks, RTMW poses, and
-        # one head-located subject per person (refined to a face when visible).
-        subjects, pf = self._detect(proc, p)
-        tracker.configure(match_iou=p.match_iou, hold_secs=p.hold_secs)
-        tracked = tracker.update(subjects, proc.shape)
+    @staticmethod
+    def _render_boxes(obs: list[TrackObs], hold_frames: int) -> list[np.ndarray]:
+        """The tracks the *live* paths blur: confirmed and recently hit.
 
-        ph, pw = proc.shape[:2]
-        blur_mask = np.zeros((ph, pw), dtype=np.uint8)
-        polys: dict[int, Optional[np.ndarray]] = {}
-        for t in tracked:
-            polys[t.track_id] = masks.add(
-                blur_mask, t, expand=p.blur_expand, hair_extra=p.blur_hair_extra)
-        masks.evict({t.track_id for t in tracked})
-        return proc, subjects, pf, tracked, polys, blur_mask
+        Coasting beyond the short preview hold is not blurred — the export's
+        offline pass decides real gaps by interpolation instead."""
+        return [o.box for o in obs
+                if o.confirmed and o.coast_frames <= hold_frames]
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
         fps: float = 25.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         t0 = time.perf_counter()
-        self._ensure_model(p.target_size)
 
-        # Sequential frames (Play) keep the tracker so head smoothing/hold shows
-        # in the live preview; scrubbing or single-frame inspection resets it.
+        # The preview computes and renders at display resolution (the panels
+        # are small); the export paths run on the full-res frame instead.
+        proc = self._display_copy(frame)
+
+        # Sequential frames (Play) keep the tracker so Kalman smoothing/hold
+        # shows live; scrubbing or single-frame inspection resets it.
         if self._pv_tracker is None or frame_idx < 0 \
                 or frame_idx != self._pv_last_idx + 1:
-            self._pv_tracker = SubjectTracker(
-                fps=fps, match_iou=p.match_iou, hold_secs=p.hold_secs)
-            self._pv_masks.reset()
+            self._pv_tracker = HeadTracker(
+                fps=fps, det_conf=p.det_conf, det_conf_low=p.det_conf_low,
+                min_hits=p.min_hits, max_age_s=p.max_age_s)
         self._pv_last_idx = frame_idx
 
-        proc, subjects, pf, tracked, polys, blur_mask = self._compute(
-            frame, p, self._pv_tracker, self._pv_masks)
+        dets, fused, obs = self._compute(proc, p, self._pv_tracker)
+        hold = max(0, int(round(p.preview_hold_s * fps)))
+        boxes = self._render_boxes(obs, hold)
+        mask = render_head_mask(proc.shape[:2], boxes,
+                                pad=p.mask_pad, feather=p.mask_feather)
 
-        # The preview renders entirely at the working resolution (the panels are
-        # downscaled for display anyway), so a 4K live preview stays responsive.
         blurred = proc.copy()
         self._blur.reconfigure(p.blur_layers)
-        self._blur.apply(blurred, blur_mask)
+        self._blur.apply(blurred, mask)
 
-        # AFTER panel shows the track outlines so the blur's target is legible.
-        for t in tracked:
-            bbox = t.face.bbox if t.face is not None else t.bbox
-            _draw_outline(blurred, polys.get(t.track_id), bbox, t.track_id,
-                          _track_colour(t.track_id),
-                          _SOURCE_TAGS.get(t.source, ""))
+        # AFTER panel outlines the exact blur ellipses so the target is legible.
+        for o in obs:
+            if o.confirmed and o.coast_frames <= hold:
+                _draw_mask_ellipse(blurred, o.box, p.mask_pad,
+                                   _track_colour(o.track_id),
+                                   f"id:{o.track_id}")
 
-        # TRACKING panel: every detection layer, incl. the RF-DETR seg masks.
         tracking = proc.copy()
-        _draw_tracking_overlay(tracking, tracked, polys, subjects, pf)
+        _draw_tracking_overlay(tracking, dets, fused, obs, p.det_conf)
 
         elapsed = time.perf_counter() - t0
         return proc, tracking, blurred, 1.0 / max(elapsed, 1e-6)
 
-    # ── Export (sequential conversion with live params) ────────────────────────
-
-    def _export_frame(
-        self,
-        frame: np.ndarray,
-        p: Params,
-        tracker: SubjectTracker,
-        masks: MaskBuilder,
-    ) -> tuple[np.ndarray, np.ndarray, list, dict[int, Optional[np.ndarray]], tuple]:
-        """Process one frame with the persistent offline pipeline.
-
-        Returns ``(blurred_full, proc, tracked, polys, overlay)``: ``blurred_full``
-        is the full-resolution frame to write; ``proc`` is the reduced-res clean
-        frame the overlays are drawn on for the preview; ``overlay`` is
-        ``(subjects, pose_frame)`` for ``_draw_tracking_overlay``.
-        """
-        self._ensure_model(p.target_size)
-        fh, fw = frame.shape[:2]
-
-        t_d = time.perf_counter()
-        proc, subjects, pf, tracked, polys, blur_mask = self._compute(
-            frame, p, tracker, masks)
-        self._last_detect_ms = (time.perf_counter() - t_d) * 1e3
-
-        # Upscale the binary mask back to full res (nearest = crisp edges, cheap)
-        # and blur the full-resolution frame that gets written.
-        if blur_mask.shape[:2] != (fh, fw):
-            mask_full = cv2.resize(blur_mask, (fw, fh),
-                                   interpolation=cv2.INTER_NEAREST)
-        else:
-            mask_full = blur_mask
-
-        blurred = frame.copy()
-        self._blur.reconfigure(p.blur_layers)
-        t_b = time.perf_counter()
-        self._blur.apply(blurred, mask_full)
-        self._last_blur_ms = (time.perf_counter() - t_b) * 1e3
-
-        overlay = (subjects, pf)
-        return blurred, proc, tracked, polys, overlay
+    # ── Export (two passes: analyse, then render) ──────────────────────────────
 
     def _paused_preview(self, frame: np.ndarray) -> None:
         """Re-render the held frame while paused so slider changes show live.
@@ -843,63 +668,39 @@ class ProcessWorker(QThread):
             _log_exception(exc)
             self.status.emit(f"Preview error: {exc!r}   (full trace: {_CRASH_LOG})")
 
-    def _log_export_timings(self, idx: int, total_ms: float) -> None:
-        """Append a per-stage timing breakdown to the debug log (~every 30 frames).
+    def _log_export_timings(self, tag: str, idx: int, total_ms: float) -> None:
+        """Append a per-stage timing line to the debug log (~every 30 frames).
 
-        Surfaces which stage dominates on the user's GPU and whether a model
-        silently fell back to CPU (which shows up as a huge detect time). The
-        sub-times are read off the live model objects; decode/encode are
-        overlapped on their own threads so they don't appear in the frame time."""
-        pose = self._pose
-        rfdetr = getattr(getattr(pose, "_person", None), "last_ms", 0.0) or 0.0
-        pose_ms = getattr(pose, "last_pose_ms", 0.0) or 0.0
-        scrfd = getattr(self._app, "last_ms", 0.0) or 0.0
+        Surfaces which stage dominates on the user's GPU and whether the model
+        silently fell back to CPU (which shows up as a huge detect time).
+        Decode/encode overlap on their own threads so they don't appear here."""
+        det_ms = self._detector.last_ms if self._detector else 0.0
         debug_log(
-            f"[export f{idx}] detect={self._last_detect_ms:.0f}ms "
-            f"(rfdetr={rfdetr:.0f} pose={pose_ms:.0f} scrfd={scrfd:.0f}) "
+            f"[{tag} f{idx}] detect={det_ms:.0f}ms "
             f"blur={self._last_blur_ms:.0f}ms frame={total_ms:.0f}ms "
             f"→ {1000.0 / max(total_ms, 1e-6):.1f} fps")
 
-    def _run_export(self, input_path: str, output_path: str) -> None:
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            self.export_finished.emit(False, f"Cannot open: {input_path}")
-            return
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        # Match the source's bitrate so the export keeps its format/quality
-        # without OpenCV's uncontrolled ~250 Mbps blow-up (the 4 GiB / 2:18
-        # corruption). Encoded via FFmpeg → co64-safe even past 4 GiB.
-        src_kbps = source_bitrate_kbps(cap)
+    @staticmethod
+    def _start_decode_thread(
+        cap: "cv2.VideoCapture",
+        decode_q: "queue.Queue",
+        stop_io: threading.Event,
+        first_frame: Optional[np.ndarray] = None,
+        name: str = "export-decode",
+    ) -> threading.Thread:
+        """Read frames ahead into ``decode_q`` as ``(idx, frame)``; None at EOF.
 
-        ret, frame0 = cap.read()
-        if not ret:
-            cap.release()
-            self.export_finished.emit(False, "Cannot read first frame")
-            return
-        fh, fw = frame0.shape[:2]
-
-        writer = make_video_writer(
-            output_path, fw, fh, fps,
-            bitrate_kbps=src_kbps, on_status=self.status.emit,
-        )
-        if writer is None:
-            cap.release()
-            self.export_finished.emit(False, f"Cannot create output: {output_path}")
-            return
-
-        # ── Pipeline the I/O off the inference thread ───────────────────────────
-        # A decode thread reads ahead into a bounded queue and a writer thread
-        # drains blurred frames to FFmpeg, so 4K decode (CPU) and encode (pipe
-        # write) overlap the GPU inference instead of stalling it serially — the
-        # GPU stays fed (steady utilisation) and throughput rises.
-        decode_q: queue.Queue = queue.Queue(maxsize=4)
-        write_q: queue.Queue = queue.Queue(maxsize=4)
-        stop_io = threading.Event()
-        write_err: list[BaseException] = []
-
+        Decode overlaps inference/encode on its own thread so the GPU stays
+        fed. ``first_frame`` seeds index 0 when the caller already read it."""
         def _decode() -> None:
-            local_idx, f = 0, frame0
+            if first_frame is not None:
+                local_idx, f = 0, first_frame
+            else:
+                ret, f = cap.read()
+                if not ret:
+                    decode_q.put(None)
+                    return
+                local_idx = 0
             while not stop_io.is_set():
                 try:
                     decode_q.put((local_idx, f), timeout=0.2)
@@ -915,6 +716,118 @@ class ProcessWorker(QThread):
             except queue.Full:
                 pass
 
+        t = threading.Thread(target=_decode, name=name, daemon=True)
+        t.start()
+        return t
+
+    def _wait_if_paused(self, frame: np.ndarray) -> bool:
+        """Block while paused (re-rendering on slider changes); True = cancel."""
+        while not self._export_run.is_set():
+            if self._take_params_dirty():
+                self._paused_preview(frame)
+            self._export_run.wait(0.05)
+        return self._export_cancel.is_set()
+
+    def _analyse_pass(
+        self,
+        cap: "cv2.VideoCapture",
+        frame0: np.ndarray,
+        total: int,
+        tracker: HeadTracker,
+        recorder: TrackRecorder,
+        fps: float,
+    ) -> tuple[int, bool]:
+        """Pass 1: detect + track every frame, record observations, blur
+        nothing. Returns ``(frames_decoded, cancelled)``."""
+        decode_q: queue.Queue = queue.Queue(maxsize=4)
+        stop_io = threading.Event()
+        dec_thread = self._start_decode_thread(
+            cap, decode_q, stop_io, frame0, "export-analyse-decode")
+
+        n = 0
+        cancelled = False
+        last_preview = 0.0
+        frame = frame0
+        try:
+            while True:
+                if self._wait_if_paused(frame):
+                    cancelled = True
+                    break
+                item = decode_q.get()
+                if item is None:
+                    break
+                idx, frame = item
+
+                p = self._latest_params()
+                t0 = time.perf_counter()
+                dets, fused, obs = self._compute(frame, p, tracker)
+                recorder.observe(idx, obs)
+                n = idx + 1
+                total_ms = (time.perf_counter() - t0) * 1e3
+
+                # Preview at ~10 fps wall-clock: the TRACKING panel shows the
+                # raw evidence live; AFTER stays honest — no blur exists yet.
+                now = time.perf_counter()
+                if now - last_preview >= 0.1:
+                    last_preview = now
+                    overlay = frame.copy()
+                    _draw_tracking_overlay(overlay, dets, fused, obs,
+                                           p.det_conf)
+                    tracking = self._display_copy(overlay)
+                    after = self._display_copy(frame)
+                    cv2.putText(after, "analysing  ·  pass 1/2",
+                                (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 170, 255), 2, cv2.LINE_AA)
+                    self._emit_preview(self._display_copy(frame), tracking,
+                                       after, 1000.0 / max(total_ms, 1e-6))
+                self.export_progress.emit(1, idx, total)
+                if n % 30 == 0:
+                    self._log_export_timings("analyse", idx, total_ms)
+        finally:
+            stop_io.set()
+            try:
+                while True:
+                    decode_q.get_nowait()
+            except queue.Empty:
+                pass
+            dec_thread.join(timeout=1.0)
+        return n, cancelled
+
+    def _render_pass(
+        self,
+        input_path: str,
+        output_path: str,
+        table: list,
+        total: int,
+        fps: float,
+        fw: int,
+        fh: int,
+        src_kbps: int,
+    ) -> None:
+        """Pass 2: re-decode, blur from the cleaned track table (no inference),
+        encode. Emits export_finished."""
+        # Fresh decoder rather than seeking the pass-1 capture back — a clean
+        # open is the only way OpenCV guarantees the identical frame sequence.
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            self.export_finished.emit(False, f"Cannot reopen: {input_path}")
+            return
+        writer = make_video_writer(
+            output_path, fw, fh, fps,
+            bitrate_kbps=src_kbps, on_status=self.status.emit,
+            audio_source=input_path,
+        )
+        if writer is None:
+            cap.release()
+            self.export_finished.emit(
+                False, f"Cannot create output: {output_path}")
+            return
+
+        decode_q: queue.Queue = queue.Queue(maxsize=4)
+        write_q: queue.Queue = queue.Queue(maxsize=4)
+        stop_io = threading.Event()
+        write_err: list[BaseException] = []
+
         def _write() -> None:
             while True:
                 item = write_q.get()
@@ -927,78 +840,63 @@ class ProcessWorker(QThread):
                 except Exception as exc:            # noqa: BLE001
                     write_err.append(exc)
 
-        dec_thread = threading.Thread(target=_decode, name="export-decode",
-                                      daemon=True)
+        dec_thread = self._start_decode_thread(
+            cap, decode_q, stop_io, None, "export-render-decode")
         wr_thread = threading.Thread(target=_write, name="export-write",
                                      daemon=True)
-        dec_thread.start()
         wr_thread.start()
 
-        p0 = self._latest_params()
-        tracker = SubjectTracker(fps=fps, match_iou=p0.match_iou,
-                                 hold_secs=p0.hold_secs)
-        masks = MaskBuilder()
-        frame = frame0
-        idx = 0
         processed = 0
-        last_preview = 0.0
         cancelled = False
-
+        last_preview = 0.0
+        frame: Optional[np.ndarray] = None
         try:
             while True:
-                # Paused: hold position, re-render on param changes.
-                while not self._export_run.is_set():
-                    if self._take_params_dirty():
-                        self._paused_preview(frame)
-                    self._export_run.wait(0.05)
-                if self._export_cancel.is_set():
+                if frame is not None and self._wait_if_paused(frame):
                     cancelled = True
                     break
-
                 item = decode_q.get()
                 if item is None:
                     break
                 idx, frame = item
 
+                # Appearance stays live-tunable in pass 2; the tracking data
+                # is already frozen in the table.
                 p = self._latest_params()
+                entries = table[idx] if idx < len(table) else []
+                boxes = [b for _tid, b in entries]
+
                 t0 = time.perf_counter()
-                blurred, proc, tracked, polys, overlay = self._export_frame(
-                    frame, p, tracker, masks)
-                write_q.put(blurred)
+                do_preview = (t0 - last_preview >= 0.1)
+                before = self._display_copy(frame) if do_preview else None
+
+                mask = render_head_mask((fh, fw), boxes,
+                                        pad=p.mask_pad, feather=p.mask_feather)
+                self._blur.reconfigure(p.blur_layers)
+                t_b = time.perf_counter()
+                self._blur.apply(frame, mask)
+                self._last_blur_ms = (time.perf_counter() - t_b) * 1e3
+                write_q.put(frame)
                 if write_err:
                     raise write_err[0]
 
-                # Refresh the preview panels at ~10 fps wall-clock (not every
-                # frame): overlays live only on these copies, never in the
-                # written file. Throttling drops the per-frame 4K copies +
-                # seg-mask blend + contour find that the GUI mostly discards.
-                now = time.perf_counter()
-                total_ms = (now - t0) * 1e3
-                if now - last_preview >= 0.1:
-                    last_preview = now
-                    tracking = proc.copy()
-                    _draw_tracking_overlay(tracking, tracked, polys, *overlay)
-                    if proc.shape[:2] != blurred.shape[:2]:
-                        preview = cv2.resize(
-                            blurred, (proc.shape[1], proc.shape[0]),
-                            interpolation=cv2.INTER_AREA)
-                    else:
-                        preview = blurred.copy()
-                    for t in tracked:
-                        bbox = t.face.bbox if t.face is not None else t.bbox
-                        _draw_outline(preview, polys.get(t.track_id), bbox,
-                                      t.track_id, _track_colour(t.track_id),
-                                      _SOURCE_TAGS.get(t.source, ""))
-                    self._emit_preview(proc.copy(), tracking, preview,
+                total_ms = (time.perf_counter() - t0) * 1e3
+                if do_preview and before is not None:
+                    last_preview = t0
+                    after = self._display_copy(frame)
+                    s = before.shape[1] / float(fw)
+                    tracking = before.copy()
+                    for tid, b in entries:
+                        _draw_mask_ellipse(tracking, b * s, p.mask_pad,
+                                           _track_colour(tid), f"id:{tid}")
+                    self._emit_preview(before, tracking, after,
                                        1000.0 / max(total_ms, 1e-6))
-                self.export_progress.emit(idx, total)
+                self.export_progress.emit(2, idx, total)
 
                 processed += 1
                 if processed % 30 == 0:
-                    self._log_export_timings(idx, total_ms)
+                    self._log_export_timings("render", idx, total_ms)
         finally:
-            # Stop the decode thread and unblock it if it's parked on a full
-            # queue, then flush the writer with a sentinel and join both.
             stop_io.set()
             try:
                 while True:
@@ -1022,6 +920,68 @@ class ProcessWorker(QThread):
         else:
             self.export_finished.emit(
                 True, f"Exported {processed} frames → {out_name}")
+
+    def _run_export(self, input_path: str, output_path: str) -> None:
+        """Two-pass export: analyse (detect+track, no blur), clean the
+        tracklets offline, then render from the cleaned table (no inference).
+
+        The offline pass is what makes the output steady: false positives are
+        pruned with hindsight, detection gaps are interpolated along the head's
+        path instead of held or dropped, and zero-phase smoothing removes
+        jitter without lag."""
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            self.export_finished.emit(False, f"Cannot open: {input_path}")
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Match the source's bitrate so the export keeps its format/quality
+        # without OpenCV's uncontrolled ~250 Mbps blow-up (the 4 GiB / 2:18
+        # corruption). Encoded via FFmpeg → co64-safe even past 4 GiB.
+        src_kbps = source_bitrate_kbps(cap)
+
+        ret, frame0 = cap.read()
+        if not ret:
+            cap.release()
+            self.export_finished.emit(False, "Cannot read first frame")
+            return
+        fh, fw = frame0.shape[:2]
+
+        p0 = self._latest_params()
+        tracker = HeadTracker(fps=fps, det_conf=p0.det_conf,
+                              det_conf_low=p0.det_conf_low,
+                              min_hits=p0.min_hits, max_age_s=p0.max_age_s)
+        recorder = TrackRecorder()
+        self.status.emit("Pass 1/2 — analysing…")
+        n1, cancelled = self._analyse_pass(cap, frame0, total, tracker,
+                                           recorder, fps)
+        cap.release()
+        if cancelled:
+            self.export_finished.emit(
+                False, "Cancelled during analysis — nothing written")
+            return
+        if n1 == 0:
+            self.export_finished.emit(False, "No frames decoded")
+            return
+
+        # Offline tracklet cleanup between the passes (fast, pure numpy).
+        p = self._latest_params()
+        raw = recorder.finalize()
+        table = postprocess(
+            raw, fps=fps, n_frames=n1,
+            p=PostParams(det_conf=p.det_conf, min_hits=p.min_hits,
+                         min_track_s=p.min_track_s,
+                         bridge_gap_s=p.bridge_gap_s,
+                         smooth_win_s=p.smooth_win_s))
+        kept = {tid for entries in table for tid, _b in entries}
+        covered = sum(1 for entries in table if entries)
+        msg = (f"Analysis: {len(raw)} raw tracklets → {len(kept)} heads, "
+               f"blur on {covered}/{n1} frames — pass 2/2 rendering…")
+        debug_log(msg)
+        self.status.emit(msg)
+
+        self._render_pass(input_path, output_path, table, n1, fps,
+                          fw, fh, src_kbps)
 
 
 # ── Reusable widgets ──────────────────────────────────────────────────────────
@@ -1377,45 +1337,33 @@ class MainWindow(QMainWindow):
         lay = QGridLayout(grp)
         lay.setSpacing(6)
 
-        size_lbl = QLabel("Target Size")
-        size_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
-        self._size_combo = QComboBox()
-        for sz in (320, 480, 640, 800, 1024):
-            self._size_combo.addItem(f"{sz} px", sz)
-        self._size_combo.setCurrentIndex(2)
-        self._size_combo.currentIndexChanged.connect(self._on_target_size_change)
-
-        # Working resolution: the frame is downscaled to this long edge before
-        # detection/masking, then only the final mask is upscaled to blur the
-        # full-res output. Big speedup on 4K; "Full" = no downscale.
-        proc_lbl = QLabel("Process Res")
-        proc_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
-        proc_lbl.setToolTip(
-            "Downscale the frame to this long edge for detection/masking, then\n"
-            "blur the full-resolution output. Lower = much faster on 4K; raise it\n"
-            "if small or distant faces start slipping through.")
-        self._proc_combo = QComboBox()
-        self._proc_combo.addItem("Full", 0)
-        for px in (960, 1280, 1600, 1920):
-            self._proc_combo.addItem(f"{px} px", px)
-        idx = self._proc_combo.findData(self._params.proc_long_edge)
-        self._proc_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self._proc_combo.currentIndexChanged.connect(self._on_param_change)
-
-        self._det_score_sl  = TunableSlider("Det Score",     0.10, 1.00, 0.55)
-        self._face_aspect_sl = TunableSlider("Face Aspect",  0.10, 1.50, 0.40)
-        self._closeup_sl     = TunableSlider("Close-up Thr", 0.10, 1.00, 0.60)
-
-        for sl in (self._det_score_sl, self._face_aspect_sl, self._closeup_sl):
+        self._det_conf_sl = TunableSlider("Confidence", 0.10, 0.95, 0.50)
+        self._det_conf_sl.setToolTip(
+            "A head detection at or above this can start and drive a blur.\n"
+            "Lower = catch more heads (and more noise); the tracker's\n"
+            "confirmation and the export's cleanup absorb most noise.")
+        self._det_low_sl = TunableSlider("Sustain floor", 0.02, 0.50, 0.10)
+        self._det_low_sl.setToolTip(
+            "Detections between this and Confidence only *sustain* an\n"
+            "existing blur through occlusion — they can never start one.")
+        for sl in (self._det_conf_sl, self._det_low_sl):
             sl.changed.connect(self._on_param_change)
 
-        lay.addWidget(size_lbl,              0, 0)
-        lay.addWidget(self._size_combo,      0, 1)
-        lay.addWidget(proc_lbl,              1, 0)
-        lay.addWidget(self._proc_combo,      1, 1)
-        lay.addWidget(self._det_score_sl,    2, 0, 1, 2)
-        lay.addWidget(self._face_aspect_sl,  3, 0, 1, 2)
-        lay.addWidget(self._closeup_sl,      4, 0, 1, 2)
+        self._rot_btn = QPushButton("Rotation Assist")
+        self._rot_btn.setProperty("chip", "true")
+        self._rot_btn.setCheckable(True)
+        self._rot_btn.setChecked(True)
+        self._rot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rot_btn.setToolTip(
+            "Also detect on ±90°-rotated frames and merge the results —\n"
+            "recovers sideways heads (lying down / bed angles) that\n"
+            "upright-trained detectors miss. ~3× the detection cost.")
+        self._rot_btn.toggled.connect(lambda _c: self._on_param_change())
+
+        lay.addWidget(self._det_conf_sl, 0, 0, 1, 2)
+        lay.addWidget(self._det_low_sl,  1, 0, 1, 2)
+        lay.addWidget(self._rot_btn,     2, 0,
+                      alignment=Qt.AlignmentFlag.AlignLeft)
         return grp
 
     def _build_blur_group(self) -> QGroupBox:
@@ -1423,15 +1371,21 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(grp)
         lay.setSpacing(12)
 
-        self._expand_sl = TunableSlider("Hull Expand", 0.00, 2.00, 0.45)
-        self._hair_sl   = TunableSlider("Hair Extra",  0.00, 3.00, 0.90)
-        for sl in (self._expand_sl, self._hair_sl):
+        self._pad_sl = TunableSlider("Mask Pad", 0.00, 0.60, 0.18)
+        self._pad_sl.setToolTip(
+            "How far the blur ellipse extends beyond the detected head box,\n"
+            "per side. Bigger = safer margin, less tight.")
+        self._feather_sl = TunableSlider("Edge Feather", 0.00, 0.40, 0.12)
+        self._feather_sl.setToolTip(
+            "Soft fade at the mask edge, as a fraction of the head size.\n"
+            "Hides residual jitter and reads less harsh than a hard edge.")
+        for sl in (self._pad_sl, self._feather_sl):
             sl.changed.connect(self._on_param_change)
 
         left = QVBoxLayout()
         left.setSpacing(6)
-        left.addWidget(self._expand_sl)
-        left.addWidget(self._hair_sl)
+        left.addWidget(self._pad_sl)
+        left.addWidget(self._feather_sl)
         left.addStretch()
 
         # Stackable blur layers, applied top to bottom.
@@ -1509,29 +1463,44 @@ class MainWindow(QMainWindow):
         self._on_param_change()
 
     def _build_tracking_group(self) -> QGroupBox:
-        grp = QGroupBox("TRACKING")
+        grp = QGroupBox("TRACKING · CLEANUP")
         lay = QVBoxLayout(grp)
         lay.setSpacing(6)
 
-        self._iou_sl = TunableSlider("Match IoU", 0.05, 0.95, 0.30)
-        self._iou_sl.changed.connect(self._on_param_change)
-        # How long a lost face keeps its blur, coasting on Kalman prediction.
-        self._hold_sl = TunableSlider("Hold (s)", 0.0, 5.0, 0.6, decimals=1)
-        self._hold_sl.changed.connect(self._on_param_change)
+        self._min_hits_sl = TunableSlider("Confirm frames", 1, 10, 3,
+                                          decimals=0)
+        self._min_hits_sl.setToolTip(
+            "Consecutive detections before a new head is blurred —\n"
+            "suppresses one-frame false positives.")
+        self._min_track_sl = TunableSlider("Min track (s)", 0.0, 2.0, 0.25,
+                                           decimals=2)
+        self._min_track_sl.setToolTip(
+            "Export cleanup: tracklets shorter than this are treated as\n"
+            "detector noise and dropped.")
+        self._bridge_sl = TunableSlider("Bridge gap (s)", 0.0, 4.0, 1.5,
+                                        decimals=1)
+        self._bridge_sl.setToolTip(
+            "Export cleanup: a head that vanishes and reappears within this\n"
+            "window is re-joined and the gap blurred along its path.")
+        self._max_age_sl = TunableSlider("Coast (s)", 0.5, 4.0, 1.75,
+                                         decimals=2)
+        self._max_age_sl.setToolTip(
+            "How long a lost track stays alive as a re-acquire/bridge\n"
+            "candidate (it is not blurred while coasting).")
+        self._smooth_sl = TunableSlider("Smooth (s)", 0.1, 2.0, 0.5,
+                                        decimals=1)
+        self._smooth_sl.setToolTip(
+            "Export cleanup: zero-phase smoothing window for the blur's\n"
+            "position/size — steadier blur, no lag.")
+        for sl in (self._min_hits_sl, self._min_track_sl, self._bridge_sl,
+                   self._max_age_sl, self._smooth_sl):
+            sl.changed.connect(self._on_param_change)
 
-        self._pose_btn = QPushButton("Pose Assist")
-        self._pose_btn.setProperty("chip", "true")
-        self._pose_btn.setCheckable(True)
-        self._pose_btn.setChecked(True)
-        self._pose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._pose_btn.setToolTip(
-            "Track the head via body pose when the face detector loses it\n"
-            "(person turns away / looks down) so the blur stays put.")
-        self._pose_btn.toggled.connect(lambda _c: self._on_param_change())
-
-        lay.addWidget(self._iou_sl)
-        lay.addWidget(self._hold_sl)
-        lay.addWidget(self._pose_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self._min_hits_sl)
+        lay.addWidget(self._min_track_sl)
+        lay.addWidget(self._bridge_sl)
+        lay.addWidget(self._max_age_sl)
+        lay.addWidget(self._smooth_sl)
         lay.addStretch()
         return grp
 
@@ -1654,12 +1623,15 @@ class MainWindow(QMainWindow):
         self._worker.start_export(self._video_path, path)
         self._on_status("Exporting…")
 
-    def _on_export_progress(self, current: int, total: int) -> None:
+    def _on_export_progress(self, pass_no: int, current: int, total: int) -> None:
+        # One slider spans both passes: [0, total) = analyse, [total, 2·total)
+        # = render, so progress never appears to rewind between passes.
+        span = max(1, total)
         self._frame_slider.blockSignals(True)
-        self._frame_slider.setMaximum(max(0, total - 1))
-        self._frame_slider.setValue(current)
+        self._frame_slider.setMaximum(2 * span - 1)
+        self._frame_slider.setValue((pass_no - 1) * span + current)
         self._frame_slider.blockSignals(False)
-        self._frame_lbl.setText(f"{current} / {max(0, total - 1)}")
+        self._frame_lbl.setText(f"P{pass_no}/2 · {current} / {max(0, total - 1)}")
 
     def _on_export_finished(self, ok: bool, msg: str) -> None:
         self._exporting = False
@@ -1688,21 +1660,17 @@ class MainWindow(QMainWindow):
         _tip, p = PRESETS[name]
         self._applying_preset = True
         try:
-            idx = self._size_combo.findData(p.target_size)
-            if idx >= 0:
-                self._size_combo.setCurrentIndex(idx)
-            pidx = self._proc_combo.findData(p.proc_long_edge)
-            if pidx >= 0:
-                self._proc_combo.setCurrentIndex(pidx)
-            self._det_score_sl.set_value(p.det_score)
-            self._face_aspect_sl.set_value(p.face_aspect)
-            self._closeup_sl.set_value(p.close_up_ratio)
-            self._expand_sl.set_value(p.blur_expand)
-            self._hair_sl.set_value(p.blur_hair_extra)
+            self._det_conf_sl.set_value(p.det_conf)
+            self._det_low_sl.set_value(p.det_conf_low)
+            self._rot_btn.setChecked(p.rot_assist)
+            self._pad_sl.set_value(p.mask_pad)
+            self._feather_sl.set_value(p.mask_feather)
             self._set_blur_layers(p.blur_layers)
-            self._iou_sl.set_value(p.match_iou)
-            self._hold_sl.set_value(p.hold_secs)
-            self._pose_btn.setChecked(p.pose_assist)
+            self._min_hits_sl.set_value(p.min_hits)
+            self._min_track_sl.set_value(p.min_track_s)
+            self._bridge_sl.set_value(p.bridge_gap_s)
+            self._max_age_sl.set_value(p.max_age_s)
+            self._smooth_sl.set_value(p.smooth_win_s)
             # Re-submit even when no slider actually moved (e.g. re-click).
             self._on_param_change()
         finally:
@@ -1716,21 +1684,18 @@ class MainWindow(QMainWindow):
             btn.setChecked(False)
         self._custom_lbl.setVisible(True)
 
-    def _on_target_size_change(self) -> None:
-        self._params.target_size = self._size_combo.currentData()
-        self._on_param_change()
-
     def _on_param_change(self, _val: float = 0.0) -> None:
-        self._params.proc_long_edge = self._proc_combo.currentData()
-        self._params.det_score      = self._det_score_sl.value()
-        self._params.face_aspect    = self._face_aspect_sl.value()
-        self._params.close_up_ratio = self._closeup_sl.value()
-        self._params.blur_expand    = self._expand_sl.value()
-        self._params.blur_hair_extra = self._hair_sl.value()
-        self._params.blur_layers    = self._blur_layers_value()
-        self._params.match_iou      = self._iou_sl.value()
-        self._params.hold_secs      = self._hold_sl.value()
-        self._params.pose_assist    = self._pose_btn.isChecked()
+        self._params.det_conf     = self._det_conf_sl.value()
+        self._params.det_conf_low = self._det_low_sl.value()
+        self._params.rot_assist   = self._rot_btn.isChecked()
+        self._params.mask_pad     = self._pad_sl.value()
+        self._params.mask_feather = self._feather_sl.value()
+        self._params.blur_layers  = self._blur_layers_value()
+        self._params.min_hits     = self._min_hits_sl.int_value()
+        self._params.min_track_s  = self._min_track_sl.value()
+        self._params.bridge_gap_s = self._bridge_sl.value()
+        self._params.max_age_s    = self._max_age_sl.value()
+        self._params.smooth_win_s = self._smooth_sl.value()
         self._worker.update_params(self._params)
         if not self._applying_preset:
             self._mark_custom()

@@ -64,6 +64,15 @@ BODY_FLOOR = 0.35
 _MERGE_IOU = 0.55
 _FACE_IN_HEAD_IOU = 0.30
 
+# Rotated-pass acceptance. Rotation passes exist purely as recall assist for
+# sideways heads, and the model hallucinates on rotated scenes (a rotated
+# upright scene can read as one giant "head" spanning the frame). A genuinely
+# sideways head becomes *upright* in the rotated view and scores high, so a
+# stricter floor costs no real recall; the containment check below kills the
+# giant-hallucination case outright.
+_ROT_SCORE_FLOOR = 0.50
+_ROT_CONTAIN_AREA = 0.5   # rotated head is fake if it swallows an upright one
+
 
 @dataclass(frozen=True)
 class DetectorSpec:
@@ -421,6 +430,30 @@ class HeadDetector:
                           faces=take(s.face_ids, FACE_FLOOR),
                           bodies=take(s.body_ids, BODY_FLOOR))
 
+    @staticmethod
+    def _filter_rotated(boxes: np.ndarray, upright: np.ndarray) -> np.ndarray:
+        """Acceptance gates for a rotated pass's boxes (see _ROT_* consts):
+        stricter score floor, and no box that contains an upright-pass box of
+        half its area or less (the giant-hallucination signature)."""
+        if len(boxes) == 0:
+            return boxes
+        boxes = boxes[boxes[:, 4] >= _ROT_SCORE_FLOOR]
+        if len(boxes) == 0 or len(upright) == 0:
+            return boxes
+        ucx = (upright[:, 0] + upright[:, 2]) / 2
+        ucy = (upright[:, 1] + upright[:, 3]) / 2
+        uarea = (upright[:, 2] - upright[:, 0]) * (upright[:, 3] - upright[:, 1])
+        keep = []
+        for b in boxes:
+            barea = (b[2] - b[0]) * (b[3] - b[1])
+            inside = ((b[0] <= ucx) & (ucx <= b[2])
+                      & (b[1] <= ucy) & (ucy <= b[3])
+                      & (uarea <= barea * _ROT_CONTAIN_AREA))
+            if not inside.any():
+                keep.append(b)
+        return (np.stack(keep) if keep
+                else np.empty((0, 5), np.float32))
+
     def detect(self, frame_bgr: np.ndarray,
                rotations: tuple[int, ...] = (0,)) -> Detections:
         """Detect on ``frame_bgr``; optionally also on rotated copies.
@@ -428,7 +461,9 @@ class HeadDetector:
         ``rotations`` beyond ``(0,)`` re-run the same pinned session on 90°/
         180°/270° copies and merge the unrotated results — recall insurance
         for sideways heads (bed angles) that upright-trained detectors miss.
-        Cost is linear in the number of rotations.
+        Cost is linear in the number of rotations. Rotated passes contribute
+        heads/faces only (bodies come from the upright pass) and pass through
+        the ``_filter_rotated`` gates.
         """
         if not self._ensure():
             return Detections()
@@ -439,24 +474,35 @@ class HeadDetector:
         fh, fw = frame_bgr.shape[:2]
         try:
             t0 = time.perf_counter()
-            per_rot: list[Detections] = []
+            base: Optional[Detections] = None
+            extra_heads: list[np.ndarray] = []
+            extra_faces: list[np.ndarray] = []
             for rot in rotations:
                 img = frame_bgr if rot == 0 else cv2.rotate(
                     frame_bgr, rot_code[rot])
                 rows = self._infer(img)
                 d = self._split(rows, *(
                     (fw, fh) if rot in (0, 180) else (fh, fw)))
-                per_rot.append(Detections(
-                    heads=_unrotate_boxes(d.heads, rot, fw, fh),
-                    faces=_unrotate_boxes(d.faces, rot, fw, fh),
-                    bodies=_unrotate_boxes(d.bodies, rot, fw, fh)))
+                if rot == 0:
+                    base = d
+                else:
+                    extra_heads.append(_unrotate_boxes(d.heads, rot, fw, fh))
+                    extra_faces.append(_unrotate_boxes(d.faces, rot, fw, fh))
             self.last_ms = (time.perf_counter() - t0) * 1e3
-            if len(per_rot) == 1:
-                return per_rot[0]
+            if base is None:
+                base = Detections()
+            if not extra_heads and not extra_faces:
+                return base
+            rot_heads = self._filter_rotated(
+                np.concatenate(extra_heads) if extra_heads
+                else np.empty((0, 5), np.float32), base.heads)
+            rot_faces = self._filter_rotated(
+                np.concatenate(extra_faces) if extra_faces
+                else np.empty((0, 5), np.float32), base.faces)
             return Detections(
-                heads=_nms(np.concatenate([d.heads for d in per_rot])),
-                faces=_nms(np.concatenate([d.faces for d in per_rot])),
-                bodies=_nms(np.concatenate([d.bodies for d in per_rot])))
+                heads=_nms(np.concatenate([base.heads, rot_heads])),
+                faces=_nms(np.concatenate([base.faces, rot_faces])),
+                bodies=base.bodies)
         except Exception as exc:  # noqa: BLE001 — one bad frame ≠ crash
             self._status(f"{self.spec.name} detect failed, degrading: {exc!r}")
             self.available = False

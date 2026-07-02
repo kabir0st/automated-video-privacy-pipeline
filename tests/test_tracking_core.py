@@ -83,6 +83,23 @@ class TestRotations:
         assert len(out) == 2
         assert out[0, 4] == pytest.approx(0.9)
 
+    def test_rotated_giant_hallucination_suppressed(self):
+        """A rotated pass can hallucinate a frame-spanning 'head' that
+        contains the real upright-detected heads — it must be dropped, while
+        a genuine sideways head (small, strong, not containing anything)
+        survives."""
+        from libs.detector import HeadDetector
+        upright = np.stack([det(880, 30, 230, 260, 0.92),
+                            det(470, 190, 240, 230, 0.89)])
+        rotated = np.stack([
+            np.array([0, 0, 1275, 544, 0.79], np.float32),   # giant fake
+            det(100, 500, 200, 150, 0.82),                   # real sideways
+            det(300, 500, 200, 150, 0.40),                   # below rot floor
+        ])
+        out = HeadDetector._filter_rotated(rotated, upright)
+        assert len(out) == 1
+        assert out[0, 4] == pytest.approx(0.82)
+
 
 # ── tracker ─────────────────────────────────────────────────────────────────
 
