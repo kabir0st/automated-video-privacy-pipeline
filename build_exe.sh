@@ -17,13 +17,18 @@
 #     (onnxruntime-directml, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - All three models — the PINTO YOLOv9-Wholebody17 detector (~28 MB), the
-#     SCRFD close-up assist (~17 MB) and the RTMPose-m body7 pose estimator
-#     (~25 MB, supplies the evidence gate's anatomical anchor + torso axis) —
-#     ARE bundled into the exe (--add-data below), so a first run needs no
+#   - All four models — the PINTO YOLOv9-Wholebody17 detector (~28 MB), the
+#     SCRFD close-up assist (~17 MB), the RTMPose-m body7 pose estimator
+#     (~25 MB, supplies the evidence gate's anatomical anchor + torso axis)
+#     and the NudeNet YOLOv8n verify witness (~12 MB, offline-only —
+#     independent cross-model confirmation for tracklet verification) — ARE
+#     bundled into the exe (--add-data below), so a first run needs no
 #     downloads at all. The startup preflight (libs/models.py) still reports
 #     each one's location and can download to %USERPROFILE%\.cache\avpp\ if a
 #     bundle is bypassed via the AVPP_*_ONNX/AVPP_*_URL env overrides.
+#   - NudeNet is AGPL-3.0 licensed (the model weights, bundled here for this
+#     project's own offline/personal-use build; see README before ever
+#     redistributing the exe).
 #   - GPU acceleration uses the DirectML execution provider (onnxruntime-directml),
 #     which runs on any Windows GPU including the AMD Radeon RX 6800. The build
 #     asserts DirectML is active so a silent CPU-only bundle can't ship; the app
@@ -136,6 +141,19 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $POSE_PATH"
 POSE_WIN=$(wslpath -w "$POSE_PATH")
 
+# NudeNet verify witness (YOLOv8n, ~12 MB) — independent, offline-only
+# cross-model witness for tracklet verification (Phase 3). Same bundling
+# treatment; libs/nudenet.py resolves _MEIPASS/models first.
+echo ""
+echo ">>> Ensuring NudeNet verify witness model for bundling…"
+NUDENET_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.nudenet import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $NUDENET_PATH"
+NUDENET_WIN=$(wslpath -w "$NUDENET_PATH")
+
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
 # Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
 # cv2/onnxruntime/insightface imports, then hands the splash to ui.main() which
@@ -190,6 +208,8 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --hidden-import "libs.evidence" \
   --hidden-import "libs.scrfd" \
   --hidden-import "libs.pose" \
+  --hidden-import "libs.nudenet" \
+  --hidden-import "libs.sidecar" \
   --hidden-import "libs.head_tracker" \
   --hidden-import "libs.tracklets" \
   --hidden-import "libs.models" \
@@ -208,6 +228,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --add-data "$MODEL_WIN;models" \
   --add-data "$SCRFD_WIN;models" \
   --add-data "$POSE_WIN;models" \
+  --add-data "$NUDENET_WIN;models" \
   \
   \
   `# utils.py optionally imports torch for the CUDA blur path; on this` \

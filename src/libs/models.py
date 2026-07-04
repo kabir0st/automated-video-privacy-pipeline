@@ -6,12 +6,14 @@ callback. Run :func:`preflight` at startup so the windowed .exe surfaces model
 status on the splash and in the debug log (:data:`libs.utils.DEBUG_LOG`)
 instead of stalling silently the first time a video is opened.
 
-Three models: the PINTO body/head/face detector (see libs/detector.py for the
+Four models: the PINTO body/head/face detector (see libs/detector.py for the
 spec, resolution order and env overrides) that owns the pipeline, the SCRFD
-face detector (libs/scrfd.py) that only assists on extreme close-ups, and the
+face detector (libs/scrfd.py) that only assists on extreme close-ups, the
 RTMPose body estimator (libs/pose.py) that supplies the evidence gate's
-anatomical anchor + torso axis. The frozen build bundles all three, so a
-normal first run downloads nothing; the download paths exist for dev
+anatomical anchor + torso axis, and NudeNet (libs/nudenet.py) — an
+independent, offline-only witness for cross-model tracklet verification
+(never runs in the live per-frame path). The frozen build bundles all four,
+so a normal first run downloads nothing; the download paths exist for dev
 machines and for spec overrides.
 
 Downloads are idempotent and best-effort: any failure is reported and skipped
@@ -25,7 +27,7 @@ from __future__ import annotations
 import os
 from typing import Callable, Optional
 
-from . import detector, pose, scrfd
+from . import detector, nudenet, pose, scrfd
 from .utils import debug_log
 
 StatusCb = Callable[[str], None]
@@ -73,6 +75,18 @@ def _preflight_pose(status: StatusCb, download: bool) -> None:
     status("pose estimator: ready")
 
 
+def _preflight_nudenet(status: StatusCb, download: bool) -> None:
+    path = nudenet.model_path()
+    if path is not None:
+        status(f"nudenet verify witness: {path}  [found]")
+        return
+    status(f"nudenet verify witness: {nudenet.default_cache()}  [MISSING]")
+    if not download:
+        return
+    nudenet.download_model(on_status=status)
+    status("nudenet verify witness: ready")
+
+
 def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) -> None:
     """Check the model's location, download it if missing, and report.
 
@@ -101,4 +115,8 @@ def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) ->
         _preflight_pose(status, download)
     except Exception as exc:  # noqa: BLE001 — the gate degrades to head-anchor
         status(f"pose: download/check failed, will degrade — {exc!r}")
+    try:
+        _preflight_nudenet(status, download)
+    except Exception as exc:  # noqa: BLE001 — verify degrades to SCRFD-only
+        status(f"nudenet: download/check failed, will degrade — {exc!r}")
     status("Model check complete")

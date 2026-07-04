@@ -238,3 +238,9 @@ The default detector model (YOLOv9-Wholebody17 from the
 [PINTO model zoo](https://github.com/PINTO0309/PINTO_model_zoo)) is GPLv3 and
 is downloaded/bundled as data, not linked; the Apache-2.0
 YOLOX-Body-Head-Hand-Face spec is available via `AVPP_DETECTOR=yolox_bhhf`.
+
+The [NudeNet](https://github.com/notAI-tech/NudeNet) verify-witness model
+(`libs/nudenet.py`, offline-only — a second opinion during export's tracklet
+verification, never in the live per-frame path) is AGPL-3.0 and is likewise
+downloaded/bundled as data, not linked. This matters only if you redistribute
+a build of this app; personal/offline use is unaffected.

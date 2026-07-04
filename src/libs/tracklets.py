@@ -19,9 +19,12 @@ and :func:`build_table` turns those into a per-frame render table:
     independent evidence a real face does.
   * **Verify** — every tracklet that survives the prune must *reproduce*
     under re-inference: sample a few of its hit frames, crop around its box
-    with context, and ask the detector again on the magnified crop
-    (:func:`verify_tracklets`). This kills persistent false positives the
-    ledger's per-frame view can miss, without touching thresholds.
+    with context, and ask an INDEPENDENT model (SCRFD and/or NudeNet — never
+    the primary detector that produced the tracklet in the first place) for
+    a face at the same spot (:func:`verify_tracklets_xmodel`). This kills
+    persistent false positives the ledger's per-frame view can miss, without
+    touching thresholds, and closes the "verifier re-runs the same model
+    that hallucinated" hole a same-model verifier would leave open.
   * **Bridge** — a track that vanishes and reappears nearby (head briefly
     buried in a pillow / behind a shoulder) is re-joined and the gap is
     *interpolated along the path*, so the blur follows the head instead of
@@ -56,7 +59,7 @@ from .evidence import EvidenceSummary, PROFILES, GateThresholds, grade, summariz
 
 # Prune gates (see _prune).
 _MIN_HIT_RATIO = 0.30
-# Verification gates (see verify_tracklets).
+# Verification gates (see verify_tracklets_xmodel).
 _VERIFY_SAMPLES = 5      # hit frames sampled per tracklet
 _VERIFY_MIN_FRAC = 0.4   # fraction of tested samples that must re-detect
 # Crop side = max(box w, h) × this. Must be ≥ ~2.5: the detector's rotated
@@ -65,13 +68,7 @@ _VERIFY_MIN_FRAC = 0.4   # fraction of tested samples that must re-detect
 # sideways heads that only the rotated pass can re-detect.
 _VERIFY_MARGIN = 3.0
 _VERIFY_MIN_CROP = 96    # px — never crop tighter than this
-_VERIFY_SCORE = 0.50     # re-detection floor when face evidence agrees
-# Floor without face evidence in the crop. Skin misread as a head (chest,
-# thigh) *reproduces* under magnification — unlike texture hallucinations —
-# but rarely this confidently; a real back-of-head magnified ×3 does. This
-# is the safe form of "check it has a face": face evidence lowers the bar,
-# its absence raises it, it never zeroes a tracklet by itself.
-_VERIFY_LONE = 0.65
+_VERIFY_SCORE = 0.50     # witness re-detection floor to count as a match
 # Bridge gates.
 _BRIDGE_SIZE_RATIO = (0.6, 1.67)
 _CORRIDOR_IOU = 0.20
@@ -435,71 +432,74 @@ def _fill_face_gaps(t: Tracklet, max_gap: int) -> Tracklet:
                     _ev_arr(t), fvalid)
 
 
-def _face_backed(cand: np.ndarray, faces: np.ndarray) -> bool:
-    """A face box centre inside the candidate, or vice versa — the candidate
-    head has face evidence behind it."""
-    if len(faces) == 0:
-        return False
-    fcx = (faces[:, 0] + faces[:, 2]) / 2
-    fcy = (faces[:, 1] + faces[:, 3]) / 2
-    in_c = ((cand[0] <= fcx) & (fcx <= cand[2])
-            & (cand[1] <= fcy) & (fcy <= cand[3]))
-    ccx, ccy = (cand[0] + cand[2]) / 2, (cand[1] + cand[3]) / 2
-    c_in = ((faces[:, 0] <= ccx) & (ccx <= faces[:, 2])
-            & (faces[:, 1] <= ccy) & (ccy <= faces[:, 3]))
-    return bool((in_c | c_in).any())
-
-
-def verify_tracklets(
+def verify_tracklets_xmodel(
     tracklets: list[Tracklet],
     frame_at: Callable[[int], "np.ndarray | None"],
-    detect_fn: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
+    witness_fn: Optional[Callable[[np.ndarray], np.ndarray]],
+    thr: GateThresholds,
     *,
     min_score: float = _VERIFY_SCORE,
 ) -> tuple[list[Tracklet], list[Tracklet]]:
-    """Re-inference gate: keep tracklets whose head reproduces on crops.
+    """Cross-model re-inference gate: keep tracklets whose face reproduces
+    on crops, according to a model that had no part in producing them.
+
+    ``witness_fn(crop) -> faces`` must come from an INDEPENDENT model — SCRFD
+    and/or NudeNet, unioned by the caller (see ui.py's ``_make_verifier``) —
+    never the primary Wholebody17 detector that fed the evidence gate and
+    produced the tracklet in the first place. The primary has no vote here
+    at all: it may have been the thing that hallucinated, so it cannot also
+    be the thing that confirms itself. This is the Phase 3 replacement for
+    the interim, single-model verifier the evidence-gate rework shipped with
+    in Phase 1, and it closes exactly that self-correlated-confirmation hole.
 
     For up to ``_VERIFY_SAMPLES`` evenly spaced *hit* frames per tracklet,
     crop the frame around the tracklet box (side ``max(w, h) ×
-    _VERIFY_MARGIN``) and run ``detect_fn`` on the crop. ``detect_fn``
-    returns ``(candidates, faces)`` — head blur candidates plus every piece
-    of face evidence seen in the crop (both as ``[x1, y1, x2, y2, score]``
-    in crop coords). A sample verifies when some candidate lands on the
-    tracklet box (its centre inside the box, or the box centre inside it — a
-    close-up head can out-grow its recorded box) and either scores ≥
-    ``min_score`` with face evidence behind it, or scores ≥ ``_VERIFY_LONE``
-    alone (the back-of-head path — face evidence is never required, only
-    rewarded). The tracklet survives when at least ``_VERIFY_MIN_FRAC`` of
-    its *tested* samples verify.
+    _VERIFY_MARGIN``) and ask ``witness_fn`` for every face
+    (``[x1, y1, x2, y2, score]``, crop coords) it sees there. A sample
+    verifies when some witness face's centre lands in the tracklet box (or
+    vice versa — a close-up face can out-grow its recorded box) scoring ≥
+    ``min_score``. The tracklet survives when at least ``_VERIFY_MIN_FRAC``
+    of its *tested* samples verify.
 
-    Fail-open by design: unreadable frames or degenerate crops don't count
-    as tested, and a tracklet with zero tested samples is kept — for a
-    privacy tool a spurious blur is cheaper than an unblurred head. (This is
-    an interim, single-model verifier — Phase 3 replaces it with a
-    cross-model version that closes that fail-open path for anything but
-    the strongest evidence grades.)
+    When nothing could be tested for a tracklet — ``witness_fn`` is ``None``
+    (every independent model is unavailable; the verifier genuinely "can't
+    run") or every sampled frame/crop was unreadable — the decision falls
+    back to the tracklet's own evidence grade (:func:`grade`): only grades in
+    ``thr.verify_fail_open_grades`` survive unverified. This is tighter than
+    a blanket fail-open, per the pipeline's precision-first mandate: under
+    the "balanced" profile a "B"-graded track is dropped rather than trusted
+    on faith when no independent model could check it; "strict" trusts
+    nothing unverified at all.
 
     Returns ``(kept, dropped)`` so the caller can log what died.
     """
     kept: list[Tracklet] = []
     dropped: list[Tracklet] = []
+
+    def _fail_open(t: Tracklet) -> None:
+        g = grade(summarize(_ev_arr(t), t.hits), thr)
+        (kept if g in thr.verify_fail_open_grades else dropped).append(t)
+
     for t in tracklets:
         hit_idx = np.nonzero(t.hits)[0]
         if len(hit_idx) == 0:
             kept.append(t)
             continue
+        if witness_fn is None:
+            _fail_open(t)
+            continue
+
         n = min(_VERIFY_SAMPLES, len(hit_idx))
         picks = hit_idx[np.unique(
             np.round(np.linspace(0, len(hit_idx) - 1, n)).astype(int))]
-        tested = accepted = 0
+        tested = verified = 0
         for k in picks:
             frame = frame_at(t.start + int(k))
             if frame is None:
                 continue
             fh, fw = frame.shape[:2]
             cx, cy, w, h = (float(v) for v in t.boxes[k])
-            side = max(w, h) * _VERIFY_MARGIN
-            side = max(side, float(_VERIFY_MIN_CROP))
+            side = max(max(w, h) * _VERIFY_MARGIN, float(_VERIFY_MIN_CROP))
             x0 = int(max(0, cx - side / 2))
             y0 = int(max(0, cy - side / 2))
             x1 = int(min(fw, cx + side / 2))
@@ -507,24 +507,25 @@ def verify_tracklets(
             if x1 - x0 < 8 or y1 - y0 < 8:
                 continue
             tested += 1
-            raw_cands, raw_faces = detect_fn(frame[y0:y1, x0:x1])
-            cands = np.asarray(raw_cands, dtype=np.float32).reshape(-1, 5)
-            faces = np.asarray(raw_faces, dtype=np.float32).reshape(-1, 5)
+            faces = np.asarray(witness_fn(frame[y0:y1, x0:x1]),
+                               dtype=np.float32).reshape(-1, 5)
+            if len(faces) == 0:
+                continue
             # Tracklet box in crop coordinates.
             bx0, by0 = cx - w / 2 - x0, cy - h / 2 - y0
             bx1, by1 = cx + w / 2 - x0, cy + h / 2 - y0
             bcx, bcy = cx - x0, cy - y0
-            for c in cands:
-                if c[4] < min_score:
+            for f in faces:
+                if f[4] < min_score:
                     continue
-                ccx, ccy = (c[0] + c[2]) / 2, (c[1] + c[3]) / 2
-                if not ((bx0 <= ccx <= bx1 and by0 <= ccy <= by1)
-                        or (c[0] <= bcx <= c[2] and c[1] <= bcy <= c[3])):
-                    continue
-                if c[4] >= _VERIFY_LONE or _face_backed(c, faces):
-                    accepted += 1
+                fcx, fcy = (f[0] + f[2]) / 2, (f[1] + f[3]) / 2
+                if ((bx0 <= fcx <= bx1 and by0 <= fcy <= by1)
+                        or (f[0] <= bcx <= f[2] and f[1] <= bcy <= f[3])):
+                    verified += 1
                     break
-        if tested == 0 or accepted / tested >= _VERIFY_MIN_FRAC:
+        if tested == 0:
+            _fail_open(t)
+        elif verified / tested >= _VERIFY_MIN_FRAC:
             kept.append(t)
         else:
             dropped.append(t)

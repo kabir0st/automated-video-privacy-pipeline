@@ -23,7 +23,7 @@ from libs.detector import _nms, _unrotate_boxes  # noqa: E402
 from libs.evidence import Ev  # noqa: E402
 from libs.head_tracker import HeadTracker, TrackObs  # noqa: E402
 from libs.tracklets import (PostParams, TrackRecorder, Tracklet,  # noqa: E402
-                            build_table, clean_tracklets, verify_tracklets)
+                            build_table, clean_tracklets)
 
 SHAPE = (720, 1280)
 
@@ -418,90 +418,10 @@ class TestPostprocess:
         assert all(len(f) == 0 for f in table)   # verify verdict is final
 
 
-# ── tracklet verification (cropped re-inference) ────────────────────────────
-
-FRAME = np.zeros((720, 1280, 3), np.uint8)
-
-
-NO_BOXES = np.empty((0, 5), np.float32)
-
-
-def centred_det(score, face_score=0.0):
-    """detect_fn stub: one candidate in the middle of whatever crop it gets —
-    crops are centred on the tracklet box, so this lands inside it. A
-    non-zero ``face_score`` adds face evidence at the same spot."""
-    def detect_fn(crop):
-        h, w = crop.shape[:2]
-        cand = np.array([[w / 2 - 40, h / 2 - 50, w / 2 + 40, h / 2 + 50,
-                          score]], np.float32)
-        faces = (np.array([[w / 2 - 20, h / 2 - 25, w / 2 + 20, h / 2 + 25,
-                            face_score]], np.float32)
-                 if face_score else NO_BOXES)
-        return cand, faces
-    return detect_fn
-
-
-class TestVerifyTracklets:
-    def test_reproducing_tracklet_kept(self):
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets([t], lambda i: FRAME,
-                                         centred_det(0.9))
-        assert len(kept) == 1 and not dropped
-
-    def test_silent_tracklet_dropped(self):
-        """The screenshot bug's kill switch: a long, confident tracklet whose
-        'head' does not re-detect on magnified crops is a hallucination."""
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets(
-            [t], lambda i: FRAME, lambda crop: (NO_BOXES, NO_BOXES))
-        assert not kept and len(dropped) == 1
-
-    def test_low_score_redetection_dropped(self):
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets([t], lambda i: FRAME,
-                                         centred_det(0.3))
-        assert not kept and len(dropped) == 1
-
-    def test_off_target_redetection_dropped(self):
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets(
-            [t], lambda i: FRAME,
-            lambda crop: (np.array([[0, 0, 10, 10, 0.9]], np.float32),
-                          NO_BOXES))
-        assert not kept and len(dropped) == 1
-
-    def test_midscore_faceless_redetection_dropped(self):
-        """The chest-blur kill switch: skin misread as a head *reproduces*
-        under magnification, but only at modest confidence and never with
-        face evidence — below the lone floor it dies."""
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets([t], lambda i: FRAME,
-                                         centred_det(0.55))
-        assert not kept and len(dropped) == 1
-
-    def test_midscore_face_backed_kept(self):
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets([t], lambda i: FRAME,
-                                         centred_det(0.55, face_score=0.4))
-        assert len(kept) == 1 and not dropped
-
-    def test_unreadable_frames_fail_open(self):
-        t = make_tracklet(1, 10, 30)
-        kept, dropped = verify_tracklets([t], lambda i: None,
-                                         centred_det(0.9))
-        assert len(kept) == 1 and not dropped
-
-    def test_only_hit_frames_sampled(self):
-        t = make_tracklet(1, 10, 30)
-        t.hits[10:] = False              # only frames 10..19 are evidence
-        asked: list[int] = []
-
-        def frame_at(idx):
-            asked.append(idx)
-            return FRAME
-
-        verify_tracklets([t], frame_at, centred_det(0.9))
-        assert asked and all(10 <= i < 20 for i in asked)
+# (verify_tracklets/TestVerifyTracklets — the interim single-model verifier —
+# were replaced by tracklets.verify_tracklets_xmodel with the Phase 3
+# cross-model rework; its coverage moved to tests/test_verify_xmodel.py,
+# which tests the replacement directly.)
 
 
 # ── scrfd decode ─────────────────────────────────────────────────────────────

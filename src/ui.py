@@ -69,10 +69,13 @@ from libs.evidence import (PROFILES, Ev, GateDebug, gate_face_candidates,
                            sustain_pool, weak_faces as gate_weak_faces)
 from libs.head_tracker import HeadTracker, TrackObs
 from libs.models import preflight as preflight_models
+from libs.nudenet import NudeNetDetector
 from libs.pose import PersonPose, PoseEstimator
 from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, kps_plausible
+from libs.sidecar import (ReviewDecisions, load as sidecar_load,
+                          save as sidecar_save)
 from libs.tracklets import (PostParams, TrackRecorder, build_table,
-                            clean_tracklets, verify_tracklets)
+                            clean_tracklets, verify_tracklets_xmodel)
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
@@ -338,6 +341,20 @@ class Params:
     blur_layers: tuple[tuple[str, int], ...] = DEFAULT_BLUR_LAYERS
 
 
+# Params fields that change what pass 1 itself records (confidence floors,
+# evidence profile, rotation assist) — the sidecar fingerprint (libs.sidecar)
+# keys on exactly these. Cleanup-only fields (bridge_gap_s, smooth_win_s,
+# min_track_s, face_hold_s, face_gap_bridge_s, mask_*, blur_*) must NOT be
+# added here: a re-export that only changed one of those should still hit
+# the cache and skip pass 1.
+_ANALYSIS_PARAM_KEYS = ("det_conf", "det_conf_low", "min_hits", "max_age_s",
+                       "rot_assist", "evidence_profile")
+
+
+def _analysis_fingerprint_params(p: Params) -> dict:
+    return {k: getattr(p, k) for k in _ANALYSIS_PARAM_KEYS}
+
+
 # ── Presets — curated Params bundles; Advanced exposes every value ───────────
 
 PRESETS: dict[str, tuple[str, Params]] = {
@@ -580,6 +597,10 @@ class ProcessWorker(QThread):
         # gate's anatomical anchor + torso axis. Failure degrades to
         # head-anchor-only gating, never crashes.
         self._pose: Optional[PoseEstimator] = None
+        # Same lifecycle for NudeNet (Phase 3): the independent witness for
+        # cross-model tracklet verification, offline-only — never runs in
+        # the live per-frame path. Failure degrades verify to SCRFD-only.
+        self._nudenet: Optional[NudeNetDetector] = None
         self._blur = BlurPipeline()
         # Preview tracking state persists across sequential frames (Play),
         # so Kalman smoothing/hold is visible live; any scrub/jump resets it.
@@ -711,6 +732,11 @@ class ProcessWorker(QThread):
         if self._pose is None:
             self._pose = PoseEstimator(on_status=self.status.emit)
         return self._pose
+
+    def _ensure_nudenet(self) -> NudeNetDetector:
+        if self._nudenet is None:
+            self._nudenet = NudeNetDetector(on_status=self.status.emit)
+        return self._nudenet
 
     @staticmethod
     def _display_copy(frame: np.ndarray) -> np.ndarray:
@@ -902,42 +928,44 @@ class ProcessWorker(QThread):
 
     def _make_verifier(self, input_path: str, p: Params):
         """Build the ``verify=`` hook for clean_tracklets: cropped
-        re-inference. Seeks back into the source and re-runs the *same*
-        evidence gate on a magnified crop around every tracklet that
-        survived the prune (see tracklets.verify_tracklets) — a real face
-        re-earns its anatomical/part evidence when magnified; a
-        skin/fabric hallucination usually doesn't. Returns None —
-        verification off, fail open — when the detector is down or the
-        source can't be reopened. (Interim, single-model verifier — Phase 3
-        adds an independent cross-model version.)
+        re-inference against an INDEPENDENT model (SCRFD and/or NudeNet —
+        never the primary Wholebody17 detector that fed the evidence gate
+        and produced the tracklet in the first place, see tracklets.
+        verify_tracklets_xmodel). A real face re-earns an independent
+        witness's confidence when magnified; a skin/fabric hallucination
+        usually doesn't, and it can no longer confirm itself by re-running
+        the same model that hallucinated it.
+
+        Always returns a working ``verify()`` closure: even when every
+        independent model is unavailable or the source can't be reopened,
+        it still applies the evidence-grade fail-open bar
+        (``thr.verify_fail_open_grades``) instead of trusting every
+        tracklet unconditionally, which is what the interim Phase 1
+        verifier did on a hard failure.
         """
-        det = self._detector
-        if det is None or not det.available:
-            return None
-        cap = cv2.VideoCapture(input_path)
-        if not cap.isOpened():
-            return None
-        rots = (0, 90, 270) if p.rot_assist else (0,)
         thr = PROFILES.get(p.evidence_profile, PROFILES["balanced"])
+        scrfd = self._ensure_scrfd()
+        nudenet = self._ensure_nudenet()
+        cap = cv2.VideoCapture(input_path)
+        cap_ok = cap.isOpened()
 
         def frame_at(idx: int) -> Optional[np.ndarray]:
+            if not cap_ok:
+                return None
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ok, frame = cap.read()
             return frame if ok else None
 
-        def detect_fn(crop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-            d = det.detect(crop, rotations=rots)
-            sboxes, skps = self._ensure_scrfd().detect_full(
-                crop, floor=WITNESS_FLOOR)
-            scrfd_ok = sboxes[kps_plausible(skps)]
-            poses = self._ensure_pose().estimate(crop, d.bodies)
-            accepted, _dbg = gate_face_candidates(
-                d, poses, scrfd_ok, crop.shape[:2], thr, p.det_conf)
-            if not accepted:
-                _empty = np.empty((0, 5), np.float32)
-                return _empty, _empty
-            return (np.stack([c.anchor for c in accepted]),
-                    np.stack([c.face for c in accepted]))
+        def witness_fn(crop: np.ndarray) -> np.ndarray:
+            parts = []
+            sboxes, skps = scrfd.detect_full(crop, floor=WITNESS_FLOOR)
+            if len(sboxes):
+                parts.append(sboxes[kps_plausible(skps)])
+            nfaces = nudenet.detect_faces(crop)
+            if len(nfaces):
+                parts.append(nfaces)
+            return (np.concatenate(parts) if parts
+                    else np.empty((0, 5), np.float32))
 
         def verify(tracklets: list) -> list:
             try:
@@ -945,8 +973,16 @@ class ProcessWorker(QThread):
                     return tracklets
                 self.status.emit(
                     f"Verifying {len(tracklets)} tracklet(s)…")
-                kept, dropped = verify_tracklets(
-                    tracklets, frame_at, detect_fn)
+                # Resolve availability with a cheap dummy probe before
+                # deciding whether the verifier can run at all — see
+                # verify_tracklets_xmodel's witness_fn=None fail-open path.
+                dummy = np.zeros((64, 64, 3), np.uint8)
+                scrfd.detect_full(dummy, floor=WITNESS_FLOOR)
+                nudenet.detect_faces(dummy)
+                have_witness = bool(scrfd.available) or bool(nudenet.available)
+                wf = witness_fn if (cap_ok and have_witness) else None
+                kept, dropped = verify_tracklets_xmodel(
+                    tracklets, frame_at, wf, thr)
                 if dropped:
                     msg = (f"verify: rejected {len(dropped)}/"
                            f"{len(tracklets)} tracklet(s) as false "
@@ -1181,7 +1217,14 @@ class ProcessWorker(QThread):
         The offline pass is what makes the output steady: false positives are
         pruned with hindsight, detection gaps are interpolated along the head's
         path instead of held or dropped, and zero-phase smoothing removes
-        jitter without lag."""
+        jitter without lag.
+
+        Pass 1 is skipped entirely when a sidecar (libs.sidecar) from a prior
+        export of this exact file, with these exact analysis-affecting
+        params, is found next to the source — the expensive detect/pose/gate
+        loop only ever needs to run once per (file, analysis-params) pair;
+        a cleanup-only re-export (bridge/smooth/hold tweaks) then replays
+        instantly from the cached raw tracklets."""
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             self.export_finished.emit(False, f"Cannot open: {input_path}")
@@ -1201,28 +1244,44 @@ class ProcessWorker(QThread):
         fh, fw = frame0.shape[:2]
 
         p0 = self._latest_params()
-        tracker = HeadTracker(fps=fps, det_conf=p0.det_conf,
-                              det_conf_low=p0.det_conf_low,
-                              min_hits=p0.min_hits, max_age_s=p0.max_age_s)
-        recorder = TrackRecorder()
-        self.status.emit("Pass 1/2 — analysing…")
-        n1, cancelled = self._analyse_pass(cap, frame0, total, tracker,
-                                           recorder, fps)
-        cap.release()
-        if cancelled:
-            self.export_finished.emit(
-                False, "Cancelled during analysis — nothing written")
-            return
-        if n1 == 0:
-            self.export_finished.emit(False, "No frames decoded")
-            return
+        analysis_params = _analysis_fingerprint_params(p0)
+        cached = sidecar_load(input_path, analysis_params)
+        if cached is not None:
+            cap.release()
+            fps, n1, raw, _review = cached
+            self.status.emit(
+                f"Sidecar hit — skipping pass 1/2 "
+                f"({len(raw)} cached tracklet(s))")
+            self.export_progress.emit(1, n1, n1)
+        else:
+            tracker = HeadTracker(fps=fps, det_conf=p0.det_conf,
+                                  det_conf_low=p0.det_conf_low,
+                                  min_hits=p0.min_hits, max_age_s=p0.max_age_s)
+            recorder = TrackRecorder()
+            self.status.emit("Pass 1/2 — analysing…")
+            n1, cancelled = self._analyse_pass(cap, frame0, total, tracker,
+                                               recorder, fps)
+            cap.release()
+            if cancelled:
+                self.export_finished.emit(
+                    False, "Cancelled during analysis — nothing written")
+                return
+            if n1 == 0:
+                self.export_finished.emit(False, "No frames decoded")
+                return
+            raw = recorder.finalize()
+            try:
+                sidecar_save(input_path, fps=fps, n_frames=n1,
+                            analysis_params=analysis_params, tracklets=raw,
+                            review=ReviewDecisions())
+            except OSError as exc:  # noqa: BLE001 — caching is best-effort
+                debug_log(f"sidecar save failed, continuing without it: {exc!r}")
 
         # Offline tracklet cleanup between the passes (fast, pure numpy,
         # composite ledger-aware prune, plus the cropped re-inference
         # verification pass — see _make_verifier — which is what kills
         # persistent hallucinations).
         p = self._latest_params()
-        raw = recorder.finalize()
         kept, rejected = clean_tracklets(
             raw, fps=fps, n_frames=n1,
             p=PostParams(det_conf=p.det_conf, min_hits=p.min_hits,
