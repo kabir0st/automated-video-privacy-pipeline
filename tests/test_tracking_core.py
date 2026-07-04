@@ -19,12 +19,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from libs.detector import (Detections, filter_orphan_faces,  # noqa: E402
-                           fuse_heads, suppress_shadow_heads, _nms,
-                           _unrotate_boxes)
+from libs.detector import _nms, _unrotate_boxes  # noqa: E402
+from libs.evidence import Ev  # noqa: E402
 from libs.head_tracker import HeadTracker, TrackObs  # noqa: E402
 from libs.tracklets import (PostParams, TrackRecorder, Tracklet,  # noqa: E402
-                            postprocess, verify_tracklets)
+                            build_table, clean_tracklets, verify_tracklets)
 
 SHAPE = (720, 1280)
 
@@ -34,28 +33,10 @@ def det(x, y, w=100, h=120, score=0.9):
 
 
 # ── detector post-processing ────────────────────────────────────────────────
-
-class TestFuseHeads:
-    def test_face_inside_head_is_not_duplicated(self):
-        d = Detections(heads=np.array([det(100, 100)]),
-                       faces=np.array([det(120, 130, 50, 60)]))
-        assert len(fuse_heads(d)) == 1
-
-    def test_orphan_face_grows_pseudo_head(self):
-        d = Detections(heads=np.array([det(100, 100)]),
-                       faces=np.array([det(800, 400, 50, 60)]))
-        fused = fuse_heads(d)
-        assert len(fused) == 2
-        pseudo = fused[1]
-        fw, fh = pseudo[2] - pseudo[0], pseudo[3] - pseudo[1]
-        assert fw == pytest.approx(50 * 1.7, rel=0.01)
-        assert fh == pytest.approx(60 * 1.9, rel=0.01)
-        # centre shifted up relative to the face centre
-        assert (pseudo[1] + pseudo[3]) / 2 < 400 + 30
-
-    def test_no_faces_passthrough(self):
-        d = Detections(heads=np.array([det(0, 0)]))
-        assert len(fuse_heads(d)) == 1
+# (fuse_heads/filter_orphan_faces/suppress_shadow_heads and their pseudo-head
+# machinery were removed with the evidence-gated rework; the scenarios below
+# move into TestGateFaceCandidates in tests/test_evidence.py, which tests the
+# replacement directly.)
 
 
 class TestRotations:
@@ -163,80 +144,6 @@ class TestRotations:
         assert len(out) == 0
 
 
-def no_witnesses():
-    return np.empty((0, 5), np.float32)
-
-
-def never_called():
-    raise AssertionError("lazy witness fn consulted when it must not be")
-
-
-class TestFilterOrphanFaces:
-    """A primary face with no covering head grows a pseudo-head (= blur);
-    on bare skin the face class misreads, so orphans need SCRFD agreement."""
-
-    def test_covered_face_passes_without_witness_pass(self):
-        heads = det(100, 100)[None]
-        faces = det(120, 130, 50, 60, 0.6)[None]        # inside the head
-        out = filter_orphan_faces(faces, heads, never_called)
-        assert len(out) == 1
-
-    def test_orphan_with_scrfd_agreement_kept(self):
-        faces = det(500, 200, 80, 90, 0.6)[None]
-        witness = det(505, 205, 70, 80, 0.35)[None]     # SCRFD sees it too
-        out = filter_orphan_faces(faces, np.empty((0, 5), np.float32),
-                                  lambda: witness)
-        assert len(out) == 1
-
-    def test_orphan_without_agreement_dies(self):
-        # The chest-blur case, face-class flavour: skin misread as a face
-        # with nothing face-like there for SCRFD at any angle.
-        faces = det(500, 200, 80, 90, 0.7)[None]
-        out = filter_orphan_faces(faces, np.empty((0, 5), np.float32),
-                                  no_witnesses)
-        assert len(out) == 0
-
-
-class TestSuppressShadowHeads:
-    """One head per body where a face pins it down — and never anywhere
-    else, because two entangled people can merge into one body box."""
-
-    BODY = det(100, 300, 700, 250, 0.8)[None]           # lying, wide box
-    REAL = det(110, 320, 100, 120, 0.85)                # head at left end
-    FACE = det(120, 330, 60, 70, 0.6)[None]             # inside REAL
-    FAKE = det(400, 380, 120, 130, 0.55)                # chest, mid-body
-
-    def test_chest_fake_dropped_next_to_face_backed_head(self):
-        heads = np.stack([self.REAL, self.FAKE])
-        out = suppress_shadow_heads(heads, self.BODY, lambda: self.FACE)
-        assert len(out) == 1
-        assert out[0, 4] == pytest.approx(0.85)
-
-    def test_faceless_body_never_arbitrated(self):
-        # Entangled couple in one body box: neither head shows a face —
-        # the partner's back-of-head must survive.
-        heads = np.stack([self.REAL, self.FAKE])
-        out = suppress_shadow_heads(heads, self.BODY, no_witnesses)
-        assert len(out) == 2
-
-    def test_strong_rival_never_dropped(self):
-        strong = self.FAKE.copy()
-        strong[4] = 0.75                                # above the cap
-        heads = np.stack([self.REAL, strong])
-        out = suppress_shadow_heads(heads, self.BODY, lambda: self.FACE)
-        assert len(out) == 2
-
-    def test_rival_outside_every_body_untouched(self):
-        outside = det(900, 100, 120, 130, 0.55)         # not in any body
-        heads = np.stack([self.REAL, outside])
-        out = suppress_shadow_heads(heads, self.BODY, lambda: self.FACE)
-        assert len(out) == 2
-
-    def test_single_claim_skips_the_face_pass(self):
-        out = suppress_shadow_heads(self.REAL[None], self.BODY, never_called)
-        assert len(out) == 1
-
-
 # ── tracker ─────────────────────────────────────────────────────────────────
 
 def run_frames(tracker, frames):
@@ -320,15 +227,52 @@ class TestHeadTracker:
         # prediction keeps moving right instead of freezing
         assert outs2[-1][0].box[0] > x_last_hit + 10
 
+    def test_face_box_remembered_and_rides_head_motion(self):
+        """The face-only blur anchor: a matched face is stored relative to
+        the head box, so it translates with the track between face frames
+        instead of freezing at its last absolute position."""
+        tr = HeadTracker(min_hits=1)
+        head = det(100, 100)                       # 100×120 head
+        face = det(120, 130, 50, 60, 0.7)          # inside the head
+        obs = tr.update(head[None], SHAPE, faces=face[None])
+        o = obs[0]
+        assert o.face_age == 0
+        np.testing.assert_allclose(o.face_box, face[:4], atol=1.5)
+        # head moves right, no face evidence this frame
+        moved = det(140, 100)
+        o2 = tr.update(moved[None], SHAPE, faces=None)[0]
+        assert o2.face_age == 1
+        # face box translated with the head (~+40 px, KF-smoothed)
+        assert o2.face_box[0] > o.face_box[0] + 10
+
+    def test_no_face_evidence_gives_no_face_box(self):
+        tr = HeadTracker(min_hits=1)
+        o = tr.update(det(100, 100)[None], SHAPE)[0]
+        assert o.face_box is None
+        # a face elsewhere in the frame must not attach to this track
+        far_face = det(900, 500, 50, 60, 0.9)
+        o = tr.update(det(100, 100)[None], SHAPE, faces=far_face[None])[0]
+        assert o.face_box is None
+        assert o.face_age > 0
+
 
 # ── offline cleanup ─────────────────────────────────────────────────────────
 
+# Default evidence for synthetic tracklets: strong enough to clear the
+# ledger (grade "A"/"B") so these tests exercise length/score/bridge/smooth
+# behavior in isolation from the evidence dimension (covered separately by
+# test_evidence_free_tracklet_pruned below and tests/test_ledger.py).
+_GOOD_EV = int(Ev.HEAD_ANCHOR | Ev.PART_EYE_HIT)
+
+
 def make_tracklet(tid, start, n, x0=100.0, vx=0.0, score=0.9, w=100.0,
-                  h=120.0):
+                  h=120.0, ev=_GOOD_EV, fvalid=True):
     boxes = np.stack([np.array([x0 + vx * i, 200.0, w, h], np.float32)
                       for i in range(n)])
     return Tracklet(tid, start, boxes,
-                    np.full(n, score, np.float32), np.ones(n, bool))
+                    np.full(n, score, np.float32), np.ones(n, bool),
+                    ev=np.full(n, ev, np.uint32),
+                    fvalid=np.full(n, fvalid, bool))
 
 
 PP = PostParams(det_conf=0.5, min_hits=3, min_track_s=0.25,
@@ -338,18 +282,32 @@ PP = PostParams(det_conf=0.5, min_hits=3, min_track_s=0.25,
 class TestPostprocess:
     def test_short_tracklet_pruned(self):
         t = make_tracklet(1, 10, 3)     # 3 frames < 0.25s @ 30fps
-        table = postprocess([t], fps=30, n_frames=100, p=PP)
+        kept, _ = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        table = build_table(kept, 100)
         assert all(len(f) == 0 for f in table)
 
     def test_low_confidence_pruned(self):
         t = make_tracklet(1, 10, 30, score=0.3)
-        table = postprocess([t], fps=30, n_frames=100, p=PP)
+        kept, _ = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        table = build_table(kept, 100)
         assert all(len(f) == 0 for f in table)
+
+    def test_evidence_free_tracklet_pruned(self):
+        """The core ledger promise: long, confident and reproducing every
+        frame — the sock/skin-misread signature — is rejected once it never
+        earns real anatomical/part evidence, even though it clears every
+        length/score/hit-ratio gate a score-and-length-only prune would
+        apply."""
+        t = make_tracklet(1, 10, 30, ev=0)
+        kept, rejected = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        assert len(kept) == 0
+        assert len(rejected) == 1 and rejected[0].grade == "C"
 
     def test_coasted_tail_trimmed(self):
         t = make_tracklet(1, 10, 30)
         t.hits[-10:] = False            # coasted tail
-        table = postprocess([t], fps=30, n_frames=100, p=PP)
+        kept, _ = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        table = build_table(kept, 100)
         ext = round(0.12 * 30)
         last = max(i for i, f in enumerate(table) if f)
         assert last == 10 + 19 + ext    # last hit + extension, not the tail
@@ -357,7 +315,8 @@ class TestPostprocess:
     def test_clean_gap_bridged_and_interpolated(self):
         a = make_tracklet(1, 0, 30, x0=100, vx=2)
         b = make_tracklet(2, 50, 30, x0=100 + 2 * 50, vx=2)
-        table = postprocess([a, b], fps=30, n_frames=120, p=PP)
+        kept, _ = clean_tracklets([a, b], fps=30, n_frames=120, p=PP)
+        table = build_table(kept, 120)
         # gap frames are covered
         assert all(table[f] for f in range(30, 50))
         # and interpolation moves along the path, not held static
@@ -370,18 +329,20 @@ class TestPostprocess:
         b = make_tracklet(2, 50, 30, x0=100)
         # third head sits exactly on the corridor during the gap
         c = make_tracklet(3, 30, 20, x0=100)
-        table = postprocess([a, b, c], fps=30, n_frames=120, p=PP)
+        kept, _ = clean_tracklets([a, b, c], fps=30, n_frames=120, p=PP)
+        table = build_table(kept, 120)
         ext = round(0.12 * 30)
         # frames between a's end(+ext) and c's start must stay unbridged
         for f in range(29 + ext + 1, 30):
-            for tid, _ in table[f]:
+            for tid, *_ in table[f]:
                 assert tid != 1
 
     def test_ambiguous_bridge_refused(self):
         a = make_tracklet(1, 0, 30, x0=100)
         b1 = make_tracklet(2, 40, 30, x0=105)
         b2 = make_tracklet(3, 40, 30, x0=110)
-        table = postprocess([a, b1, b2], fps=30, n_frames=120, p=PP)
+        kept, _ = clean_tracklets([a, b1, b2], fps=30, n_frames=120, p=PP)
+        table = build_table(kept, 120)
         # gap frames (with margin for the end-extension) stay empty
         ext = round(0.12 * 30)
         for f in range(30 + ext, 40 - ext):
@@ -390,7 +351,8 @@ class TestPostprocess:
     def test_smoothing_is_continuous_at_seam(self):
         a = make_tracklet(1, 0, 30, x0=100, vx=2)
         b = make_tracklet(2, 40, 30, x0=190, vx=2)
-        table = postprocess([a, b], fps=30, n_frames=120, p=PP)
+        kept, _ = clean_tracklets([a, b], fps=30, n_frames=120, p=PP)
+        table = build_table(kept, 120)
         xs = [(f[0][1][0] + f[0][1][2]) / 2 for f in table if f]
         jumps = np.abs(np.diff(xs))
         assert jumps.max() < 15        # no teleporting at the bridge seam
@@ -405,6 +367,40 @@ class TestPostprocess:
         ts = rec.finalize()
         assert len(ts) == 1
         assert len(ts[0].boxes) == 4    # padded to stay contiguous
+        assert len(ts[0].fboxes) == 4   # face channel padded in lockstep
+        assert len(ts[0].ev) == 4       # evidence channel padded too
+        assert len(ts[0].fvalid) == 4
+
+    def test_face_channel_recorded_and_emitted(self):
+        """The face-target channel travels recorder → clean_tracklets →
+        build_table alongside the head channel and stays distinct from it."""
+        rec = TrackRecorder()
+        head = np.array([100, 100, 200, 220], np.float32)
+        face = np.array([120, 130, 170, 190], np.float32)
+        obs = [TrackObs(1, head, 0.9, True, True, 0)]
+        for f in range(30):
+            rec.observe(f, obs, face_boxes=[face], face_valid=[True],
+                       ev_flags=[_GOOD_EV])
+        kept, _ = clean_tracklets(rec.finalize(), fps=30, n_frames=60, p=PP)
+        table = build_table(kept, 60)
+        frames = [f for f in table if f]
+        assert frames
+        tid, hb, fb, ok = frames[len(frames) // 2][0]
+        np.testing.assert_allclose(hb, head, atol=1.0)
+        np.testing.assert_allclose(fb, face, atol=1.0)
+        assert ok
+
+    def test_face_channel_defaults_to_head(self):
+        rec = TrackRecorder()
+        head = np.array([100, 100, 200, 220], np.float32)
+        obs = [TrackObs(1, head, 0.9, True, True, 0)]
+        for f in range(30):
+            rec.observe(f, obs, ev_flags=[_GOOD_EV])  # no face_boxes given
+        kept, _ = clean_tracklets(rec.finalize(), fps=30, n_frames=60, p=PP)
+        table = build_table(kept, 60)
+        frames = [f for f in table if f]
+        _tid, hb, fb, _ok = frames[len(frames) // 2][0]
+        np.testing.assert_allclose(fb, hb, atol=1e-3)
 
     def test_verify_hook_runs_after_prune_and_is_final(self):
         good = make_tracklet(1, 10, 30)
@@ -415,8 +411,9 @@ class TestPostprocess:
             seen.extend(t.tid for t in ts)
             return []                            # reject everything
 
-        table = postprocess([good, noise], fps=30, n_frames=100, p=PP,
-                            verify=verify)
+        kept, _ = clean_tracklets([good, noise], fps=30, n_frames=100, p=PP,
+                                  verify=verify)
+        table = build_table(kept, 100)
         assert seen == [1]                       # prune ran first
         assert all(len(f) == 0 for f in table)   # verify verdict is final
 
@@ -511,15 +508,16 @@ class TestVerifyTracklets:
 
 class TestScrfdDecode:
     @staticmethod
-    def _zero_outs(hw=(640, 640)):
+    def _zero_outs(hw=(640, 640), with_kps=False):
         from libs.scrfd import _ANCHORS_PER_CELL, _STRIDES
         h, w = hw
-        scores, bboxes = [], []
+        scores, bboxes, kpss = [], [], []
         for s in _STRIDES:
             n = (h // s) * (w // s) * _ANCHORS_PER_CELL
             scores.append(np.zeros((n, 1), np.float32))
             bboxes.append(np.zeros((n, 4), np.float32))
-        return scores, bboxes
+            kpss.append(np.zeros((n, 10), np.float32))
+        return (scores, bboxes, kpss) if with_kps else (scores, bboxes)
 
     def test_synthetic_single_face(self):
         from libs.scrfd import _ANCHORS_PER_CELL, _decode
@@ -540,6 +538,66 @@ class TestScrfdDecode:
         scores, bboxes = self._zero_outs()
         out = _decode(scores + bboxes, (640, 640), 0.5)
         assert out.shape == (0, 5)
+
+    def test_kps_decoded_when_exported(self):
+        from libs.scrfd import _ANCHORS_PER_CELL, _decode
+        scores, bboxes, kpss = self._zero_outs(with_kps=True)
+        stride, row, col = 16, 10, 5
+        flat = (row * (640 // stride) + col) * _ANCHORS_PER_CELL
+        scores[1][flat] = 0.8
+        bboxes[1][flat] = [2.0, 3.0, 4.0, 5.0]
+        # left eye offset (−1, −2) stride units from the anchor centre
+        kpss[1][flat, 0:2] = [-1.0, -2.0]
+        out = _decode(scores + bboxes + kpss, (640, 640), 0.5)
+        assert out.shape == (1, 15)
+        cx, cy = col * stride, row * stride
+        assert out[0, 5] == pytest.approx(cx - 16)
+        assert out[0, 6] == pytest.approx(cy - 32)
+
+
+class TestKpsPlausible:
+    """The landmark face-ness gate: real layouts pass at any rotation,
+    degenerate/scattered ones (skin, socks, fabric folds) die."""
+
+    # A plausible frontal face: eyes level, nose centred, mouth below.
+    FACE = np.array([[30, 30], [70, 30], [50, 55], [35, 75], [65, 75]],
+                    np.float32)
+
+    @staticmethod
+    def _rot90(kps):
+        return np.stack([kps[:, 1], -kps[:, 0]], axis=1)
+
+    def test_frontal_face_passes(self):
+        from libs.scrfd import kps_plausible
+        assert kps_plausible(self.FACE[None]).all()
+
+    def test_rotation_invariant(self):
+        # Lying-down and upside-down faces are the norm in this footage.
+        from libs.scrfd import kps_plausible
+        k = self.FACE
+        for _ in range(3):
+            k = self._rot90(k)
+            assert kps_plausible(k[None]).all()
+
+    def test_degenerate_cluster_rejected(self):
+        # All five points collapsed — the classic misread signature.
+        from libs.scrfd import kps_plausible
+        k = np.full((1, 5, 2), 50.0, np.float32) \
+            + np.random.default_rng(0).normal(0, 0.3, (1, 5, 2))
+        assert not kps_plausible(k).any()
+
+    def test_collinear_smear_rejected(self):
+        # Eyes/nose/mouth on one line — a fold or edge, not a face.
+        from libs.scrfd import kps_plausible
+        k = np.array([[[10, 10], [20, 20], [30, 30], [40, 40], [50, 50]]],
+                     np.float32)
+        assert not kps_plausible(k).any()
+
+    def test_nan_fails_open(self):
+        # A model without landmark outputs must not veto anything.
+        from libs.scrfd import kps_plausible
+        k = np.full((1, 5, 2), np.nan, np.float32)
+        assert kps_plausible(k).all()
 
 
 class TestCloseupFilter:

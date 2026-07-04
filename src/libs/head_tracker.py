@@ -1,7 +1,12 @@
-"""Kalman head tracker with BYTE-style two-stage association.
+"""Kalman tracker, BYTE-style two-stage association — over face-anchored
+tracks.
 
-Replaces the greedy IoU/static-hold SubjectTracker. Three properties the old
-tracker lacked, each mapped to a failure it caused:
+Tracks are driven by gated face candidates (libs/evidence.gate_face_candidates)
+via their head-scale *anchor* box (a covering head/pose box, or a face grown
+to head proportions); the anchor is Kalman motion food, never a blur target
+by itself — only a track with real face evidence behind it renders. Three
+properties this tracker has that a plain greedy/static-hold tracker lacks,
+each mapped to a failure it caused:
 
   * **Motion model** — a constant-velocity Kalman filter per track. A lost
     head coasts *along its trajectory* instead of freezing in place (the old
@@ -63,6 +68,15 @@ class TrackObs(NamedTuple):
     confirmed: bool
     coast_frames: int        # consecutive frames without a detection
     face_age: int = FACE_NEVER   # frames since face evidence matched this track
+    # Last matched face box, xyxy in frame coords, re-anchored to the current
+    # head box every frame (it is stored relative to the head box, so it rides
+    # the Kalman motion between face detections). None until a face matches;
+    # check ``face_age`` for freshness before trusting it.
+    face_box: "np.ndarray | None" = None
+    # Ev bits (libs/evidence.py) of the candidate that drove this frame's
+    # hit; 0 on a coast or a sustain-pool (ungated) hit. Feeds the offline
+    # evidence ledger — see libs/tracklets.clean_tracklets.
+    flags: int = 0
 
 
 class _KalmanBox:
@@ -148,7 +162,8 @@ def _hungarian(cost: np.ndarray, gate: np.ndarray) -> list[tuple[int, int]]:
 
 
 class _Track:
-    def __init__(self, tid: int, det: np.ndarray, min_hits: int) -> None:
+    def __init__(self, tid: int, det: np.ndarray, min_hits: int,
+                flags: int = 0) -> None:
         self.id = tid
         self.kf = _KalmanBox(_to_z(det))
         self.hits = 1
@@ -156,14 +171,20 @@ class _Track:
         self.confirmed = min_hits <= 1
         self.last_score = float(det[4])
         self.hit = True
+        self.last_flags = flags
         self.face_age = FACE_NEVER
+        # Last matched face box relative to the head box (x1, y1, x2, y2 as
+        # fractions of the box), so it follows the Kalman motion between
+        # face detections instead of freezing at a stale absolute position.
+        self.face_rel: np.ndarray | None = None
 
-    def mark_hit(self, det: np.ndarray, min_hits: int) -> None:
+    def mark_hit(self, det: np.ndarray, min_hits: int, flags: int = 0) -> None:
         self.kf.update(_to_z(det))
         self.hits += 1
         self.coast_frames = 0
         self.last_score = float(det[4])
         self.hit = True
+        self.last_flags = flags
         if self.hits >= min_hits:
             self.confirmed = True
 
@@ -172,6 +193,7 @@ class _Track:
         self.coast_frames += 1
         self.last_score = 0.0
         self.hit = False
+        self.last_flags = 0
 
 
 class HeadTracker:
@@ -216,24 +238,62 @@ class HeadTracker:
     def _max_age(self) -> int:
         return max(1, int(round(self.max_age_s * self._fps)))
 
-    def update(self, heads: np.ndarray, frame_shape: tuple,
-               faces: np.ndarray | None = None) -> list[TrackObs]:
-        """Advance one frame with (N,5) head candidates; return live tracks.
+    def update(self, cands: np.ndarray, frame_shape: tuple,
+               faces: np.ndarray | None = None,
+               flags: np.ndarray | None = None,
+               sustain: np.ndarray | None = None,
+               weak_faces: np.ndarray | None = None) -> list[TrackObs]:
+        """Advance one frame with (N,5) gated face-anchor candidates; return
+        live tracks.
 
-        ``faces`` is optional (N,5) face *evidence* in the same frame — each
-        track's ``face_age`` resets to 0 when a face lands on its box this
-        frame, and ages by 1 otherwise (including when no evidence was
-        collected at all)."""
+        ``cands`` (xyxy + face score) come from
+        ``libs.evidence.gate_face_candidates`` and are the *only* thing that
+        may spawn or drive a track — a candidate scoring at or above
+        ``det_conf`` may do either; one scoring in ``[det_conf_low,
+        det_conf)`` may only sustain (BYTE stage 2). ``flags`` (N,) are each
+        candidate's ``Ev`` bits (see libs/evidence.py), aligned 1:1 with
+        ``cands``, stored on the matching track and surfaced as
+        ``TrackObs.flags`` for the offline evidence ledger.
+
+        ``sustain`` is a *separate* pool of ungated low-score boxes
+        (``libs.evidence.sustain_pool``, veto-passed but not gated) that may
+        also sustain — never spawn — a track through a confidence dip; it
+        carries no flags (an ungated hit contributes no ledger evidence).
+
+        ``faces``/``weak_faces`` are flat face-box pools, spatially matched
+        against each track's *current* box after this frame's position
+        updates (not index-aligned with ``cands`` — a track's box already
+        tells us where to look). ``faces`` is this frame's own gated
+        candidates' face boxes and may refresh any track, confirmed or not;
+        ``weak_faces`` is raw, ungated face-ish evidence and only refreshes
+        already-*confirmed* tracks — an established track's own identity is
+        what makes that weaker evidence trustworthy there. Either match
+        resets ``face_age`` to 0 and stores the face box relative to the
+        head box, so it rides the Kalman motion between face detections.
+        """
         fh, fw = frame_shape[:2]
-        heads = np.asarray(heads, dtype=np.float32).reshape(-1, 5)
+        cands = np.asarray(cands, dtype=np.float32).reshape(-1, 5)
+        cand_flags = (np.zeros(len(cands), dtype=np.int64) if flags is None
+                     else np.asarray(flags, dtype=np.int64).reshape(-1))
+        sustain = (np.empty((0, 5), np.float32) if sustain is None
+                  else np.asarray(sustain, dtype=np.float32).reshape(-1, 5))
 
         for t in self._tracks:
             t.kf.predict()
             t.face_age = min(t.face_age + 1, FACE_NEVER)
 
-        high = heads[heads[:, 4] >= self.det_conf]
-        low = heads[(heads[:, 4] >= self.det_conf_low)
-                    & (heads[:, 4] < self.det_conf)]
+        high_mask = cands[:, 4] >= self.det_conf
+        high, high_flags = cands[high_mask], cand_flags[high_mask]
+
+        low_mask = (cands[:, 4] >= self.det_conf_low) & ~high_mask
+        low_gated, low_gated_flags = cands[low_mask], cand_flags[low_mask]
+        if len(sustain):
+            s_mask = ((sustain[:, 4] >= self.det_conf_low)
+                     & (sustain[:, 4] < self.det_conf))
+            sustain = sustain[s_mask]
+        low = np.concatenate([low_gated, sustain])
+        low_flags = np.concatenate(
+            [low_gated_flags, np.zeros(len(sustain), dtype=np.int64)])
 
         track_boxes = np.array([t.kf.box for t in self._tracks],
                                dtype=np.float32).reshape(-1, 4)
@@ -241,26 +301,29 @@ class HeadTracker:
         matched_t: set[int] = set()
         matched_d: set[int] = set()
 
-        # Stage 1 — every live track × high-score detections, IoU-gated.
+        # Stage 1 — every live track × high-score candidates, IoU-gated.
         ious = _iou_matrix(track_boxes, high[:, :4])
         for ti, di in _hungarian(1.0 - ious, ious >= _IOU_GATE_HIGH):
-            self._tracks[ti].mark_hit(high[di], self.min_hits)
+            self._tracks[ti].mark_hit(high[di], self.min_hits,
+                                      int(high_flags[di]))
             matched_t.add(ti)
             matched_d.add(di)
 
-        # Stage 2 (BYTE) — leftover recently-alive tracks × low-score dets.
-        # Stricter IoU: a low det may sustain a track, never yank it far.
+        # Stage 2 (BYTE) — leftover recently-alive tracks × low-score pool
+        # (gated candidates below det_conf, unioned with the ungated sustain
+        # pool). Stricter IoU: a low hit may sustain a track, never yank it.
         rem_t = [i for i in range(len(self._tracks))
                  if i not in matched_t and self._tracks[i].coast_frames <= 3]
         if rem_t and len(low):
             boxes_t = track_boxes[rem_t]
             ious = _iou_matrix(boxes_t, low[:, :4])
             for ri, di in _hungarian(1.0 - ious, ious >= _IOU_GATE_LOW):
-                self._tracks[rem_t[ri]].mark_hit(low[di], self.min_hits)
+                self._tracks[rem_t[ri]].mark_hit(low[di], self.min_hits,
+                                                 int(low_flags[di]))
                 matched_t.add(rem_t[ri])
 
         # Stage 3 — fast motion: IoU already zero, so match unmatched
-        # *confirmed* tracks to leftover high dets by normalised centre
+        # *confirmed* tracks to leftover high candidates by normalised centre
         # distance, with a size-similarity gate. Hungarian keeps two close
         # heads from stealing each other's detection.
         rem_t = [i for i in range(len(self._tracks))
@@ -284,7 +347,8 @@ class HeadTracker:
                     cost[a, b] = dist
                     gate[a, b] = dist < _CENTRE_GATE and ok_w and ok_h
             for a, b in _hungarian(cost, gate):
-                self._tracks[rem_t[a]].mark_hit(high[rem_d[b]], self.min_hits)
+                self._tracks[rem_t[a]].mark_hit(high[rem_d[b]], self.min_hits,
+                                                int(high_flags[rem_d[b]]))
                 matched_t.add(rem_t[a])
                 matched_d.add(rem_d[b])
 
@@ -306,32 +370,61 @@ class HeadTracker:
             survivors.append(t)
         self._tracks = survivors
 
-        # Births — only leftover *high* detections confident enough to spawn.
-        spawn_thr = min(self.det_conf + 0.10, 0.95)
+        # Births — every leftover high candidate is already gated (see the
+        # docstring); det_conf is the sole spawn bar now — the evidence gate
+        # replaced the old score-margin's job of keeping noise from spawning.
         for di in range(len(high)):
             if di in matched_d or len(self._tracks) >= self._max_tracks:
                 continue
-            if high[di, 4] >= spawn_thr:
-                self._tracks.append(
-                    _Track(self._next_id, high[di], self.min_hits))
-                self._next_id += 1
+            self._tracks.append(
+                _Track(self._next_id, high[di], self.min_hits,
+                      int(high_flags[di])))
+            self._next_id += 1
 
-        # Face evidence → per-track memory (newborn tracks included).
-        if faces is not None:
-            faces = np.asarray(faces, dtype=np.float32).reshape(-1, 5)
-            if len(faces):
-                fcx = (faces[:, 0] + faces[:, 2]) / 2
-                fcy = (faces[:, 1] + faces[:, 3]) / 2
-                for t in self._tracks:
-                    b = t.kf.box
-                    bcx, bcy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-                    in_t = ((b[0] <= fcx) & (fcx <= b[2])
-                            & (b[1] <= fcy) & (fcy <= b[3]))
-                    t_in = ((faces[:, 0] <= bcx) & (bcx <= faces[:, 2])
-                            & (faces[:, 1] <= bcy) & (bcy <= faces[:, 3]))
-                    if bool((in_t | t_in).any()):
-                        t.face_age = 0
+        def _refresh_faces(pool: np.ndarray | None,
+                           confirmed_only: bool) -> None:
+            if pool is None or len(pool) == 0:
+                return
+            pool = np.asarray(pool, dtype=np.float32).reshape(-1, 5)
+            fcx = (pool[:, 0] + pool[:, 2]) / 2
+            fcy = (pool[:, 1] + pool[:, 3]) / 2
+            for t in self._tracks:
+                if confirmed_only and not t.confirmed:
+                    continue
+                b = t.kf.box
+                bcx, bcy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+                in_t = ((b[0] <= fcx) & (fcx <= b[2])
+                        & (b[1] <= fcy) & (fcy <= b[3]))
+                t_in = ((pool[:, 0] <= bcx) & (bcx <= pool[:, 2])
+                        & (pool[:, 1] <= bcy) & (bcy <= pool[:, 3]))
+                m = in_t | t_in
+                if bool(m.any()):
+                    t.face_age = 0
+                    best = pool[m][np.argmax(pool[m][:, 4])]
+                    bw = max(b[2] - b[0], 1e-3)
+                    bh = max(b[3] - b[1], 1e-3)
+                    t.face_rel = np.array(
+                        [(best[0] - b[0]) / bw, (best[1] - b[1]) / bh,
+                         (best[2] - b[0]) / bw, (best[3] - b[1]) / bh],
+                        dtype=np.float32)
+
+        # Face evidence → per-track memory (spatial join against each
+        # track's current box — see the docstring for why ``faces`` may
+        # touch any track but ``weak_faces`` only confirmed ones).
+        _refresh_faces(faces, confirmed_only=False)
+        _refresh_faces(weak_faces, confirmed_only=True)
+
+        def face_box(t: _Track) -> np.ndarray | None:
+            if t.face_rel is None:
+                return None
+            b = t.kf.box
+            bw, bh = b[2] - b[0], b[3] - b[1]
+            return np.array([b[0] + t.face_rel[0] * bw,
+                             b[1] + t.face_rel[1] * bh,
+                             b[0] + t.face_rel[2] * bw,
+                             b[1] + t.face_rel[3] * bh], dtype=np.float32)
 
         return [TrackObs(t.id, t.kf.box, t.last_score, t.hit, t.confirmed,
-                         t.coast_frames, t.face_age)
+                         t.coast_frames, t.face_age, face_box(t),
+                         t.last_flags)
                 for t in self._tracks]

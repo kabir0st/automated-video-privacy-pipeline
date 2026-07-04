@@ -7,7 +7,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from libs.utils import BlurPipeline, render_head_mask  # noqa: E402
+from libs.utils import (BlurPipeline, bloom_face_box,  # noqa: E402
+                        render_head_mask)
 
 BOX = np.array([300, 200, 420, 340], dtype=np.float32)  # w=120 h=140
 
@@ -43,6 +44,22 @@ def test_half_out_of_frame_still_masked():
 def test_empty_boxes():
     mask = render_head_mask((100, 100), [])
     assert mask.sum() == 0
+
+
+def test_bloom_face_box_favours_hair():
+    face = np.array([100, 100, 200, 220, 0.8], dtype=np.float32)  # w=100 h=120
+    out = bloom_face_box(face)
+    top_growth = 100 - out[1]
+    bottom_growth = out[3] - 220
+    side_growth = 100 - out[0]
+    assert top_growth > bottom_growth          # hair, not chin
+    assert top_growth > side_growth
+    assert out[2] - 200 == side_growth         # symmetric sides
+    assert out[4] == face[4]                   # score untouched
+    # still much tighter than the head box a pseudo-head would grow (×1.9 h)
+    assert (out[3] - out[1]) < 1.5 * 120
+    # input is not mutated
+    assert face[1] == 100
 
 
 def test_soft_blur_composite_cpu():

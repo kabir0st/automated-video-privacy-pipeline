@@ -150,6 +150,30 @@ def make_session(model_path: str, providers: list[str]):
 
 # ── mask rendering ──────────────────────────────────────────────────────────
 
+# Face-only blur: how far the detected face box grows before it becomes the
+# blur target. The top gets most of the bloom so the mask catches the
+# forehead/fringe ("a bit of hair"), the sides a little, the chin barely —
+# this is deliberately much tighter than a head box (~1.7–1.9× the face),
+# which is the whole point of the face-only mode.
+_FACE_BLOOM_TOP = 0.35
+_FACE_BLOOM_SIDE = 0.10
+_FACE_BLOOM_BOTTOM = 0.05
+
+
+def bloom_face_box(box: np.ndarray) -> np.ndarray:
+    """Grow a face box ``[x1, y1, x2, y2, ...]`` into its blur target: the
+    face plus a fringe of hair (see the _FACE_BLOOM_* constants). Score and
+    any trailing columns pass through untouched."""
+    out = np.asarray(box, dtype=np.float32).copy()
+    w = out[2] - out[0]
+    h = out[3] - out[1]
+    out[0] -= _FACE_BLOOM_SIDE * w
+    out[2] += _FACE_BLOOM_SIDE * w
+    out[1] -= _FACE_BLOOM_TOP * h
+    out[3] += _FACE_BLOOM_BOTTOM * h
+    return out
+
+
 def render_head_mask(
     shape_hw: tuple[int, int],
     boxes: "list[np.ndarray] | np.ndarray",

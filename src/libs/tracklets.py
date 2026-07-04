@@ -2,24 +2,26 @@
 
 The export runs in two passes (see ui.py). Pass 1 detects and tracks but
 renders nothing; every frame's ``TrackObs`` land here. Between passes,
-:func:`postprocess` turns the raw tracklets into a per-frame render table
-using knowledge a streaming tracker can never have — the future:
+:func:`clean_tracklets` turns the raw tracklets into cleaned, graded
+tracklets using knowledge a streaming tracker can never have — the future —
+and :func:`build_table` turns those into a per-frame render table:
 
   * **Trim** — coasted tails are cut; a Kalman prediction that never met
     another detection was a guess, and guesses aren't blurred (the old
     static-hold ghost fix).
-  * **Prune** — tracklets too short or never confident are detector noise; a
-    one-second-late prune here beats a three-frame-late blur onset in a
-    streaming tracker, because pass 2 rewinds time.
+  * **Prune** — a *composite* gate: tracklets too short, never confident, or
+    too sparse are detector noise (as before); on top of that, a tracklet
+    whose per-frame evidence ledger (libs/evidence.summarize/grade) never
+    accumulates real anatomical/part backing is graded "C" and dropped too —
+    this is what catches a static skin/fabric misread that reproduces every
+    frame at high confidence (long *and* confident, so score-and-length
+    gates alone can't tell it from a real head) but never earns the
+    independent evidence a real face does.
   * **Verify** — every tracklet that survives the prune must *reproduce*
     under re-inference: sample a few of its hit frames, crop around its box
     with context, and ask the detector again on the magnified crop
-    (:func:`verify_tracklets`). A real head re-detects stronger when it
-    fills the input; a hallucination (bed corner, curtain fold) doesn't
-    reproduce at the same spot. This kills persistent false positives that
-    score-and-length gates can never catch — a hallucination on a static
-    scene is long *and* confident — without touching thresholds, so recall
-    is untouched.
+    (:func:`verify_tracklets`). This kills persistent false positives the
+    ledger's per-frame view can miss, without touching thresholds.
   * **Bridge** — a track that vanishes and reappears nearby (head briefly
     buried in a pillow / behind a shoulder) is re-joined and the gap is
     *interpolated along the path*, so the blur follows the head instead of
@@ -27,6 +29,14 @@ using knowledge a streaming tracker can never have — the future:
     velocity-extrapolated distance, size similarity, a corridor test (never
     bridge through a region another surviving track occupies), and an
     ambiguity test (two plausible predecessors → bridge neither).
+  * **Fill face gaps** — separately from bridging (which concerns *any*
+    detection gap), short runs where face evidence itself was momentarily
+    missing get their face-target box interpolated between the flanking
+    real sightings instead of falling back to the wider head box — a
+    detector flicker should not visibly balloon the face-only blur. Longer
+    runs are left alone: a genuine, extended loss of face evidence (the
+    subject turned away) is reported as such (``fvalid=False``), not papered
+    over.
   * **Smooth** — zero-phase Savitzky-Golay on cx/cy/w/h. Offline smoothing has
     no lag, so the blur is both steady *and* on target.
 
@@ -42,7 +52,9 @@ from typing import Callable, Optional
 import numpy as np
 from scipy.signal import savgol_filter
 
-# Prune gates (see postprocess).
+from .evidence import EvidenceSummary, PROFILES, GateThresholds, grade, summarize
+
+# Prune gates (see _prune).
 _MIN_HIT_RATIO = 0.30
 # Verification gates (see verify_tracklets).
 _VERIFY_SAMPLES = 5      # hit frames sampled per tracklet
@@ -75,12 +87,20 @@ _EXTEND_S = 0.12
 class Tracklet:
     tid: int
     start: int              # first frame index
-    boxes: np.ndarray       # (T, 4) float32 cx, cy, w, h — contiguous frames
+    boxes: np.ndarray       # (T, 4) float32 cx, cy, w, h — head/anchor channel
     scores: np.ndarray      # (T,)
     hits: np.ndarray        # (T,) bool — False = coasted or interpolated
-    # (T,) bool — face evidence matched the track that frame; None = no
-    # evidence was collected (face gating must then not judge this tracklet).
-    faces: Optional[np.ndarray] = None
+    # (T, 4) float32 cx, cy, w, h — the *face-only* blur target per frame
+    # (the tracker's remembered face box, or the head/anchor box when no
+    # face has ever matched). None = not recorded; falls back to ``boxes``.
+    fboxes: Optional[np.ndarray] = None
+    # (T,) uint32 — Ev bits (libs/evidence.py) credited to this tracklet's
+    # hit that frame; 0 on a coast/interpolated frame or an evidence-free
+    # (sustain-pool) hit. Feeds the evidence ledger (summarize/grade).
+    ev: Optional[np.ndarray] = None
+    # (T,) bool — face evidence was a literal match *this exact frame*
+    # (before gap-filling). None = not recorded.
+    fvalid: Optional[np.ndarray] = None
 
     @property
     def end(self) -> int:
@@ -95,34 +115,66 @@ class PostParams:
     min_track_s: float = 0.25
     bridge_gap_s: float = 1.5
     smooth_win_s: float = 0.5
-    # Drop tracklets that never once showed a face across their whole
-    # (bridged) lifetime — one sighting anywhere marks the entire track,
-    # turned-away spans included. The caller must only enable this while
-    # face-evidence collection is actually live (SCRFD up), or real heads
-    # would be judged on missing data.
-    require_face: bool = False
+    # How long a run of missing face evidence may be interpolated across
+    # (see _fill_face_gaps) before it's reported as a genuine coverage gap.
+    face_gap_bridge_s: float = 1.0
+    # Key into libs.evidence.PROFILES — how much evidence a tracklet needs
+    # to clear the composite prune (see _prune).
+    evidence_profile: str = "balanced"
+
+
+@dataclass
+class CleanTracklet:
+    """One tracklet after cleanup, with its evidence grade attached — the
+    unit :func:`build_table` (kept) and a future review UI (kept + rejected)
+    both consume."""
+    t: Tracklet
+    summary: EvidenceSummary
+    grade: str
+    verify: Optional[object] = None      # VerifyResult — wired in Phase 3
+    enabled_default: bool = True         # review-UI seed — wired in Phase 4
 
 
 class TrackRecorder:
     """Pass-1 sink: collects per-frame TrackObs into contiguous tracklets."""
 
     def __init__(self) -> None:
-        # tid -> [start, [boxes cxcywh], [scores], [hits]]
+        # tid -> [start, [boxes cxcywh], [scores], [hits], [fboxes cxcywh],
+        #         [ev], [fvalid]]
         self._open: dict[int, list] = {}
         self._done: list[Tracklet] = []
         self._last_frame = -1
 
-    def observe(self, frame_idx: int, obs: list, inv_scale: float = 1.0) -> None:
+    def observe(self, frame_idx: int, obs: list, inv_scale: float = 1.0,
+               face_boxes: Optional[list] = None,
+               face_valid: Optional[list] = None,
+               ev_flags: Optional[list] = None) -> None:
         """Record one frame of tracker output (boxes scaled by ``inv_scale``
-        back to full resolution). Tracks absent this frame are closed."""
+        back to full resolution). Tracks absent this frame are closed.
+
+        ``face_boxes`` is an optional parallel list of xyxy boxes — the
+        raw face-target position per observation (the tracker's own best
+        guess; the caller does not pre-decide freshness here — see
+        ``face_valid``); each defaults to the head box when omitted.
+        ``face_valid`` marks which of those are a literal match this frame
+        (vs. a stale carried-over position); ``ev_flags`` is each
+        observation's ``Ev`` bits. Both default to "no evidence" when
+        omitted."""
         seen: set[int] = set()
-        for o in obs:
+        for k, o in enumerate(obs):
             b = np.asarray(o.box, dtype=np.float32) * inv_scale
             z = np.array([(b[0] + b[2]) / 2, (b[1] + b[3]) / 2,
                           b[2] - b[0], b[3] - b[1]], dtype=np.float32)
+            fb = b if face_boxes is None \
+                else np.asarray(face_boxes[k], dtype=np.float32) * inv_scale
+            fz = np.array([(fb[0] + fb[2]) / 2, (fb[1] + fb[3]) / 2,
+                           fb[2] - fb[0], fb[3] - fb[1]], dtype=np.float32)
+            ev = 0 if ev_flags is None else int(ev_flags[k])
+            fv = False if face_valid is None else bool(face_valid[k])
             rec = self._open.get(o.track_id)
             if rec is None:
-                self._open[o.track_id] = [frame_idx, [z], [o.score], [o.hit]]
+                self._open[o.track_id] = [frame_idx, [z], [o.score], [o.hit],
+                                          [fz], [ev], [fv]]
             else:
                 # Guard against a recycled id after the tracker dropped the
                 # track for exactly one frame boundary we didn't see: pad any
@@ -132,10 +184,16 @@ class TrackRecorder:
                     rec[1].append(rec[1][-1].copy())
                     rec[2].append(0.0)
                     rec[3].append(False)
+                    rec[4].append(rec[4][-1].copy())
+                    rec[5].append(0)
+                    rec[6].append(False)
                     expect += 1
                 rec[1].append(z)
                 rec[2].append(o.score)
                 rec[3].append(bool(o.hit))
+                rec[4].append(fz)
+                rec[5].append(ev)
+                rec[6].append(fv)
             seen.add(o.track_id)
         for tid in list(self._open):
             if tid not in seen:
@@ -143,17 +201,37 @@ class TrackRecorder:
         self._last_frame = frame_idx
 
     def _close(self, tid: int) -> None:
-        start, boxes, scores, hits = self._open.pop(tid)
+        start, boxes, scores, hits, fboxes, ev, fvalid = self._open.pop(tid)
         self._done.append(Tracklet(
             tid, start,
             np.asarray(boxes, dtype=np.float32).reshape(-1, 4),
             np.asarray(scores, dtype=np.float32),
-            np.asarray(hits, dtype=bool)))
+            np.asarray(hits, dtype=bool),
+            np.asarray(fboxes, dtype=np.float32).reshape(-1, 4),
+            np.asarray(ev, dtype=np.uint32),
+            np.asarray(fvalid, dtype=bool)))
 
     def finalize(self) -> list[Tracklet]:
         for tid in list(self._open):
             self._close(tid)
         return self._done
+
+
+def _fb(t: Tracklet) -> np.ndarray:
+    """Face-target channel, falling back to the head boxes when absent."""
+    return t.fboxes if t.fboxes is not None else t.boxes
+
+
+def _ev_arr(t: Tracklet) -> np.ndarray:
+    """Evidence-flag channel, falling back to "no evidence recorded"."""
+    return (t.ev if t.ev is not None
+            else np.zeros(len(t.boxes), dtype=np.uint32))
+
+
+def _fvalid_arr(t: Tracklet) -> np.ndarray:
+    """Face-freshness channel, falling back to "never fresh"."""
+    return (t.fvalid if t.fvalid is not None
+            else np.zeros(len(t.boxes), dtype=bool))
 
 
 def _trim(t: Tracklet) -> Tracklet | None:
@@ -163,7 +241,32 @@ def _trim(t: Tracklet) -> Tracklet | None:
         return None
     a, b = int(idx[0]), int(idx[-1]) + 1
     return Tracklet(t.tid, t.start + a, t.boxes[a:b], t.scores[a:b],
-                    t.hits[a:b])
+                    t.hits[a:b], _fb(t)[a:b], _ev_arr(t)[a:b],
+                    _fvalid_arr(t)[a:b])
+
+
+def _prune(
+    trimmed: list[Tracklet], p: PostParams, fps: float, thr: GateThresholds,
+) -> tuple[list[Tracklet], list[Tracklet]]:
+    """Composite prune: the original length/confidence/density gates, *and*
+    the evidence ledger (see the module docstring). Both must pass. Returns
+    ``(kept, rejected)`` — rejected tracklets are not silently discarded by
+    the caller (see :func:`clean_tracklets`)."""
+    min_len = max(p.min_hits, int(round(p.min_track_s * fps)))
+    kept: list[Tracklet] = []
+    rejected: list[Tracklet] = []
+    for t in trimmed:
+        n_hit = int(t.hits.sum())
+        top = np.sort(t.scores[t.hits])[-3:]
+        basic_ok = (n_hit >= min_len
+                   and float(top.mean()) >= p.det_conf
+                   and n_hit / len(t.boxes) >= _MIN_HIT_RATIO)
+        g = grade(summarize(_ev_arr(t), t.hits), thr)
+        if basic_ok and g != "C":
+            kept.append(t)
+        else:
+            rejected.append(t)
+    return kept, rejected
 
 
 def _boxes_at(t: Tracklet, frame: int) -> np.ndarray | None:
@@ -231,8 +334,8 @@ def _bridge_candidates(
                     if cb is None:
                         continue
                     w = (f - a.end) / (g + 1)
-                    p = (1 - w) * a.boxes[-1] + w * b.boxes[0]
-                    if _iou_cxcywh(p, cb) > _CORRIDOR_IOU:
+                    pred_box = (1 - w) * a.boxes[-1] + w * b.boxes[0]
+                    if _iou_cxcywh(pred_box, cb) > _CORRIDOR_IOU:
                         blocked = True
                         break
                 if blocked:
@@ -247,16 +350,24 @@ def _merge_pair(a: Tracklet, b: Tracklet) -> Tracklet:
     """Join ``a``→``b`` with the gap linearly interpolated and size-padded."""
     g = b.start - a.end - 1
     gap_boxes = np.empty((g, 4), dtype=np.float32)
+    gap_fboxes = np.empty((g, 4), dtype=np.float32)
+    fa, fb = _fb(a), _fb(b)
     for f in range(g):
         w = (f + 1) / (g + 1)
+        pad = 1.0 + _GAP_PAD * np.sin(np.pi * (f + 1) / (g + 1))
         gap_boxes[f] = (1 - w) * a.boxes[-1] + w * b.boxes[0]
         # Uncertainty padding, strongest mid-gap.
-        gap_boxes[f, 2:] *= 1.0 + _GAP_PAD * np.sin(np.pi * (f + 1) / (g + 1))
+        gap_boxes[f, 2:] *= pad
+        gap_fboxes[f] = (1 - w) * fa[-1] + w * fb[0]
+        gap_fboxes[f, 2:] *= pad
     return Tracklet(
         a.tid, a.start,
         np.concatenate([a.boxes, gap_boxes, b.boxes]),
         np.concatenate([a.scores, np.zeros(g, np.float32), b.scores]),
-        np.concatenate([a.hits, np.zeros(g, bool), b.hits]))
+        np.concatenate([a.hits, np.zeros(g, bool), b.hits]),
+        np.concatenate([fa, gap_fboxes, fb]),
+        np.concatenate([_ev_arr(a), np.zeros(g, np.uint32), _ev_arr(b)]),
+        np.concatenate([_fvalid_arr(a), np.zeros(g, bool), _fvalid_arr(b)]))
 
 
 def _bridge(tracklets: list[Tracklet], gap_max: int) -> list[Tracklet]:
@@ -292,6 +403,36 @@ def _bridge(tracklets: list[Tracklet], gap_max: int) -> list[Tracklet]:
             return tracklets
         tracklets = [merged.get(k, t) for k, t in enumerate(tracklets)
                      if k not in consumed]
+
+
+def _fill_face_gaps(t: Tracklet, max_gap: int) -> Tracklet:
+    """Interpolate the face-target box across runs of ``fvalid=False`` no
+    longer than ``max_gap`` frames, flanked on both sides by a real sighting
+    — a detector flicker should not visibly balloon the face-only blur out
+    to the head box and back. Leading/trailing runs (no flanking sighting on
+    one side) and longer runs are left alone: a genuine, extended loss of
+    face evidence is reported as such, not papered over."""
+    fvalid = _fvalid_arr(t).copy()
+    fboxes = _fb(t).copy()
+    n = len(fvalid)
+    i = 0
+    while i < n:
+        if fvalid[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not fvalid[j]:
+            j += 1
+        gap_len = j - i
+        if gap_len <= max_gap and i > 0 and j < n:
+            a, b = fboxes[i - 1], fboxes[j]
+            for k in range(gap_len):
+                w = (k + 1) / (gap_len + 1)
+                fboxes[i + k] = (1 - w) * a + w * b
+                fvalid[i + k] = True
+        i = j
+    return Tracklet(t.tid, t.start, t.boxes, t.scores, t.hits, fboxes,
+                    _ev_arr(t), fvalid)
 
 
 def _face_backed(cand: np.ndarray, faces: np.ndarray) -> bool:
@@ -333,7 +474,10 @@ def verify_tracklets(
 
     Fail-open by design: unreadable frames or degenerate crops don't count
     as tested, and a tracklet with zero tested samples is kept — for a
-    privacy tool a spurious blur is cheaper than an unblurred head.
+    privacy tool a spurious blur is cheaper than an unblurred head. (This is
+    an interim, single-model verifier — Phase 3 replaces it with a
+    cross-model version that closes that fail-open path for anything but
+    the strongest evidence grades.)
 
     Returns ``(kept, dropped)`` so the caller can log what died.
     """
@@ -387,33 +531,26 @@ def verify_tracklets(
     return kept, dropped
 
 
-def postprocess(
+def clean_tracklets(
     tracklets: list[Tracklet],
     *,
     fps: float,
     n_frames: int,
     p: PostParams,
     verify: Optional[Callable[[list[Tracklet]], list[Tracklet]]] = None,
-) -> list[list[tuple[int, np.ndarray]]]:
-    """Raw tracklets → per-frame render table ``frame -> [(tid, xyxy)]``."""
+) -> tuple[list[CleanTracklet], list[CleanTracklet]]:
+    """Raw tracklets → ``(kept, rejected)`` graded :class:`CleanTracklet`
+    lists — ``kept`` is ready for :func:`build_table`; ``rejected`` is
+    logged today and will feed the review UI once one exists (Phase 4).
+    See the module docstring for what each stage does."""
     fps = max(fps, 1.0)
+    thr = PROFILES.get(p.evidence_profile, PROFILES["balanced"])
 
     # 1. TRIM coasted tails/heads.
     trimmed = [t for t in (_trim(t) for t in tracklets) if t is not None]
 
-    # 2. PRUNE noise.
-    min_len = max(p.min_hits, int(round(p.min_track_s * fps)))
-    kept: list[Tracklet] = []
-    for t in trimmed:
-        n_hit = int(t.hits.sum())
-        if n_hit < min_len:
-            continue
-        top = np.sort(t.scores[t.hits])[-3:]
-        if float(top.mean()) < p.det_conf:
-            continue
-        if n_hit / len(t.boxes) < _MIN_HIT_RATIO:
-            continue
-        kept.append(t)
+    # 2. PRUNE — composite length/confidence/density + evidence ledger.
+    kept, rejected = _prune(trimmed, p, fps, thr)
 
     # 2½. VERIFY — re-inference second opinion (export wires cropped
     # re-detection here; None in tests/preview). Before BRIDGE so a fake
@@ -424,6 +561,10 @@ def postprocess(
     # 3. BRIDGE across gaps.
     kept = _bridge(kept, gap_max=int(round(p.bridge_gap_s * fps)))
 
+    # 3½. FILL short face-evidence gaps (see the module docstring).
+    fill_gap = max(0, int(round(p.face_gap_bridge_s * fps)))
+    kept = [_fill_face_gaps(t, fill_gap) for t in kept]
+
     # 4. EXTEND ends (hold first/last box briefly).
     ext = max(0, int(round(_EXTEND_S * fps)))
     extended: list[Tracklet] = []
@@ -433,11 +574,21 @@ def postprocess(
         boxes = np.concatenate([np.repeat(t.boxes[:1], pre, axis=0),
                                 t.boxes,
                                 np.repeat(t.boxes[-1:], post, axis=0)])
+        fb = _fb(t)
+        fboxes = np.concatenate([np.repeat(fb[:1], pre, axis=0), fb,
+                                 np.repeat(fb[-1:], post, axis=0)])
         scores = np.concatenate([np.zeros(pre, np.float32), t.scores,
                                  np.zeros(post, np.float32)])
         hits = np.concatenate([np.zeros(pre, bool), t.hits,
                                np.zeros(post, bool)])
-        extended.append(Tracklet(t.tid, t.start - pre, boxes, scores, hits))
+        ev = _ev_arr(t)
+        ev_ext = np.concatenate([np.repeat(ev[:1], pre), ev,
+                                 np.repeat(ev[-1:], post)])
+        fvalid = _fvalid_arr(t)
+        fvalid_ext = np.concatenate([np.repeat(fvalid[:1], pre), fvalid,
+                                     np.repeat(fvalid[-1:], post)])
+        extended.append(Tracklet(t.tid, t.start - pre, boxes, scores, hits,
+                                 fboxes, ev_ext, fvalid_ext))
 
     # 5. SMOOTH (zero-phase; offline so no lag).
     win = int(round(p.smooth_win_s * fps)) | 1
@@ -449,15 +600,40 @@ def postprocess(
                 for ch in range(4):
                     t.boxes[:, ch] = savgol_filter(
                         t.boxes[:, ch], w, polyorder=2, mode="interp")
+                    t.fboxes[:, ch] = savgol_filter(
+                        t.fboxes[:, ch], w, polyorder=2, mode="interp")
 
-    # 6. EMIT render table.
-    table: list[list[tuple[int, np.ndarray]]] = [[] for _ in range(n_frames)]
-    for t in extended:
+    def _wrap(t: Tracklet) -> CleanTracklet:
+        s = summarize(_ev_arr(t), t.hits)
+        return CleanTracklet(t=t, summary=s, grade=grade(s, thr))
+
+    return [_wrap(t) for t in extended], [_wrap(t) for t in rejected]
+
+
+def build_table(
+    kept: list[CleanTracklet], n_frames: int,
+) -> list[list[tuple[int, np.ndarray, np.ndarray, bool]]]:
+    """Cleaned tracklets → per-frame render table ``frame -> [(tid,
+    head_xyxy, face_xyxy, face_ok)]``. ``face_ok`` is whether the face
+    channel is trustworthy that frame (see ``Tracklet.fvalid`` /
+    ``_fill_face_gaps``) — pass 2 picks head vs. face live from
+    ``Params.blur_region``, and in face mode skips any entry where
+    ``face_ok`` is False rather than silently falling back to the head box,
+    per the "face only" blur-region contract."""
+    def xyxy(z: np.ndarray) -> np.ndarray:
+        cx, cy, w, h = z
+        return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2],
+                        dtype=np.float32)
+
+    table: list[list[tuple[int, np.ndarray, np.ndarray, bool]]] = [
+        [] for _ in range(n_frames)]
+    for ct in kept:
+        t = ct.t
+        fb = _fb(t)
+        fvalid = _fvalid_arr(t)
         for k in range(len(t.boxes)):
             f = t.start + k
             if 0 <= f < n_frames:
-                cx, cy, w, h = t.boxes[k]
-                table[f].append((t.tid, np.array(
-                    [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2],
-                    dtype=np.float32)))
+                table[f].append((t.tid, xyxy(t.boxes[k]), xyxy(fb[k]),
+                                 bool(fvalid[k])))
     return table

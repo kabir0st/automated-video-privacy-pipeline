@@ -64,16 +64,18 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-from libs.detector import (Detections, HeadDetector, filter_orphan_faces,
-                           fuse_heads, suppress_shadow_heads)
+from libs.detector import Detections, HeadDetector, NEG_HAND
+from libs.evidence import (PROFILES, Ev, GateDebug, gate_face_candidates,
+                           sustain_pool, weak_faces as gate_weak_faces)
 from libs.head_tracker import HeadTracker, TrackObs
 from libs.models import preflight as preflight_models
-from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, closeup_filter
-from libs.tracklets import (PostParams, TrackRecorder, postprocess,
-                            verify_tracklets)
+from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, kps_plausible
+from libs.tracklets import (PostParams, TrackRecorder, build_table,
+                            clean_tracklets, verify_tracklets)
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
+    bloom_face_box,
     debug_log,
     render_head_mask,
 )
@@ -286,11 +288,19 @@ def _letterspace(lbl: QLabel, px: float = 1.5) -> None:
 @dataclass
 class Params:
     # Detection / track gating. det_conf is the one knob that matters: a
-    # detection at or above it can spawn and drive a blur; the band between
-    # det_conf_low and det_conf only *sustains* an existing blur through
-    # occlusion (BYTE association) and can never start one.
+    # gated face candidate (libs.evidence.gate_face_candidates) at or above
+    # it can spawn and drive a blur; the band between det_conf_low and
+    # det_conf only *sustains* an existing blur through occlusion (BYTE
+    # association) and can never start one. Coverage is bought with the
+    # evidence profile and holds below, not by lowering this floor — a
+    # weaker confidence bar is exactly what let skin/fabric misreads through
+    # before this gate existed.
     det_conf: float = 0.50
     det_conf_low: float = 0.10
+    # How much anatomical/consensus evidence a face candidate needs to clear
+    # the gate and, offline, the evidence ledger — a key into
+    # libs.evidence.PROFILES ("balanced" / "max" / "strict").
+    evidence_profile: str = "balanced"
     # Consecutive hits before a new track may blur — kills 1-frame false
     # positives at the cost of a few frames of onset (repaired offline by the
     # export's end-extension).
@@ -302,6 +312,12 @@ class Params:
     bridge_gap_s: float = 1.5    # max detection gap to interpolate across
     min_track_s: float = 0.25    # tracklets with fewer hits are noise
     smooth_win_s: float = 0.5    # zero-phase SavGol window
+    # How long a track's last matched face keeps steering the face-only blur
+    # (live preview) or may be interpolated across (export's face-gap fill)
+    # before falling back to the wider head box / being reported as a
+    # genuine coverage gap.
+    face_hold_s: float = 0.8
+    face_gap_bridge_s: float = 1.0
     # Mask geometry.
     mask_pad: float = 0.18       # ellipse expansion per side of the head box
     mask_feather: float = 0.12   # edge feather as a fraction of head diagonal
@@ -311,6 +327,12 @@ class Params:
     # (lying down / bed angles) that upright-trained detectors miss. ~3× the
     # (single, small) detection cost.
     rot_assist: bool = True
+    # Blur target: "face" = the matched face box bloomed to catch a bit of
+    # hair — blurred only while face evidence is fresh/interpolated (a
+    # turned-away head with no face evidence stays unblurred by design); or
+    # "head" = the whole tracked head-scale anchor box (safest, biggest —
+    # never loses coverage, at the cost of a much bigger blur).
+    blur_region: str = "face"
     # Ordered blur stack: ("gaussian", kernel) / ("pixelate", block).
     blur_layers: tuple[tuple[str, int], ...] = DEFAULT_BLUR_LAYERS
 
@@ -323,36 +345,40 @@ PRESETS: dict[str, tuple[str, Params]] = {
         Params(),
     ),
     "Max Privacy": (
-        "Catch every head and blur hard — favours coverage over precision",
-        Params(det_conf=0.35, det_conf_low=0.05, min_hits=2,
+        "Catch every head and blur hard — favours coverage over precision. "
+        "Coverage comes from a looser evidence bar and longer holds, never "
+        "from trusting the detector's raw confidence more.",
+        Params(det_conf_low=0.05, evidence_profile="max", min_hits=2,
                max_age_s=2.5, bridge_gap_s=2.5, min_track_s=0.15,
+               face_hold_s=1.5, face_gap_bridge_s=2.0,
                mask_pad=0.30, mask_feather=0.15,
                blur_layers=(("gaussian", 99), ("pixelate", 16))),
     ),
     "Strict": (
-        "Fewer false blurs — higher confidence bar, shorter bridging",
-        Params(det_conf=0.60, min_hits=5, bridge_gap_s=0.8,
-               min_track_s=0.4, mask_pad=0.15),
+        "Fewer false blurs — higher confidence bar, more evidence required, "
+        "shorter bridging",
+        Params(det_conf=0.60, evidence_profile="strict", min_hits=5,
+               bridge_gap_s=0.8, min_track_s=0.4, face_hold_s=0.5,
+               mask_pad=0.15),
     ),
 }
 
 # TRACKING panel palette: layers distinct from the per-track colours.
 _BODY_BOX_COLOUR = (180, 60, 180)      # faint magenta — context only
-_HEAD_DET_COLOUR = (0, 220, 0)         # confident head detections
-_HEAD_LOW_COLOUR = (140, 140, 140)     # low-score band (BYTE sustain food)
-_FACE_DET_COLOUR = (255, 220, 0)       # face detections (cyan-ish in BGR)
-_PSEUDO_HEAD_COLOUR = (0, 170, 255)    # face-derived pseudo-heads (amber)
+_HEAD_DET_COLOUR = (0, 220, 0)         # confident head-class detections
+_HEAD_LOW_COLOUR = (140, 140, 140)     # low-score band (evidence only)
+_FACE_DET_COLOUR = (255, 220, 0)       # face-class detections (cyan-ish in BGR)
+_PART_COLOUR = (0, 255, 255)           # eye/nose/mouth part evidence (yellow dot)
+_NEG_COLOUR = (0, 128, 255)            # hand/foot veto evidence (orange)
+_SCRFD_FACE_COLOUR = (255, 0, 170)     # SCRFD witness faces (violet)
+_SCRFD_REJ_COLOUR = (60, 60, 230)      # landmark-implausible faces (red)
+_REJECTED_COLOUR = (0, 0, 160)         # gate-rejected face claims (dark red)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 
 def _track_colour(tid: int) -> tuple[int, int, int]:
     return _TRACK_COLOURS[tid % len(_TRACK_COLOURS)]
-
-
-def _max_score(boxes: np.ndarray) -> float:
-    """Best score in a (K, 5) box array; 0.0 when empty."""
-    return float(boxes[:, 4].max()) if len(boxes) else 0.0
 
 
 def _draw_box(
@@ -397,20 +423,55 @@ def _obs_tag(o: TrackObs) -> str:
     return ""
 
 
+def _blur_target_box(o: TrackObs, region: str, face_hold: int) -> np.ndarray:
+    """Live-preview blur target for one track (approximate by design — the
+    export instead records the raw face box + freshness and lets the
+    offline pass in libs/tracklets.py interpolate short gaps precisely).
+    In face mode: the bloomed face box while evidence is fresh, otherwise
+    the whole head/anchor box, so a momentary detector flicker doesn't blank
+    the preview blur outright. Always the head/anchor box in head mode."""
+    if region == "face" and o.face_box is not None \
+            and o.face_age <= face_hold:
+        return bloom_face_box(o.face_box)
+    return o.box
+
+
+def _reject_reason(flags: int) -> str:
+    """Short label for a gate-rejected face claim's dominant failure — see
+    libs/evidence.py's ``Ev`` flags."""
+    f = Ev(flags)
+    if f & Ev.VETO_FOOT:
+        return "rej:foot"
+    if f & Ev.VETO_HAND:
+        return "rej:hand"
+    if f & Ev.VETO_AXIS:
+        return "rej:axis"
+    if not (f & (Ev.HEAD_ANCHOR | Ev.POSE_ANCHOR | Ev.CLOSEUP)):
+        return "rej:anchor"
+    return "rej:parts"
+
+
 def _draw_tracking_overlay(
     tracking: np.ndarray,
     dets: Detections,
-    fused: np.ndarray,
     obs: list[TrackObs],
     det_conf: float,
+    scrfd_view: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+    gate_debug: Optional[GateDebug] = None,
 ) -> None:
     """Composite every detection layer onto the TRACKING panel copy.
 
-    Bottom layer up: body boxes (faint, context), raw head detections (green
-    when they clear det_conf, grey in the low band that only sustains tracks),
-    face detections (cyan), face-derived pseudo-heads (amber — the recall
-    backstop when the head class misses), and the Kalman tracks with id and
-    state tag. Drawn on a frame copy only — never on the written output.
+    Bottom layer up: body boxes (faint, context), raw head/face-class
+    detections (green/cyan when they clear det_conf, grey in the low band —
+    evidence only, no longer a blur target by itself), eye/nose/mouth part
+    hits (yellow dots) and hand/foot veto evidence (orange boxes), SCRFD
+    witness faces with their 5-point landmarks (violet) plus the faces the
+    landmark check rejected (red), every face claim libs/evidence.py
+    rejected (dark red, tagged with the failing gate — this is where the
+    sock/knee/shoulder claims from the old pipeline now show up instead of
+    turning into a blur), and finally the Kalman tracks with id, state tag
+    and each track's remembered face box. Drawn on a frame copy only — never
+    on the written output.
     """
     for b in dets.bodies:
         _draw_box(tracking, b, _BODY_BOX_COLOUR, 1)
@@ -420,13 +481,34 @@ def _draw_tracking_overlay(
                   _HEAD_DET_COLOUR if strong else _HEAD_LOW_COLOUR,
                   1, f"{b[4]:.2f}")
     for b in dets.faces:
-        _draw_box(tracking, b, _FACE_DET_COLOUR, 1)
-    for b in fused[len(dets.heads):]:
-        _draw_box(tracking, b, _PSEUDO_HEAD_COLOUR, 1, "pseudo")
+        _draw_box(tracking, b, _FACE_DET_COLOUR, 1, "face")
+    for b in dets.parts:
+        cx, cy = int(round((b[0] + b[2]) / 2)), int(round((b[1] + b[3]) / 2))
+        cv2.circle(tracking, (cx, cy), 3, _PART_COLOUR, -1, cv2.LINE_AA)
+    for b in dets.negatives:
+        label = "hand" if int(b[5]) == NEG_HAND else "foot"
+        _draw_box(tracking, b, _NEG_COLOUR, 1, label)
+    if scrfd_view is not None:
+        ok_boxes, rej_boxes, ok_kps = scrfd_view
+        for b in rej_boxes:
+            _draw_box(tracking, b, _SCRFD_REJ_COLOUR, 1, "rej")
+        for b, kp in zip(ok_boxes, ok_kps):
+            _draw_box(tracking, b, _SCRFD_FACE_COLOUR, 1, "scrfd")
+            if not np.isnan(kp).any():
+                for x, y in kp:
+                    cv2.circle(tracking, (int(round(x)), int(round(y))),
+                               2, _SCRFD_FACE_COLOUR, -1, cv2.LINE_AA)
+    if gate_debug is not None:
+        for box, flags in gate_debug.rejected:
+            _draw_box(tracking, box, _REJECTED_COLOUR, 1,
+                      _reject_reason(flags))
     for o in obs:
         colour = _track_colour(o.track_id)
         _draw_box(tracking, o.box, colour, 2 if o.confirmed else 1,
                   f"id:{o.track_id}{_obs_tag(o)}")
+        # The face box the face-only blur would target, riding the track.
+        if o.face_box is not None:
+            _draw_box(tracking, o.face_box, colour, 1, "face")
 
 
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
@@ -601,67 +683,51 @@ class ProcessWorker(QThread):
 
     def _compute(
         self, frame: np.ndarray, p: Params, tracker: HeadTracker,
-    ) -> tuple[Detections, np.ndarray, list[TrackObs]]:
-        """Detection → head fusion → tracking on ``frame``.
+    ) -> tuple[Detections, list, list[TrackObs], GateDebug,
+               tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Detection → evidence gate → tracking on ``frame``.
 
-        Returns ``(dets, fused_heads, obs)`` with every box in ``frame``'s
-        coordinate space. The detector resizes to its own fixed input
+        Returns ``(dets, cands, obs, gate_debug, scrfd_view)`` with every box
+        in ``frame``'s coordinate space. ``cands`` is this frame's gated
+        ``libs.evidence.FaceCandidate`` list — the only thing that may spawn
+        or drive a blur track (see libs/evidence.py); ``gate_debug.rejected``
+        carries every claim the gate turned down, for the TRACKING overlay.
+        ``scrfd_view`` is ``(ok_boxes, rejected_boxes, ok_kps)``: faces whose
+        5-point landmarks read as a real face, faces the landmark check
+        rejected (fabric/skin misreads — display only), and the landmarks of
+        the accepted ones. The detector resizes to its own fixed input
         internally, so this costs the same at any frame resolution.
         """
         detector = self._ensure_detector()
         rots = (0, 90, 270) if p.rot_assist else (0,)
         dets = detector.detect(frame, rotations=rots)
 
-        # One SCRFD pass per frame at the corroboration floor, fetched
-        # lazily — three consumers below may ask, most frames need none.
-        scrfd_cache: list[np.ndarray] = []
+        # SCRFD now runs every frame — a first-class consensus/part-evidence
+        # source for the gate, not a lazy close-up-only fallback. Landmark-
+        # implausible faces are cut before the gate ever sees them.
+        boxes, kps = self._ensure_scrfd().detect_full(frame, floor=WITNESS_FLOOR)
+        ok = kps_plausible(kps)
+        scrfd_view = (boxes[ok], boxes[~ok], kps[ok])
 
-        def scrfd_once() -> np.ndarray:
-            if not scrfd_cache:
-                scrfd_cache.append(self._ensure_scrfd().detect(
-                    frame, floor=WITNESS_FLOOR))
-            return scrfd_cache[0]
+        thr = PROFILES.get(p.evidence_profile, PROFILES["balanced"])
+        cands, gate_debug = gate_face_candidates(
+            dets, [], scrfd_view[0], frame.shape[:2], thr, p.det_conf)
 
-        # Face claims: a primary face with no covering head box grows a
-        # pseudo-head (= blur), and the face class misreads bare skin —
-        # orphans must be seconded by SCRFD before they are believed.
-        dets.faces = filter_orphan_faces(dets.faces, dets.heads, scrfd_once)
-        # Close-up assist: when the primary sees nothing confident — the
-        # extreme-close-up signature (partial face fills the frame, no whole
-        # head/body to detect) — ask SCRFD. Only faces at close-up scale and
-        # above the user's confidence bar survive closeup_filter (this state
-        # holds on *every* frame of head-free footage, so an ungated SCRFD
-        # would blur its skin/texture misfires); survivors join dets.faces
-        # and grow pseudo-heads in fuse_heads like any orphan face.
-        if _max_score(dets.heads) < p.det_conf \
-                and _max_score(dets.faces) < p.det_conf:
-            extra = closeup_filter(scrfd_once(), frame.shape[:2],
-                                   min_score=p.det_conf)
-            if len(extra):
-                dets.faces = (np.concatenate([dets.faces, extra])
-                              if len(dets.faces) else extra)
-        # Head claims: a body box holding a face-backed head plus a disjoint
-        # face-less rival at modest score is blurring someone's chest, not a
-        # second head (see suppress_shadow_heads for why this never touches
-        # back-of-heads).
-        dets.heads = suppress_shadow_heads(
-            dets.heads, dets.bodies,
-            lambda: (np.concatenate([dets.faces, scrfd_once()])
-                     if len(dets.faces) else scrfd_once()))
-        fused = fuse_heads(dets)
         tracker.configure(det_conf=p.det_conf, det_conf_low=p.det_conf_low,
                           min_hits=p.min_hits, max_age_s=p.max_age_s)
-        obs = tracker.update(fused, frame.shape)
-        return dets, fused, obs
-
-    @staticmethod
-    def _render_boxes(obs: list[TrackObs], hold_frames: int) -> list[np.ndarray]:
-        """The tracks the *live* paths blur: confirmed and recently hit.
-
-        Coasting beyond the short preview hold is not blurred — the export's
-        offline pass decides real gaps by interpolation instead."""
-        return [o.box for o in obs
-                if o.confirmed and o.coast_frames <= hold_frames]
+        if cands:
+            anchors = np.stack([c.anchor for c in cands])
+            faces = np.stack([c.face for c in cands])
+            flags = np.array([c.flags for c in cands], dtype=np.int64)
+        else:
+            anchors = np.empty((0, 5), np.float32)
+            faces = np.empty((0, 5), np.float32)
+            flags = np.empty(0, dtype=np.int64)
+        obs = tracker.update(
+            anchors, frame.shape, faces=faces, flags=flags,
+            sustain=sustain_pool(dets, thr, p.det_conf_low, p.det_conf),
+            weak_faces=gate_weak_faces(dets, scrfd_view[0]))
+        return dets, cands, obs, gate_debug, scrfd_view
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
@@ -682,9 +748,14 @@ class ProcessWorker(QThread):
                 min_hits=p.min_hits, max_age_s=p.max_age_s)
         self._pv_last_idx = frame_idx
 
-        dets, fused, obs = self._compute(proc, p, self._pv_tracker)
+        dets, cands, obs, gate_debug, scrfd_view = self._compute(
+            proc, p, self._pv_tracker)
         hold = max(0, int(round(p.preview_hold_s * fps)))
-        boxes = self._render_boxes(obs, hold)
+        face_hold = max(0, int(round(p.face_hold_s * fps)))
+        rendered = [o for o in obs
+                    if o.confirmed and o.coast_frames <= hold]
+        boxes = [_blur_target_box(o, p.blur_region, face_hold)
+                 for o in rendered]
         mask = render_head_mask(proc.shape[:2], boxes,
                                 pad=p.mask_pad, feather=p.mask_feather)
 
@@ -693,14 +764,14 @@ class ProcessWorker(QThread):
         self._blur.apply(blurred, mask)
 
         # AFTER panel outlines the exact blur ellipses so the target is legible.
-        for o in obs:
-            if o.confirmed and o.coast_frames <= hold:
-                _draw_mask_ellipse(blurred, o.box, p.mask_pad,
-                                   _track_colour(o.track_id),
-                                   f"id:{o.track_id}")
+        for o, b in zip(rendered, boxes):
+            _draw_mask_ellipse(blurred, b, p.mask_pad,
+                               _track_colour(o.track_id),
+                               f"id:{o.track_id}")
 
         tracking = proc.copy()
-        _draw_tracking_overlay(tracking, dets, fused, obs, p.det_conf)
+        _draw_tracking_overlay(tracking, dets, obs, p.det_conf, scrfd_view,
+                               gate_debug)
 
         elapsed = time.perf_counter() - t0
         return proc, tracking, blurred, 1.0 / max(elapsed, 1e-6)
@@ -782,12 +853,15 @@ class ProcessWorker(QThread):
         return self._export_cancel.is_set()
 
     def _make_verifier(self, input_path: str, p: Params):
-        """Build the ``verify=`` hook for postprocess: cropped re-inference.
-
-        Seeks back into the source and asks the detector for a second
-        opinion on every tracklet that survived the prune (see
-        tracklets.verify_tracklets). Returns None — verification off, fail
-        open — when the detector is down or the source can't be reopened.
+        """Build the ``verify=`` hook for clean_tracklets: cropped
+        re-inference. Seeks back into the source and re-runs the *same*
+        evidence gate on a magnified crop around every tracklet that
+        survived the prune (see tracklets.verify_tracklets) — a real face
+        re-earns its anatomical/part evidence when magnified; a
+        skin/fabric hallucination usually doesn't. Returns None —
+        verification off, fail open — when the detector is down or the
+        source can't be reopened. (Interim, single-model verifier — Phase 3
+        adds an independent cross-model version.)
         """
         det = self._detector
         if det is None or not det.available:
@@ -796,6 +870,7 @@ class ProcessWorker(QThread):
         if not cap.isOpened():
             return None
         rots = (0, 90, 270) if p.rot_assist else (0,)
+        thr = PROFILES.get(p.evidence_profile, PROFILES["balanced"])
 
         def frame_at(idx: int) -> Optional[np.ndarray]:
             cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -804,22 +879,16 @@ class ProcessWorker(QThread):
 
         def detect_fn(crop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             d = det.detect(crop, rotations=rots)
-            cands = fuse_heads(d)
-            # Face evidence for the corroboration bar: SCRFD at the witness
-            # floor plus the primary's own confident-enough faces. No
-            # closeup_filter here: in a ×3 crop a real close-up face sits
-            # below the close-up fraction by construction.
-            faces = self._ensure_scrfd().detect(crop, floor=WITNESS_FLOOR)
-            strong_pf = d.faces[d.faces[:, 4] >= WITNESS_FLOOR] \
-                if len(d.faces) else d.faces
-            if len(strong_pf):
-                faces = (np.concatenate([faces, strong_pf])
-                         if len(faces) else strong_pf)
-            if len(cands) == 0 and len(faces):
-                # Face-only tracklets (close-up assist) re-verify via the
-                # face evidence growing pseudo-heads.
-                cands = fuse_heads(Detections(faces=faces))
-            return cands, faces
+            sboxes, skps = self._ensure_scrfd().detect_full(
+                crop, floor=WITNESS_FLOOR)
+            scrfd_ok = sboxes[kps_plausible(skps)]
+            accepted, _dbg = gate_face_candidates(
+                d, [], scrfd_ok, crop.shape[:2], thr, p.det_conf)
+            if not accepted:
+                _empty = np.empty((0, 5), np.float32)
+                return _empty, _empty
+            return (np.stack([c.anchor for c in accepted]),
+                    np.stack([c.face for c in accepted]))
 
         def verify(tracklets: list) -> list:
             try:
@@ -873,8 +942,20 @@ class ProcessWorker(QThread):
 
                 p = self._latest_params()
                 t0 = time.perf_counter()
-                dets, fused, obs = self._compute(frame, p, tracker)
-                recorder.observe(idx, obs)
+                dets, cands, obs, gate_debug, scrfd_view = self._compute(
+                    frame, p, tracker)
+                # Record the raw face-target position (the track's own best
+                # guess — not gated by a live hold) and whether it is a
+                # literal match this exact frame; libs/tracklets.py's
+                # offline face-gap fill decides how to bridge short misses,
+                # knowledge a streaming recorder can't have. Head vs face is
+                # chosen live in pass 2.
+                recorder.observe(
+                    idx, obs,
+                    face_boxes=[o.face_box if o.face_box is not None
+                               else o.box for o in obs],
+                    face_valid=[o.face_age == 0 for o in obs],
+                    ev_flags=[o.flags for o in obs])
                 n = idx + 1
                 total_ms = (time.perf_counter() - t0) * 1e3
 
@@ -884,8 +965,8 @@ class ProcessWorker(QThread):
                 if now - last_preview >= 0.1:
                     last_preview = now
                     overlay = frame.copy()
-                    _draw_tracking_overlay(overlay, dets, fused, obs,
-                                           p.det_conf)
+                    _draw_tracking_overlay(overlay, dets, obs, p.det_conf,
+                                           scrfd_view, gate_debug)
                     tracking = self._display_copy(overlay)
                     after = self._display_copy(frame)
                     cv2.putText(after, "analysing  ·  pass 1/2",
@@ -974,10 +1055,16 @@ class ProcessWorker(QThread):
                 idx, frame = item
 
                 # Appearance stays live-tunable in pass 2; the tracking data
-                # is already frozen in the table.
+                # is already frozen in the table (both head and face-target
+                # channels, so the blur-region choice stays live too). In
+                # face mode an entry with stale/never-seen face evidence
+                # (face_ok False) is skipped outright rather than falling
+                # back to the head box — see Params.blur_region.
                 p = self._latest_params()
                 entries = table[idx] if idx < len(table) else []
-                boxes = [b for _tid, b in entries]
+                face_mode = p.blur_region == "face"
+                boxes = ([fb for _tid, _b, fb, ok in entries if ok]
+                        if face_mode else [b for _tid, b, _fb, _ok in entries])
 
                 t0 = time.perf_counter()
                 do_preview = (t0 - last_preview >= 0.1)
@@ -999,8 +1086,12 @@ class ProcessWorker(QThread):
                     after = self._display_copy(frame)
                     s = before.shape[1] / float(fw)
                     tracking = before.copy()
-                    for tid, b in entries:
-                        _draw_mask_ellipse(tracking, b * s, p.mask_pad,
+                    for tid, b, fb, ok in entries:
+                        if face_mode and not ok:
+                            continue
+                        _draw_mask_ellipse(tracking,
+                                           (fb if face_mode else b) * s,
+                                           p.mask_pad,
                                            _track_colour(tid), f"id:{tid}")
                     self._emit_preview(before, tracking, after,
                                        1000.0 / max(total_ms, 1e-6))
@@ -1078,20 +1169,27 @@ class ProcessWorker(QThread):
             return
 
         # Offline tracklet cleanup between the passes (fast, pure numpy,
-        # plus the cropped re-inference verification pass — see
-        # _make_verifier — which is what kills persistent hallucinations).
+        # composite ledger-aware prune, plus the cropped re-inference
+        # verification pass — see _make_verifier — which is what kills
+        # persistent hallucinations).
         p = self._latest_params()
         raw = recorder.finalize()
-        table = postprocess(
+        kept, rejected = clean_tracklets(
             raw, fps=fps, n_frames=n1,
             p=PostParams(det_conf=p.det_conf, min_hits=p.min_hits,
                          min_track_s=p.min_track_s,
                          bridge_gap_s=p.bridge_gap_s,
-                         smooth_win_s=p.smooth_win_s),
+                         smooth_win_s=p.smooth_win_s,
+                         face_gap_bridge_s=p.face_gap_bridge_s,
+                         evidence_profile=p.evidence_profile),
             verify=self._make_verifier(input_path, p))
-        kept = {tid for entries in table for tid, _b in entries}
+        table = build_table(kept, n1)
         covered = sum(1 for entries in table if entries)
-        msg = (f"Analysis: {len(raw)} raw tracklets → {len(kept)} heads, "
+        grades = {}
+        for ct in kept:
+            grades[ct.grade] = grades.get(ct.grade, 0) + 1
+        msg = (f"Analysis: {len(raw)} raw tracklets → {len(kept)} kept "
+               f"(grades {grades}), {len(rejected)} rejected — "
                f"blur on {covered}/{n1} frames — pass 2/2 rendering…")
         debug_log(msg)
         self.status.emit(msg)
@@ -1315,6 +1413,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(self._build_toolbar())
         lay.addWidget(self._build_video_area(), stretch=1)
+        lay.addWidget(self._build_legend())
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -1369,6 +1468,57 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._frame_lbl)
         lay.addWidget(self._fps_lbl)
         lay.addWidget(self._status_lbl)
+        return bar
+
+    def _build_legend(self) -> QWidget:
+        """Colour key for the TRACKING / AFTER overlays: which box is what."""
+        def swatch(colour_bgr: tuple[int, int, int]) -> QLabel:
+            b, g, r = colour_bgr
+            dot = QLabel()
+            dot.setFixedSize(10, 10)
+            dot.setStyleSheet(
+                f"background-color: #{r:02x}{g:02x}{b:02x};"
+                "border-radius: 5px;")
+            return dot
+
+        bar = QWidget()
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 0, 6, 0)
+        lay.setSpacing(6)
+
+        cap = QLabel("LEGEND")
+        cap.setStyleSheet(
+            f"color: {_TEXT_DIM}; font-size: 10px; font-weight: bold;")
+        _letterspace(cap)
+        lay.addWidget(cap)
+        lay.addSpacing(6)
+
+        entries: list[tuple[tuple[int, int, int], str]] = [
+            (_BODY_BOX_COLOUR, "Body"),
+            (_HEAD_DET_COLOUR, "Head (confident)"),
+            (_HEAD_LOW_COLOUR, "Head (low score)"),
+            (_FACE_DET_COLOUR, "Face"),
+            (_PART_COLOUR, "Eye/nose/mouth"),
+            (_NEG_COLOUR, "Hand/foot (veto evidence)"),
+            (_SCRFD_FACE_COLOUR, "Face + landmarks (SCRFD)"),
+            (_SCRFD_REJ_COLOUR, "Face rejected (bad landmarks)"),
+            (_REJECTED_COLOUR, "Face rejected (gate)"),
+        ]
+        for colour, name in entries:
+            lay.addWidget(swatch(colour))
+            lbl = QLabel(name)
+            lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 10px;")
+            lay.addWidget(lbl)
+            lay.addSpacing(8)
+
+        # Tracks (and their blur ellipses in AFTER) are coloured per id.
+        for tid in range(3):
+            lay.addWidget(swatch(_track_colour(tid + 1)))
+        lbl = QLabel("Track id + blur ellipse (colour per id)")
+        lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 10px;")
+        lay.addWidget(lbl)
+
+        lay.addStretch()
         return bar
 
     def _build_video_area(self) -> QWidget:
@@ -1465,6 +1615,26 @@ class MainWindow(QMainWindow):
         for sl in (self._det_conf_sl, self._det_low_sl):
             sl.changed.connect(self._on_param_change)
 
+        evidence_row = QHBoxLayout()
+        evidence_row.setSpacing(6)
+        evidence_lbl = QLabel("Evidence")
+        evidence_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
+        self._evidence_combo = QComboBox()
+        self._evidence_combo.addItem("Balanced", "balanced")
+        self._evidence_combo.addItem("Max Privacy", "max")
+        self._evidence_combo.addItem("Strict", "strict")
+        self._evidence_combo.setToolTip(
+            "How much anatomical/consensus evidence a face candidate needs\n"
+            "to be trusted (see libs/evidence.py) — this, not Confidence,\n"
+            "is what tells a real face apart from skin/fabric misread as\n"
+            "one. Max Privacy accepts weaker evidence (more coverage, some\n"
+            "risk); Strict requires more (fewer false blurs, some risk of\n"
+            "missing an odd-angle face).")
+        self._evidence_combo.currentIndexChanged.connect(
+            lambda _i: self._on_param_change())
+        evidence_row.addWidget(evidence_lbl)
+        evidence_row.addWidget(self._evidence_combo, stretch=1)
+
         self._rot_btn = QPushButton("Rotation Assist")
         self._rot_btn.setProperty("chip", "true")
         self._rot_btn.setCheckable(True)
@@ -1478,7 +1648,8 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(self._det_conf_sl, 0, 0, 1, 2)
         lay.addWidget(self._det_low_sl,  1, 0, 1, 2)
-        lay.addWidget(self._rot_btn,     2, 0,
+        lay.addLayout(evidence_row,      2, 0, 1, 2)
+        lay.addWidget(self._rot_btn,     3, 0,
                       alignment=Qt.AlignmentFlag.AlignLeft)
         return grp
 
@@ -1487,21 +1658,49 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(grp)
         lay.setSpacing(12)
 
+        region_row = QHBoxLayout()
+        region_row.setSpacing(6)
+        region_lbl = QLabel("Region")
+        region_lbl.setStyleSheet(f"color: {_TEXT_MID}; font-size: 11px;")
+        self._region_combo = QComboBox()
+        self._region_combo.addItem("Face only", "face")
+        self._region_combo.addItem("Whole head", "head")
+        self._region_combo.setToolTip(
+            "What the blur covers.\n"
+            "Face only — the detected face bloomed to include a bit of\n"
+            "hair; blurred only while face evidence is fresh or bridged\n"
+            "(a track with no face evidence at all stays unblurred — see\n"
+            "Face Hold below and the Evidence setting above).\n"
+            "Whole head — the tracked head/anchor box (safest, biggest,\n"
+            "never loses coverage).")
+        self._region_combo.currentIndexChanged.connect(
+            lambda _i: self._on_param_change())
+        region_row.addWidget(region_lbl)
+        region_row.addWidget(self._region_combo, stretch=1)
+
         self._pad_sl = TunableSlider("Mask Pad", 0.00, 0.60, 0.18)
         self._pad_sl.setToolTip(
-            "How far the blur ellipse extends beyond the detected head box,\n"
+            "How far the blur ellipse extends beyond the blur target box,\n"
             "per side. Bigger = safer margin, less tight.")
         self._feather_sl = TunableSlider("Edge Feather", 0.00, 0.40, 0.12)
         self._feather_sl.setToolTip(
             "Soft fade at the mask edge, as a fraction of the head size.\n"
             "Hides residual jitter and reads less harsh than a hard edge.")
-        for sl in (self._pad_sl, self._feather_sl):
+        self._face_hold_sl = TunableSlider("Face Hold (s)", 0.1, 3.0, 0.8,
+                                           decimals=1)
+        self._face_hold_sl.setToolTip(
+            "Face-only mode: how long a track's last face sighting keeps\n"
+            "steering the blur (preview) or may be bridged across (export)\n"
+            "before it's treated as a genuine loss of face evidence.")
+        for sl in (self._pad_sl, self._feather_sl, self._face_hold_sl):
             sl.changed.connect(self._on_param_change)
 
         left = QVBoxLayout()
         left.setSpacing(6)
+        left.addLayout(region_row)
         left.addWidget(self._pad_sl)
         left.addWidget(self._feather_sl)
+        left.addWidget(self._face_hold_sl)
         left.addStretch()
 
         # Stackable blur layers, applied top to bottom.
@@ -1778,15 +1977,23 @@ class MainWindow(QMainWindow):
         try:
             self._det_conf_sl.set_value(p.det_conf)
             self._det_low_sl.set_value(p.det_conf_low)
+            idx = self._evidence_combo.findData(p.evidence_profile)
+            self._evidence_combo.setCurrentIndex(max(0, idx))
             self._rot_btn.setChecked(p.rot_assist)
+            self._region_combo.setCurrentIndex(
+                0 if p.blur_region == "face" else 1)
             self._pad_sl.set_value(p.mask_pad)
             self._feather_sl.set_value(p.mask_feather)
+            self._face_hold_sl.set_value(p.face_hold_s)
             self._set_blur_layers(p.blur_layers)
             self._min_hits_sl.set_value(p.min_hits)
             self._min_track_sl.set_value(p.min_track_s)
             self._bridge_sl.set_value(p.bridge_gap_s)
             self._max_age_sl.set_value(p.max_age_s)
             self._smooth_sl.set_value(p.smooth_win_s)
+            # No dedicated widget for face_gap_bridge_s yet — carried
+            # straight from the preset.
+            self._params.face_gap_bridge_s = p.face_gap_bridge_s
             # Re-submit even when no slider actually moved (e.g. re-click).
             self._on_param_change()
         finally:
@@ -1803,9 +2010,12 @@ class MainWindow(QMainWindow):
     def _on_param_change(self, _val: float = 0.0) -> None:
         self._params.det_conf     = self._det_conf_sl.value()
         self._params.det_conf_low = self._det_low_sl.value()
+        self._params.evidence_profile = self._evidence_combo.currentData()
         self._params.rot_assist   = self._rot_btn.isChecked()
+        self._params.blur_region  = self._region_combo.currentData()
         self._params.mask_pad     = self._pad_sl.value()
         self._params.mask_feather = self._feather_sl.value()
+        self._params.face_hold_s  = self._face_hold_sl.value()
         self._params.blur_layers  = self._blur_layers_value()
         self._params.min_hits     = self._min_hits_sl.int_value()
         self._params.min_track_s  = self._min_track_sl.value()

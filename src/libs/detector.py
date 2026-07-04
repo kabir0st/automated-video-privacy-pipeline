@@ -1,20 +1,27 @@
-"""Single-model detection front-end: body + head + face boxes in one pass.
+"""Single-model detection front-end: body + head + face + part boxes in one pass.
 
-Replaces the RF-DETR ⊕ RTMW ⊕ SCRFD ensemble with one ONNX detector from the
-PINTO model zoo whose classes include whole *heads* alongside faces and bodies.
-The head class is trained on all 360° head orientations (back of head, profile,
-top-down — "Head does not mean Face"), which is exactly the coverage the old
-pose/face ensemble kept missing on lying-down and occluded subjects. The head
-box is the blur target; faces only corroborate or substitute (a face with no
-overlapping head box grows a pseudo-head so the person is still covered).
+One ONNX detector from the PINTO model zoo whose classes include whole
+*heads* alongside faces, bodies and (on the default spec) facial parts and
+hands/feet. The head class is trained on all 360° head orientations (back of
+head, profile, top-down), which is real recall the old pose/face ensemble
+kept missing on lying-down and occluded subjects — but a head/face-class
+detection is *evidence*, not a blur target by itself: skin and fabric read as
+a head or face often enough on this footage that a lone detection here,
+however confident, is not trustworthy on its own. libs/evidence.py is what
+turns these boxes (plus libs/pose.py's anatomical anchors and libs/scrfd.py's
+witness faces) into gated face candidates; nothing in this module may spawn a
+blur.
 
 Two interchangeable model specs are known:
 
   * ``wholebody17`` (default) — 457_YOLOv9-Wholebody17, GPLv3. Body/Head/Face
-    among 17 classes.
-  * ``yolox_bhhf`` — 434_YOLOX-Body-Head-Hand-Face, Apache-2.0. Same idea,
-    4 classes. The escape hatch if the default underperforms or GPL is
-    unwanted.
+    plus eye/nose/mouth/ear (part-consensus evidence) and hand/foot
+    (negative-veto evidence) among its 17 classes.
+  * ``yolox_bhhf`` — 434_YOLOX-Body-Head-Hand-Face, Apache-2.0. Body/Head/Hand
+    /Face, 4 classes — hand is available as negative-veto evidence but there
+    are no eye/nose/mouth/ear/foot classes to draw on. The escape hatch if the
+    default underperforms or GPL is unwanted, at the cost of weaker
+    part-consensus evidence.
 
 Both use PINTO's post-processed exports: NMS, BGR handling and normalisation
 are embedded in the graph. Input is raw BGR float32 ``1×3×H×W``; output is one
@@ -57,24 +64,21 @@ _CACHE_DIR = Path.home() / ".cache" / "avpp" / "detector"
 
 # Score floors applied at parse time. Deliberately low for heads/faces: the
 # BYTE association stage in libs/head_tracker.py *needs* low-score detections
-# to sustain tracks through occlusion — the real gates live in the tracker.
+# to sustain tracks through occlusion — the real gates live in the tracker
+# (and, for faces, in libs/evidence.py's acceptance gate).
 HEAD_FLOOR = 0.05
 FACE_FLOOR = 0.05
 BODY_FLOOR = 0.35
+# Facial parts (eye/nose/mouth/ear) are consensus evidence only — never a box
+# on their own — so the floor stays permissive; the gate needs "is there an
+# eye here at all", not a confident eye detection. Negatives (hand/foot) veto
+# a face candidate, so a false veto is costly and gets a stricter floor.
+PART_FLOOR = 0.20
+NEG_FLOOR = 0.35
 
 # IoU above which two boxes (same class, different rotation passes) are the
-# same detection; and above which a face is "inside" a head for fuse_heads.
+# same detection.
 _MERGE_IOU = 0.55
-_FACE_IN_HEAD_IOU = 0.30
-
-# Face-evidence arbitration (filter_orphan_faces / suppress_shadow_heads).
-# Skin misread as a head or face is the dominant false positive on nude
-# footage — a chest or thigh forms a confident, *reproducing* box no score or
-# geometry gate can tell from a head. Face evidence (the primary's face class
-# cross-checked against SCRFD) arbitrates instead. It is never a veto on a
-# lone head: back-of-heads show no face and must stay covered.
-_SHADOW_MAX_SCORE = 0.60     # in-body rival heads above this are never dropped
-_SHADOW_DISJOINT_IOU = 0.20  # below this, the rival is a separate head claim
 _WITNESS_MATCH_IOU = 0.20    # boxes from two detectors describe the same face
 
 # Rotated-pass acceptance. Rotation passes exist purely as recall assist for
@@ -99,6 +103,14 @@ _ROT_CONTAIN_AREA = 0.5   # rotated head is fake if it swallows an upright one
 _ROT_MAX_AREA_FRAC = 0.20  # rotated-only head bigger than this × frame is fake
 
 
+# Part-class enum for Detections.parts[:, 5] ("cls" column, positive/
+# consensus evidence). Ear is diagnostic/overlay only — not consulted by the
+# gate, since an ear alone says little about where the face is.
+PART_EYE, PART_NOSE, PART_MOUTH, PART_EAR = range(4)
+# Negative-class enum for Detections.negatives[:, 5] (veto evidence).
+NEG_HAND, NEG_FOOT = range(2)
+
+
 @dataclass(frozen=True)
 class DetectorSpec:
     name: str
@@ -108,6 +120,15 @@ class DetectorSpec:
     body_ids: tuple[int, ...]
     head_ids: tuple[int, ...]
     face_ids: tuple[int, ...]
+    # Optional finer-grained classes. Empty tuple = the spec's export has no
+    # such class; the gate degrades gracefully (fewer consensus/veto sources,
+    # never a crash — see libs/evidence.py).
+    eye_ids: tuple[int, ...] = ()
+    nose_ids: tuple[int, ...] = ()
+    mouth_ids: tuple[int, ...] = ()
+    ear_ids: tuple[int, ...] = ()
+    hand_ids: tuple[int, ...] = ()
+    foot_ids: tuple[int, ...] = ()
     # [N,7] output columns — identical for every known PINTO post export, kept
     # explicit so a future export with a different layout is a spec edit.
     col_cls: int = 1
@@ -126,6 +147,12 @@ SPECS: dict[str, DetectorSpec] = {
         body_ids=(0,),
         head_ids=(7,),
         face_ids=(8,),
+        eye_ids=(9,),
+        nose_ids=(10,),
+        mouth_ids=(11,),
+        ear_ids=(12,),
+        hand_ids=(13, 14, 15),
+        foot_ids=(16,),
     ),
     "yolox_bhhf": DetectorSpec(
         name="yolox_bhhf",
@@ -135,6 +162,7 @@ SPECS: dict[str, DetectorSpec] = {
         body_ids=(0,),
         head_ids=(1,),
         face_ids=(3,),
+        hand_ids=(2,),
     ),
 }
 
@@ -258,14 +286,25 @@ def _pinned_model(path: str, hw: tuple[int, int]) -> str:
 
 @dataclass
 class Detections:
-    """Per-class boxes as (K, 5) float32 ``[x1, y1, x2, y2, score]``, frame
-    coordinates."""
+    """Per-class boxes, frame coordinates.
+
+    ``heads``/``faces``/``bodies`` are (K, 5) float32 ``[x1, y1, x2, y2,
+    score]``. ``parts``/``negatives`` are (K, 6) float32 ``[x1, y1, x2, y2,
+    score, cls]`` — ``cls`` indexes ``PART_EYE/PART_NOSE/PART_MOUTH/PART_EAR``
+    or ``NEG_HAND/NEG_FOOT`` respectively. Both are evidence for
+    libs/evidence.py's gate, never blur candidates themselves; either is
+    empty when the active :class:`DetectorSpec` has no such classes.
+    """
     heads: np.ndarray = field(
         default_factory=lambda: np.empty((0, 5), np.float32))
     faces: np.ndarray = field(
         default_factory=lambda: np.empty((0, 5), np.float32))
     bodies: np.ndarray = field(
         default_factory=lambda: np.empty((0, 5), np.float32))
+    parts: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 6), np.float32))
+    negatives: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 6), np.float32))
 
 
 def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -313,17 +352,6 @@ def _centres_inside(a: np.ndarray, b: np.ndarray) -> np.ndarray:
             & (b[None, :, 1] <= acy[:, None]) & (acy[:, None] <= b[None, :, 3]))
 
 
-def _covered_mask(faces: np.ndarray, heads: np.ndarray,
-                  iou_thr: float = _FACE_IN_HEAD_IOU) -> np.ndarray:
-    """True per face when some head box covers it — overlap beyond
-    ``iou_thr`` or the face centre inside the head (the fuse_heads
-    corroboration criterion)."""
-    if len(faces) == 0 or len(heads) == 0:
-        return np.zeros(len(faces), bool)
-    return ((_iou_matrix(faces, heads) >= iou_thr).any(axis=1)
-            | _centres_inside(faces, heads).any(axis=1))
-
-
 def match_faces(boxes: np.ndarray, witnesses: np.ndarray,
                 iou_thr: float = _WITNESS_MATCH_IOU) -> np.ndarray:
     """True per box when some witness face agrees with it: IoU beyond
@@ -334,97 +362,6 @@ def match_faces(boxes: np.ndarray, witnesses: np.ndarray,
     return ((_iou_matrix(boxes, witnesses) >= iou_thr).any(axis=1)
             | _centres_inside(boxes, witnesses).any(axis=1)
             | _centres_inside(witnesses, boxes).any(axis=0))
-
-
-def filter_orphan_faces(
-    faces: np.ndarray, heads: np.ndarray,
-    witness_fn: Callable[[], np.ndarray],
-) -> np.ndarray:
-    """Cross-check the faces that would grow pseudo-heads.
-
-    A face covered by a head box is corroboration for that head and rides
-    along untouched. An *orphan* face becomes a blur candidate all by itself
-    (fuse_heads grows it a pseudo-head), and the primary's face class
-    misreads bare skin — so an orphan must be seconded by the witness
-    detector (SCRFD at its permissive corroboration floor, any face angle)
-    or it is presumed skin and dies here. ``witness_fn`` is called lazily:
-    it costs an inference pass and most frames have no orphans."""
-    if len(faces) == 0:
-        return faces
-    covered = _covered_mask(faces, heads)
-    if covered.all():
-        return faces
-    witnesses = np.asarray(witness_fn(), np.float32).reshape(-1, 5)
-    return faces[covered | match_faces(faces, witnesses)]
-
-
-def suppress_shadow_heads(
-    heads: np.ndarray, bodies: np.ndarray,
-    faces_fn: Callable[[], np.ndarray],
-) -> np.ndarray:
-    """One head per body *where a face pins it down*.
-
-    Inside a body box holding a face-backed head, a second disjoint head
-    claim with no face and only modest confidence (≤ _SHADOW_MAX_SCORE) is
-    anatomically a skin/limb misread — the chest-blur failure — and is
-    dropped. Deliberately narrow: never touches strong heads, heads outside
-    every body, or bodies with no face-backed member, because two entangled
-    people can merge into a single body box and the partner's back-of-head
-    must survive having no face. ``faces_fn`` (may cost an SCRFD pass) is
-    called only when some body actually holds two disjoint head claims."""
-    if len(heads) < 2 or len(bodies) == 0:
-        return heads
-    member = _centres_inside(heads, bodies)          # (H, B)
-    ious = _iou_matrix(heads, heads)
-    contested = []
-    for b in range(member.shape[1]):
-        idx = np.nonzero(member[:, b])[0]
-        if len(idx) >= 2 and \
-                (ious[np.ix_(idx, idx)] < _SHADOW_DISJOINT_IOU).any():
-            contested.append(idx)
-    if not contested:
-        return heads
-    faces = np.asarray(faces_fn(), np.float32).reshape(-1, 5)
-    backed = match_faces(heads, faces, iou_thr=_FACE_IN_HEAD_IOU)
-    if not backed.any():
-        return heads
-    drop = np.zeros(len(heads), bool)
-    for idx in contested:
-        anchors = idx[backed[idx]]
-        if len(anchors) == 0:
-            continue
-        for i in idx:
-            if backed[i] or heads[i, 4] > _SHADOW_MAX_SCORE:
-                continue
-            if (ious[i, anchors] < _SHADOW_DISJOINT_IOU).all():
-                drop[i] = True
-    return heads[~drop]
-
-
-def fuse_heads(dets: Detections, iou_thr: float = _FACE_IN_HEAD_IOU) -> np.ndarray:
-    """Blur candidates: all head boxes, plus a pseudo-head for every face that
-    no head box covers.
-
-    A face detection whose centre lies inside a head box (or that overlaps one
-    beyond ``iou_thr``) is corroboration, not a new subject. An *orphan* face
-    means the head class missed — grow the face box to head proportions
-    (×1.7 wide, ×1.9 tall, centre shifted up a quarter face-height for
-    forehead/hair) so the person is still covered.
-    """
-    heads, faces = dets.heads, dets.faces
-    if len(faces) == 0:
-        return heads
-    out = [heads]
-    covered = _covered_mask(faces, heads, iou_thr)
-    for f in faces[~covered]:
-        cx, cy = (f[0] + f[2]) / 2, (f[1] + f[3]) / 2
-        w, h = f[2] - f[0], f[3] - f[1]
-        pcx, pcy = cx, cy - 0.25 * h
-        pw, ph = 1.7 * w, 1.9 * h
-        out.append(np.array([[pcx - pw / 2, pcy - ph / 2,
-                              pcx + pw / 2, pcy + ph / 2, f[4]]],
-                            dtype=np.float32))
-    return np.concatenate(out, axis=0) if len(out) > 1 else heads
 
 
 def _unrotate_boxes(boxes: np.ndarray, rot: int, fw: int, fh: int) -> np.ndarray:
@@ -542,9 +479,34 @@ class HeadDetector:
             m = np.isin(cls, ids) & (score >= floor) & ok_size
             return packed[m].astype(np.float32)
 
-        return Detections(heads=take(s.head_ids, HEAD_FLOOR),
-                          faces=take(s.face_ids, FACE_FLOOR),
-                          bodies=take(s.body_ids, BODY_FLOOR))
+        def take_tagged(groups: tuple[tuple[int, tuple[int, ...]], ...],
+                        floor: float) -> np.ndarray:
+            """Like ``take`` but for several id-groups, each tagged with its
+            enum value in an appended 6th column (PART_*/NEG_*)."""
+            out = []
+            for tag, ids in groups:
+                if not ids:
+                    continue
+                m = np.isin(cls, ids) & (score >= floor) & ok_size
+                if not m.any():
+                    continue
+                out.append(np.concatenate(
+                    [packed[m], np.full((int(m.sum()), 1), tag, np.float32)],
+                    axis=1))
+            return (np.concatenate(out).astype(np.float32) if out
+                    else np.empty((0, 6), np.float32))
+
+        return Detections(
+            heads=take(s.head_ids, HEAD_FLOOR),
+            faces=take(s.face_ids, FACE_FLOOR),
+            bodies=take(s.body_ids, BODY_FLOOR),
+            parts=take_tagged(
+                ((PART_EYE, s.eye_ids), (PART_NOSE, s.nose_ids),
+                 (PART_MOUTH, s.mouth_ids), (PART_EAR, s.ear_ids)),
+                PART_FLOOR),
+            negatives=take_tagged(
+                ((NEG_HAND, s.hand_ids), (NEG_FOOT, s.foot_ids)), NEG_FLOOR),
+        )
 
     @staticmethod
     def _filter_rotated(boxes: np.ndarray, upright: np.ndarray,
@@ -602,9 +564,13 @@ class HeadDetector:
         ``rotations`` beyond ``(0,)`` re-run the same pinned session on 90°/
         180°/270° copies and merge the unrotated results — recall insurance
         for sideways heads (bed angles) that upright-trained detectors miss.
-        Cost is linear in the number of rotations. Rotated passes contribute
-        heads/faces only (bodies come from the upright pass) and pass through
-        the ``_filter_rotated`` gates.
+        Cost is linear in the number of rotations. Rotated heads/faces pass
+        through the ``_filter_rotated`` anti-hallucination gates (bodies come
+        from the upright pass only); rotated parts/negatives are simply
+        unioned in at their normal floor — they are gate evidence in
+        libs/evidence.py, weighed and overridable, never a box a
+        hallucination can blur by itself, so they don't need the same
+        machinery.
         """
         if not self._ensure():
             return Detections()
@@ -618,6 +584,8 @@ class HeadDetector:
             base: Optional[Detections] = None
             extra_heads: list[np.ndarray] = []
             extra_faces: list[np.ndarray] = []
+            extra_parts: list[np.ndarray] = []
+            extra_negs: list[np.ndarray] = []
             for rot in rotations:
                 img = frame_bgr if rot == 0 else cv2.rotate(
                     frame_bgr, rot_code[rot])
@@ -629,10 +597,14 @@ class HeadDetector:
                 else:
                     extra_heads.append(_unrotate_boxes(d.heads, rot, fw, fh))
                     extra_faces.append(_unrotate_boxes(d.faces, rot, fw, fh))
+                    extra_parts.append(_unrotate_boxes(d.parts, rot, fw, fh))
+                    extra_negs.append(
+                        _unrotate_boxes(d.negatives, rot, fw, fh))
             self.last_ms = (time.perf_counter() - t0) * 1e3
             if base is None:
                 base = Detections()
-            if not extra_heads and not extra_faces:
+            if not extra_heads and not extra_faces \
+                    and not extra_parts and not extra_negs:
                 return base
             witnesses = np.concatenate(
                 [base.heads, base.faces, base.bodies])
@@ -644,10 +616,16 @@ class HeadDetector:
                 np.concatenate(extra_faces) if extra_faces
                 else np.empty((0, 5), np.float32),
                 base.faces, witnesses, fw, fh)
+            parts = (np.concatenate([base.parts, *extra_parts])
+                     if extra_parts else base.parts)
+            negatives = (np.concatenate([base.negatives, *extra_negs])
+                        if extra_negs else base.negatives)
             return Detections(
                 heads=_nms(np.concatenate([base.heads, rot_heads])),
                 faces=_nms(np.concatenate([base.faces, rot_faces])),
-                bodies=base.bodies)
+                bodies=base.bodies,
+                parts=parts,
+                negatives=negatives)
         except Exception as exc:  # noqa: BLE001 — one bad frame ≠ crash
             self._status(f"{self.spec.name} detect failed, degrading: {exc!r}")
             self.available = False

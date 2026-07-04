@@ -72,6 +72,14 @@ _CLOSEUP_MIN_FRAC = 0.25
 _STRIDES = (8, 16, 32)
 _ANCHORS_PER_CELL = 2
 
+# 5-point landmark plausibility gates (see kps_plausible). Deliberately
+# loose — profile and upside-down faces are the norm in this footage — the
+# check only has to kill the degenerate/scattered layouts that skin and
+# fabric misreads produce, not grade real faces.
+_KPS_RATIO = (0.4, 4.0)     # |eye-mid→mouth-mid| / |eye→eye| bounds
+_KPS_MAX_COS = 0.8          # eye axis vs face axis: ≥ ~37° apart
+_KPS_NOSE_T = (-0.3, 1.3)   # nose projection along the face axis
+
 
 def model_path() -> Optional[Path]:
     """First existing model file per the resolution order in the module doc."""
@@ -161,13 +169,19 @@ def closeup_filter(boxes: np.ndarray, frame_hw: tuple[int, int],
 
 
 def _decode(outs: list, in_hw: tuple[int, int], floor: float) -> np.ndarray:
-    """Raw SCRFD outputs → (K, 5) ``[x1, y1, x2, y2, score]`` in input pixels.
+    """Raw SCRFD outputs → per-face rows in input pixels.
 
     ``outs`` is the session's output list: per-stride score tensors first,
-    then per-stride bbox distance tensors (kps tensors, if exported, are
-    ignored). Pure numpy so it unit-tests without a model."""
+    then per-stride bbox distance tensors, then (when the export carries
+    them — ``det_10g`` does) per-stride 5-point landmark tensors. Rows are
+    ``[x1, y1, x2, y2, score]`` — (K, 5) — without landmarks, or (K, 15)
+    with the five ``x, y`` landmark pairs appended (left eye, right eye,
+    nose, left/right mouth corner). Pure numpy so it unit-tests without a
+    model."""
     h, w = in_hw
     fmc = len(_STRIDES)
+    has_kps = len(outs) >= 3 * fmc
+    ncol = 15 if has_kps else 5
     rows: list[np.ndarray] = []
     for i, stride in enumerate(_STRIDES):
         scores = np.asarray(outs[i], dtype=np.float32).reshape(-1)
@@ -182,12 +196,53 @@ def _decode(outs: list, in_hw: tuple[int, int], floor: float) -> np.ndarray:
         centers = np.repeat(centers, _ANCHORS_PER_CELL,
                             axis=0).astype(np.float32)
         c, b, s = centers[keep], bbox[keep], scores[keep]
-        rows.append(np.stack([c[:, 0] - b[:, 0], c[:, 1] - b[:, 1],
-                              c[:, 0] + b[:, 2], c[:, 1] + b[:, 3], s],
-                             axis=1).astype(np.float32))
+        cols = [c[:, 0] - b[:, 0], c[:, 1] - b[:, 1],
+                c[:, 0] + b[:, 2], c[:, 1] + b[:, 3], s]
+        if has_kps:
+            kps = np.asarray(outs[i + 2 * fmc],
+                             dtype=np.float32).reshape(-1, 10)[keep] * stride
+            for j in range(5):
+                cols.append(c[:, 0] + kps[:, 2 * j])
+                cols.append(c[:, 1] + kps[:, 2 * j + 1])
+        rows.append(np.stack(cols, axis=1).astype(np.float32))
     if not rows:
-        return np.empty((0, 5), np.float32)
+        return np.empty((0, ncol), np.float32)
     return np.concatenate(rows)
+
+
+def kps_plausible(kps: np.ndarray) -> np.ndarray:
+    """(K, 5, 2) landmark sets → (K,) bool — does the layout read as a face?
+
+    Rotation-invariant on purpose (faces in this footage lie sideways and
+    upside down): eyes and mouth must sit a sane distance apart relative to
+    the eye spacing, the eye axis must cross the eye→mouth axis at a real
+    angle (a collinear smear is fabric, not a face), and the nose must fall
+    between the eye line and the mouth line along the face axis. NaN sets
+    (a model without landmark outputs) pass — the gate fails open."""
+    kps = np.asarray(kps, dtype=np.float32).reshape(-1, 5, 2)
+    if len(kps) == 0:
+        return np.zeros(0, bool)
+    ok = np.ones(len(kps), bool)
+    nan = np.isnan(kps).any(axis=(1, 2))
+    e1, e2, nose = kps[:, 0], kps[:, 1], kps[:, 2]
+    eye_mid = (e1 + e2) / 2
+    mouth_mid = (kps[:, 3] + kps[:, 4]) / 2
+    eye_ax = e2 - e1
+    face_ax = mouth_mid - eye_mid
+    d_eye = np.hypot(eye_ax[:, 0], eye_ax[:, 1])
+    d_face = np.hypot(face_ax[:, 0], face_ax[:, 1])
+    lo, hi = _KPS_RATIO
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = d_face / np.maximum(d_eye, 1e-6)
+        ok &= (ratio >= lo) & (ratio <= hi)
+        cos = np.abs((eye_ax * face_ax).sum(axis=1)) \
+            / np.maximum(d_eye * d_face, 1e-6)
+        ok &= cos <= _KPS_MAX_COS
+        t = ((nose - eye_mid) * face_ax).sum(axis=1) \
+            / np.maximum(d_face ** 2, 1e-6)
+        ok &= (t >= _KPS_NOSE_T[0]) & (t <= _KPS_NOSE_T[1])
+    ok[nan] = True
+    return ok
 
 
 class ScrfdDetector:
@@ -245,12 +300,21 @@ class ScrfdDetector:
                floor: float = _FLOOR) -> np.ndarray:
         """Detect faces on ``frame_bgr`` → (K, 5) xyxy+score, frame coords.
 
+        Pass ``floor=WITNESS_FLOOR`` when the result corroborates other
+        evidence instead of standing alone."""
+        return self.detect_full(frame_bgr, floor)[0]
+
+    def detect_full(
+        self, frame_bgr: np.ndarray, floor: float = _FLOOR,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Detect faces → ``(boxes, kps)``: (K, 5) xyxy+score plus the
+        matching (K, 5, 2) 5-point landmarks, all in frame coords (landmarks
+        are NaN when the model export carries none).
+
         Aspect-preserving letterbox into the pinned input (top-left anchored,
-        insightface convention) so close-up faces aren't distorted. Pass
-        ``floor=WITNESS_FLOOR`` when the result corroborates other evidence
-        instead of standing alone."""
+        insightface convention) so close-up faces aren't distorted."""
         if not self._ensure():
-            return np.empty((0, 5), np.float32)
+            return np.empty((0, 5), np.float32), np.empty((0, 5, 2), np.float32)
         import cv2
 
         from .detector import _nms
@@ -268,17 +332,24 @@ class ScrfdDetector:
             blob = (blob - 127.5) / 128.0
             blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
             outs = self._sess.run(None, {self._in_name: blob})
-            boxes = _nms(_decode(outs, _INPUT_HW, floor), _NMS_IOU)
+            # _nms keys on column 4 and carries any landmark columns along.
+            rows = _nms(_decode(outs, _INPUT_HW, floor), _NMS_IOU)
             self.last_ms = (time.perf_counter() - t0) * 1e3
-            if len(boxes) == 0:
-                return boxes
-            boxes[:, :4] /= scale
-            boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, fw - 1)
-            boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, fh - 1)
-            ok = ((boxes[:, 2] - boxes[:, 0] >= 4)
-                  & (boxes[:, 3] - boxes[:, 1] >= 4))
-            return boxes[ok]
+            if len(rows) == 0:
+                return (np.empty((0, 5), np.float32),
+                        np.empty((0, 5, 2), np.float32))
+            rows[:, :4] /= scale
+            rows[:, [0, 2]] = rows[:, [0, 2]].clip(0, fw - 1)
+            rows[:, [1, 3]] = rows[:, [1, 3]].clip(0, fh - 1)
+            ok = ((rows[:, 2] - rows[:, 0] >= 4)
+                  & (rows[:, 3] - rows[:, 1] >= 4))
+            rows = rows[ok]
+            if rows.shape[1] >= 15:
+                kps = (rows[:, 5:15] / scale).reshape(-1, 5, 2)
+            else:
+                kps = np.full((len(rows), 5, 2), np.nan, np.float32)
+            return rows[:, :5].copy(), kps
         except Exception as exc:  # noqa: BLE001 — one bad frame ≠ crash
             self._status(f"SCRFD detect failed, degrading: {exc!r}")
             self.available = False
-            return np.empty((0, 5), np.float32)
+            return np.empty((0, 5), np.float32), np.empty((0, 5, 2), np.float32)
