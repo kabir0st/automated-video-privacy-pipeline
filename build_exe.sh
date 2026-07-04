@@ -215,6 +215,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --hidden-import "libs.models" \
   --hidden-import "libs.video_writer" \
   --hidden-import "splash" \
+  --hidden-import "review_ui" \
   --hidden-import "ui" \
   \
   --hidden-import "PyQt6" \

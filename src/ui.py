@@ -74,8 +74,9 @@ from libs.pose import PersonPose, PoseEstimator
 from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, kps_plausible
 from libs.sidecar import (ReviewDecisions, load as sidecar_load,
                           save as sidecar_save)
-from libs.tracklets import (PostParams, TrackRecorder, build_table,
-                            clean_tracklets, verify_tracklets_xmodel)
+from libs.tracklets import (PostParams, TrackRecorder, apply_review,
+                            build_table, clean_tracklets,
+                            verify_tracklets_xmodel)
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
@@ -84,12 +85,16 @@ from libs.utils import (
     render_head_mask,
 )
 from libs.video_writer import make_video_writer, source_bitrate_kbps
+from review_ui import ReviewDecision, ReviewDialog, ReviewRequest, ReviewTrack
 from splash import show_splash, update as splash_update
 
 # Preview panels render at this long edge — computing/drawing at 4K would be
 # wasted on panels a third of the window wide. Detection is unaffected (the
 # detector resizes to its own fixed input internally).
 _DISPLAY_LONG_EDGE = 1280
+# Review dialog (Phase 4) track thumbnails — small enough to build cheaply
+# for every kept/rejected tracklet, big enough to recognise a false positive.
+_REVIEW_THUMB = 96
 _TRACK_COLOURS = [
     (0, 255, 0), (255, 128, 0), (0, 128, 255), (255, 0, 255),
     (0, 255, 255), (255, 255, 0), (128, 0, 255), (0, 200, 100),
@@ -580,6 +585,12 @@ class ProcessWorker(QThread):
     # (pass_no 1|2, current_frame, total_frames) — export runs two passes.
     export_progress = pyqtSignal(int, int, int)
     export_finished = pyqtSignal(bool, str)
+    # Lightweight notification (Phase 4): the review payload itself travels
+    # through take_review_request(), mirroring preview_ready/take_preview's
+    # mailbox pattern — a QThread can't construct/exec PyQt widgets itself,
+    # so the GUI thread builds and execs the ReviewDialog and hands the
+    # result back via submit_review_decision().
+    review_ready = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -619,6 +630,13 @@ class ProcessWorker(QThread):
         # timing log (the detector sub-times are read off the model objects).
         self._last_detect_ms = 0.0
         self._last_blur_ms = 0.0
+        # Review handshake (Phase 4): the worker blocks on _review_done
+        # while the GUI thread owns a modal ReviewDialog — see
+        # take_review_request/submit_review_decision and _run_export.
+        self._review_lock = threading.Lock()
+        self._review_request: Optional[ReviewRequest] = None
+        self._review_decision: Optional[ReviewDecision] = None
+        self._review_done = threading.Event()
 
     def submit(self, frame: np.ndarray, params: Params,
                frame_idx: int = -1, fps: float = 25.0) -> None:
@@ -630,6 +648,20 @@ class ProcessWorker(QThread):
         with self._lock:
             self._params = replace(params)
             self._params_dirty = True
+
+    def take_review_request(self) -> Optional[ReviewRequest]:
+        """Consumed by the GUI thread's ``review_ready`` slot — mirrors
+        ``take_preview()``'s mailbox pattern."""
+        with self._review_lock:
+            req, self._review_request = self._review_request, None
+        return req
+
+    def submit_review_decision(self, decision: ReviewDecision) -> None:
+        """Called by the GUI thread once its modal ``ReviewDialog`` closes —
+        unblocks ``_run_export``'s wait in the review handshake."""
+        with self._review_lock:
+            self._review_decision = decision
+        self._review_done.set()
 
     def start_export(self, input_path: str, output_path: str) -> None:
         with self._lock:
@@ -909,10 +941,18 @@ class ProcessWorker(QThread):
                 if not ret2:
                     break
                 f = nf
-            try:
-                decode_q.put(None, timeout=0.2)   # sentinel (best-effort)
-            except queue.Full:
-                pass
+            # Sentinel: retried like any other put (not one-shot) — the
+            # consumer's final decode_q.get() blocks forever if this is
+            # ever silently dropped, which a single timed-out attempt could
+            # do whenever decode (pure I/O) reaches EOF well ahead of a
+            # slower consumer (real ONNX inference) and the queue is still
+            # at capacity from readahead.
+            while not stop_io.is_set():
+                try:
+                    decode_q.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
 
         t = threading.Thread(target=_decode, name=name, daemon=True)
         t.start()
@@ -1248,7 +1288,7 @@ class ProcessWorker(QThread):
         cached = sidecar_load(input_path, analysis_params)
         if cached is not None:
             cap.release()
-            fps, n1, raw, _review = cached
+            fps, n1, raw, initial_review = cached
             self.status.emit(
                 f"Sidecar hit — skipping pass 1/2 "
                 f"({len(raw)} cached tracklet(s))")
@@ -1270,12 +1310,7 @@ class ProcessWorker(QThread):
                 self.export_finished.emit(False, "No frames decoded")
                 return
             raw = recorder.finalize()
-            try:
-                sidecar_save(input_path, fps=fps, n_frames=n1,
-                            analysis_params=analysis_params, tracklets=raw,
-                            review=ReviewDecisions())
-            except OSError as exc:  # noqa: BLE001 — caching is best-effort
-                debug_log(f"sidecar save failed, continuing without it: {exc!r}")
+            initial_review = ReviewDecisions()
 
         # Offline tracklet cleanup between the passes (fast, pure numpy,
         # composite ledger-aware prune, plus the cropped re-inference
@@ -1291,19 +1326,86 @@ class ProcessWorker(QThread):
                          face_gap_bridge_s=p.face_gap_bridge_s,
                          evidence_profile=p.evidence_profile),
             verify=self._make_verifier(input_path, p))
-        table = build_table(kept, n1)
+
+        # Review (Phase 4): hand kept+rejected to the GUI thread's modal
+        # ReviewDialog and block until it closes — see the review_ready /
+        # take_review_request / submit_review_decision handshake.
+        tracks = self._build_review_tracks(input_path, kept, rejected, fps)
+        with self._review_lock:
+            self._review_request = ReviewRequest(
+                video_path=input_path, fps=fps, n_frames=n1, tracks=tracks,
+                initial=initial_review)
+        self._review_done.clear()
+        self.review_ready.emit()
+        self._review_done.wait()
+        with self._review_lock:
+            decision = self._review_decision
+            self._review_decision = None
+        if decision is None or not decision.accepted:
+            self.export_finished.emit(
+                False, "Cancelled during review — nothing written")
+            return
+
+        try:
+            sidecar_save(input_path, fps=fps, n_frames=n1,
+                        analysis_params=analysis_params, tracklets=raw,
+                        review=decision.review)
+        except OSError as exc:  # noqa: BLE001 — caching is best-effort
+            debug_log(f"sidecar save failed, continuing without it: {exc!r}")
+
+        render_set = apply_review(kept, rejected, decision.review.enabled)
+        table = build_table(render_set, n1, decision.review.manual_regions)
         covered = sum(1 for entries in table if entries)
         grades = {}
-        for ct in kept:
+        for ct in render_set:
             grades[ct.grade] = grades.get(ct.grade, 0) + 1
         msg = (f"Analysis: {len(raw)} raw tracklets → {len(kept)} kept "
                f"(grades {grades}), {len(rejected)} rejected — "
+               f"{len(render_set)} enabled after review, "
+               f"{len(decision.review.manual_regions)} manual region(s) — "
                f"blur on {covered}/{n1} frames — pass 2/2 rendering…")
         debug_log(msg)
         self.status.emit(msg)
 
         self._render_pass(input_path, output_path, table, n1, fps,
                           fw, fh, src_kbps)
+
+    def _build_review_tracks(
+        self, input_path: str, kept: list, rejected: list, fps: float,
+    ) -> list[ReviewTrack]:
+        """One :class:`review_ui.ReviewTrack` per kept/rejected tracklet, with
+        a small thumbnail crop around its midpoint frame — computed here
+        (worker thread, has frame access) so the review dialog itself does
+        no inference or extra decoding."""
+        cap = cv2.VideoCapture(input_path)
+
+        def make(ct, is_kept: bool) -> ReviewTrack:
+            t = ct.t
+            mid_k = len(t.boxes) // 2
+            thumb = None
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_POS_FRAMES, t.start + mid_k)
+                ok, frame = cap.read()
+                if ok:
+                    cx, cy, w, h = t.boxes[mid_k]
+                    side = max(float(w), float(h)) * 1.6
+                    fh, fw = frame.shape[:2]
+                    x0 = int(max(0, cx - side / 2))
+                    y0 = int(max(0, cy - side / 2))
+                    x1 = int(min(fw, cx + side / 2))
+                    y1 = int(min(fh, cy + side / 2))
+                    if x1 - x0 >= 4 and y1 - y0 >= 4:
+                        thumb = cv2.resize(
+                            frame[y0:y1, x0:x1], (_REVIEW_THUMB, _REVIEW_THUMB),
+                            interpolation=cv2.INTER_AREA)
+            return ReviewTrack(tid=t.tid, start_frame=t.start, end_frame=t.end,
+                               grade=ct.grade, kept=is_kept, thumbnail=thumb)
+
+        try:
+            return ([make(ct, True) for ct in kept]
+                    + [make(ct, False) for ct in rejected])
+        finally:
+            cap.release()
 
 
 # ── Reusable widgets ──────────────────────────────────────────────────────────
@@ -1506,6 +1608,7 @@ class MainWindow(QMainWindow):
         self._worker.status.connect(self._on_status)
         self._worker.export_progress.connect(self._on_export_progress)
         self._worker.export_finished.connect(self._on_export_finished)
+        self._worker.review_ready.connect(self._on_review_ready)
         self._worker.start()
 
         self._build_ui()
@@ -2074,6 +2177,18 @@ class MainWindow(QMainWindow):
         self._on_status(msg)
         if self._cap is not None:
             self._go_to_frame(self._current_frame_idx)
+
+    def _on_review_ready(self) -> None:
+        """The worker thread is blocked in _run_export waiting for a review
+        decision — build and exec the modal ReviewDialog here (GUI thread;
+        PyQt widgets can't run on ProcessWorker's QThread) and hand the
+        result back so the worker can proceed."""
+        req = self._worker.take_review_request()
+        if req is None:
+            return
+        dlg = ReviewDialog(req, self)
+        dlg.exec()
+        self._worker.submit_review_decision(dlg.decision())
 
     # ── Param handling ────────────────────────────────────────────────────────
 

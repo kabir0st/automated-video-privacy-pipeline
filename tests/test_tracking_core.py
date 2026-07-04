@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from libs.detector import _nms, _unrotate_boxes  # noqa: E402
 from libs.evidence import Ev  # noqa: E402
 from libs.head_tracker import HeadTracker, TrackObs  # noqa: E402
+from libs.sidecar import ManualRegion  # noqa: E402
 from libs.tracklets import (PostParams, TrackRecorder, Tracklet,  # noqa: E402
-                            build_table, clean_tracklets)
+                            apply_review, build_table, clean_tracklets)
 
 SHAPE = (720, 1280)
 
@@ -416,6 +417,74 @@ class TestPostprocess:
         table = build_table(kept, 100)
         assert seen == [1]                       # prune ran first
         assert all(len(f) == 0 for f in table)   # verify verdict is final
+
+
+class TestReviewOverrides:
+    """apply_review() + build_table()'s manual_regions — the Phase 4 review
+    UI's non-GUI logic (ReviewDialog itself lives in src/review_ui.py and is
+    smoke-tested separately, headlessly, via QTest)."""
+
+    def test_kept_enabled_by_default(self):
+        t = make_tracklet(1, 10, 30)
+        kept, rejected = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        out = apply_review(kept, rejected, {})
+        assert [ct.t.tid for ct in out] == [1]
+
+    def test_kept_can_be_disabled(self):
+        t = make_tracklet(1, 10, 30)
+        kept, rejected = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        out = apply_review(kept, rejected, {1: False})
+        assert out == []
+
+    def test_rejected_disabled_by_default(self):
+        t = make_tracklet(1, 10, 3)      # too short — pruned
+        kept, rejected = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        assert len(rejected) == 1
+        out = apply_review(kept, rejected, {})
+        assert out == []
+
+    def test_rejected_can_be_reenabled(self):
+        t = make_tracklet(1, 10, 3)
+        kept, rejected = clean_tracklets([t], fps=30, n_frames=100, p=PP)
+        out = apply_review(kept, rejected, {1: True})
+        assert [ct.t.tid for ct in out] == [1]
+
+    def test_manual_region_renders_across_its_range(self):
+        region = ManualRegion(start=5, end=9, box0=(0, 0, 20, 20),
+                              box1=(0, 0, 20, 20))
+        table = build_table([], 20, manual_regions=[region])
+        for f in range(5, 10):
+            assert len(table[f]) == 1
+            tid, hb, fb, ok = table[f][0]
+            assert tid < 0                # never collides with a real tid
+            np.testing.assert_allclose(hb, [0, 0, 20, 20])
+            np.testing.assert_allclose(fb, [0, 0, 20, 20])
+            assert ok is True
+        assert table[4] == [] and table[10] == []
+
+    def test_manual_region_interpolates_between_keyframes(self):
+        region = ManualRegion(start=0, end=10, box0=(0, 0, 10, 10),
+                              box1=(10, 10, 20, 20))
+        table = build_table([], 11, manual_regions=[region])
+        _tid, hb, _fb, _ok = table[5][0]
+        np.testing.assert_allclose(hb, [5, 5, 15, 15], atol=1e-3)
+
+    def test_manual_regions_get_distinct_negative_tids(self):
+        r1 = ManualRegion(0, 5, (0, 0, 10, 10), (0, 0, 10, 10))
+        r2 = ManualRegion(0, 5, (50, 50, 60, 60), (50, 50, 60, 60))
+        table = build_table([], 6, manual_regions=[r1, r2])
+        tids = sorted(e[0] for e in table[0])
+        assert len(tids) == 2 and len(set(tids)) == 2
+        assert all(tid < 0 for tid in tids)
+
+    def test_manual_region_coexists_with_real_tracks(self):
+        t = make_tracklet(1, 0, 30)
+        kept, _ = clean_tracklets([t], fps=30, n_frames=40, p=PP)
+        region = ManualRegion(0, 39, (0, 0, 5, 5), (0, 0, 5, 5))
+        table = build_table(kept, 40, manual_regions=[region])
+        tids = sorted(e[0] for e in table[15])
+        assert 1 in tids
+        assert any(tid < 0 for tid in tids)
 
 
 # (verify_tracklets/TestVerifyTracklets — the interim single-model verifier —

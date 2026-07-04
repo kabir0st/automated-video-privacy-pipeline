@@ -50,10 +50,17 @@ scale bookkeeping.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import numpy as np
 from scipy.signal import savgol_filter
+
+if TYPE_CHECKING:
+    # Only for type hints — tracklets.py must not import libs.sidecar at
+    # runtime (sidecar.py imports Tracklet from here, so a real import would
+    # be circular). build_table only ever calls .start/.end/.box_at() on
+    # these, so any duck-typed object works at runtime.
+    from .sidecar import ManualRegion
 
 from .evidence import EvidenceSummary, PROFILES, GateThresholds, grade, summarize
 
@@ -611,8 +618,29 @@ def clean_tracklets(
     return [_wrap(t) for t in extended], [_wrap(t) for t in rejected]
 
 
+def apply_review(
+    kept: list[CleanTracklet], rejected: list[CleanTracklet],
+    enabled_overrides: dict[int, bool],
+) -> list[CleanTracklet]:
+    """Resolve the final render set from :func:`clean_tracklets`' ``(kept,
+    rejected)`` plus the review UI's per-tid enable/disable overrides
+    (Phase 4; see ``libs.sidecar.ReviewDecisions.enabled``).
+
+    ``kept`` tracklets are enabled by default (they already cleared the
+    gate/ledger/composite-verify pipeline); ``rejected`` ones are disabled
+    by default (they already failed it) but are never silently dropped —
+    the caller can re-enable a wrongly-rejected track by tid, and disable a
+    wrongly-kept one, either way via ``enabled_overrides``. ``kept`` and
+    ``rejected`` are disjoint tid sets by construction (a tid can only ever
+    be in one of the two clean_tracklets output lists)."""
+    out = [ct for ct in kept if enabled_overrides.get(ct.t.tid, True)]
+    out.extend(ct for ct in rejected if enabled_overrides.get(ct.t.tid, False))
+    return out
+
+
 def build_table(
     kept: list[CleanTracklet], n_frames: int,
+    manual_regions: "Sequence[ManualRegion]" = (),
 ) -> list[list[tuple[int, np.ndarray, np.ndarray, bool]]]:
     """Cleaned tracklets → per-frame render table ``frame -> [(tid,
     head_xyxy, face_xyxy, face_ok)]``. ``face_ok`` is whether the face
@@ -620,7 +648,15 @@ def build_table(
     ``_fill_face_gaps``) — pass 2 picks head vs. face live from
     ``Params.blur_region``, and in face mode skips any entry where
     ``face_ok`` is False rather than silently falling back to the head box,
-    per the "face only" blur-region contract."""
+    per the "face only" blur-region contract.
+
+    ``manual_regions`` (Phase 4's review UI) are user-drawn blur regions —
+    each becomes a synthetic entry per frame in its range, keyed by a
+    negative tid so it can never collide with a real track id (the tracker's
+    ids are always non-negative). A manual region has no separate head/face
+    channel (there's nothing to hold vs. blur) and no freshness gap to
+    report, so both box slots are the same interpolated box and
+    ``face_ok`` is always ``True``."""
     def xyxy(z: np.ndarray) -> np.ndarray:
         cx, cy, w, h = z
         return np.array([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2],
@@ -637,4 +673,13 @@ def build_table(
             if 0 <= f < n_frames:
                 table[f].append((t.tid, xyxy(t.boxes[k]), xyxy(fb[k]),
                                  bool(fvalid[k])))
+    for i, region in enumerate(manual_regions):
+        tid = -(1000 + i)
+        lo, hi = max(0, region.start), min(n_frames - 1, region.end)
+        for f in range(lo, hi + 1):
+            box = region.box_at(f)
+            if box is None:
+                continue
+            box = box.astype(np.float32)
+            table[f].append((tid, box, box, True))
     return table
