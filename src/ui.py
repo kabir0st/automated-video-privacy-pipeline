@@ -69,6 +69,7 @@ from libs.evidence import (PROFILES, Ev, GateDebug, gate_face_candidates,
                            sustain_pool, weak_faces as gate_weak_faces)
 from libs.head_tracker import HeadTracker, TrackObs
 from libs.models import preflight as preflight_models
+from libs.pose import PersonPose, PoseEstimator
 from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, kps_plausible
 from libs.tracklets import (PostParams, TrackRecorder, build_table,
                             clean_tracklets, verify_tracklets)
@@ -373,6 +374,8 @@ _NEG_COLOUR = (0, 128, 255)            # hand/foot veto evidence (orange)
 _SCRFD_FACE_COLOUR = (255, 0, 170)     # SCRFD witness faces (violet)
 _SCRFD_REJ_COLOUR = (60, 60, 230)      # landmark-implausible faces (red)
 _REJECTED_COLOUR = (0, 0, 160)         # gate-rejected face claims (dark red)
+_POSE_SKELETON_COLOUR = (255, 255, 255)  # pose joints/bones (white)
+_POSE_ANCHOR_COLOUR = (0, 255, 128)     # pose-derived head anchor box (spring green)
 
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -451,6 +454,33 @@ def _reject_reason(flags: int) -> str:
     return "rej:parts"
 
 
+_POSE_BONES = (
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),      # shoulders, arms
+    (5, 11), (6, 12), (11, 12),                    # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),        # legs
+)
+
+
+def _draw_poses(tracking: np.ndarray, poses: "Sequence[PersonPose]") -> None:
+    """Skeleton + head-anchor box per pose, so the TRACKING panel shows the
+    anatomical context the gate's HEAD_ANCHOR/POSE_ANCHOR/AXIS_OK flags are
+    reasoning about (see libs/pose.py, libs/evidence.py)."""
+    for p in poses:
+        kpts = p.kpts
+        for i, j in _POSE_BONES:
+            if kpts[i, 2] <= 0.3 or kpts[j, 2] <= 0.3:
+                continue
+            pt1 = (int(round(kpts[i, 0])), int(round(kpts[i, 1])))
+            pt2 = (int(round(kpts[j, 0])), int(round(kpts[j, 1])))
+            cv2.line(tracking, pt1, pt2, _POSE_SKELETON_COLOUR, 1, cv2.LINE_AA)
+        for x, y, s in kpts:
+            if s > 0.3:
+                cv2.circle(tracking, (int(round(x)), int(round(y))), 2,
+                          _POSE_SKELETON_COLOUR, -1, cv2.LINE_AA)
+        if p.anchor is not None:
+            _draw_box(tracking, p.anchor, _POSE_ANCHOR_COLOUR, 1, "pose")
+
+
 def _draw_tracking_overlay(
     tracking: np.ndarray,
     dets: Detections,
@@ -458,6 +488,7 @@ def _draw_tracking_overlay(
     det_conf: float,
     scrfd_view: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     gate_debug: Optional[GateDebug] = None,
+    poses: "Sequence[PersonPose]" = (),
 ) -> None:
     """Composite every detection layer onto the TRACKING panel copy.
 
@@ -466,7 +497,8 @@ def _draw_tracking_overlay(
     evidence only, no longer a blur target by itself), eye/nose/mouth part
     hits (yellow dots) and hand/foot veto evidence (orange boxes), SCRFD
     witness faces with their 5-point landmarks (violet) plus the faces the
-    landmark check rejected (red), every face claim libs/evidence.py
+    landmark check rejected (red), pose skeletons with their head-anchor box
+    (white/green — see libs/pose.py), every face claim libs/evidence.py
     rejected (dark red, tagged with the failing gate — this is where the
     sock/knee/shoulder claims from the old pipeline now show up instead of
     turning into a blur), and finally the Kalman tracks with id, state tag
@@ -498,6 +530,7 @@ def _draw_tracking_overlay(
                 for x, y in kp:
                     cv2.circle(tracking, (int(round(x)), int(round(y))),
                                2, _SCRFD_FACE_COLOUR, -1, cv2.LINE_AA)
+    _draw_poses(tracking, poses)
     if gate_debug is not None:
         for box, flags in gate_debug.rejected:
             _draw_box(tracking, box, _REJECTED_COLOUR, 1,
@@ -543,6 +576,10 @@ class ProcessWorker(QThread):
         # Same lifecycle for the SCRFD close-up assist (fallback only: runs
         # when the primary sees nothing confident, so usually never loads).
         self._scrfd: Optional[ScrfdDetector] = None
+        # Same lifecycle for the pose estimator (Phase 2): supplies the
+        # gate's anatomical anchor + torso axis. Failure degrades to
+        # head-anchor-only gating, never crashes.
+        self._pose: Optional[PoseEstimator] = None
         self._blur = BlurPipeline()
         # Preview tracking state persists across sequential frames (Play),
         # so Kalman smoothing/hold is visible live; any scrub/jump resets it.
@@ -670,6 +707,11 @@ class ProcessWorker(QThread):
             self._scrfd = ScrfdDetector(on_status=self.status.emit)
         return self._scrfd
 
+    def _ensure_pose(self) -> PoseEstimator:
+        if self._pose is None:
+            self._pose = PoseEstimator(on_status=self.status.emit)
+        return self._pose
+
     @staticmethod
     def _display_copy(frame: np.ndarray) -> np.ndarray:
         """Downscale for the preview panels (long edge ≤ _DISPLAY_LONG_EDGE)."""
@@ -684,19 +726,23 @@ class ProcessWorker(QThread):
     def _compute(
         self, frame: np.ndarray, p: Params, tracker: HeadTracker,
     ) -> tuple[Detections, list, list[TrackObs], GateDebug,
-               tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        """Detection → evidence gate → tracking on ``frame``.
+               tuple[np.ndarray, np.ndarray, np.ndarray], list[PersonPose]]:
+        """Detection → pose → evidence gate → tracking on ``frame``.
 
-        Returns ``(dets, cands, obs, gate_debug, scrfd_view)`` with every box
-        in ``frame``'s coordinate space. ``cands`` is this frame's gated
-        ``libs.evidence.FaceCandidate`` list — the only thing that may spawn
-        or drive a blur track (see libs/evidence.py); ``gate_debug.rejected``
-        carries every claim the gate turned down, for the TRACKING overlay.
-        ``scrfd_view`` is ``(ok_boxes, rejected_boxes, ok_kps)``: faces whose
-        5-point landmarks read as a real face, faces the landmark check
-        rejected (fabric/skin misreads — display only), and the landmarks of
-        the accepted ones. The detector resizes to its own fixed input
-        internally, so this costs the same at any frame resolution.
+        Returns ``(dets, cands, obs, gate_debug, scrfd_view, poses)`` with
+        every box in ``frame``'s coordinate space. ``cands`` is this frame's
+        gated ``libs.evidence.FaceCandidate`` list — the only thing that may
+        spawn or drive a blur track (see libs/evidence.py); ``gate_debug.
+        rejected`` carries every claim the gate turned down, for the
+        TRACKING overlay. ``scrfd_view`` is ``(ok_boxes, rejected_boxes,
+        ok_kps)``: faces whose 5-point landmarks read as a real face, faces
+        the landmark check rejected (fabric/skin misreads — display only),
+        and the landmarks of the accepted ones. ``poses`` is up to two
+        ``libs.pose.PersonPose`` (one per tracked body, Phase 2) — empty when
+        no bodies are in frame or the pose model is unavailable, in which
+        case the gate degrades to head-anchor-only. The detector resizes to
+        its own fixed input internally, so this costs the same at any frame
+        resolution.
         """
         detector = self._ensure_detector()
         rots = (0, 90, 270) if p.rot_assist else (0,)
@@ -709,9 +755,11 @@ class ProcessWorker(QThread):
         ok = kps_plausible(kps)
         scrfd_view = (boxes[ok], boxes[~ok], kps[ok])
 
+        poses = self._ensure_pose().estimate(frame, dets.bodies)
+
         thr = PROFILES.get(p.evidence_profile, PROFILES["balanced"])
         cands, gate_debug = gate_face_candidates(
-            dets, [], scrfd_view[0], frame.shape[:2], thr, p.det_conf)
+            dets, poses, scrfd_view[0], frame.shape[:2], thr, p.det_conf)
 
         tracker.configure(det_conf=p.det_conf, det_conf_low=p.det_conf_low,
                           min_hits=p.min_hits, max_age_s=p.max_age_s)
@@ -727,7 +775,7 @@ class ProcessWorker(QThread):
             anchors, frame.shape, faces=faces, flags=flags,
             sustain=sustain_pool(dets, thr, p.det_conf_low, p.det_conf),
             weak_faces=gate_weak_faces(dets, scrfd_view[0]))
-        return dets, cands, obs, gate_debug, scrfd_view
+        return dets, cands, obs, gate_debug, scrfd_view, poses
 
     def _process(
         self, frame: np.ndarray, p: Params, frame_idx: int = -1,
@@ -748,7 +796,7 @@ class ProcessWorker(QThread):
                 min_hits=p.min_hits, max_age_s=p.max_age_s)
         self._pv_last_idx = frame_idx
 
-        dets, cands, obs, gate_debug, scrfd_view = self._compute(
+        dets, cands, obs, gate_debug, scrfd_view, poses = self._compute(
             proc, p, self._pv_tracker)
         hold = max(0, int(round(p.preview_hold_s * fps)))
         face_hold = max(0, int(round(p.face_hold_s * fps)))
@@ -771,7 +819,7 @@ class ProcessWorker(QThread):
 
         tracking = proc.copy()
         _draw_tracking_overlay(tracking, dets, obs, p.det_conf, scrfd_view,
-                               gate_debug)
+                               gate_debug, poses)
 
         elapsed = time.perf_counter() - t0
         return proc, tracking, blurred, 1.0 / max(elapsed, 1e-6)
@@ -882,8 +930,9 @@ class ProcessWorker(QThread):
             sboxes, skps = self._ensure_scrfd().detect_full(
                 crop, floor=WITNESS_FLOOR)
             scrfd_ok = sboxes[kps_plausible(skps)]
+            poses = self._ensure_pose().estimate(crop, d.bodies)
             accepted, _dbg = gate_face_candidates(
-                d, [], scrfd_ok, crop.shape[:2], thr, p.det_conf)
+                d, poses, scrfd_ok, crop.shape[:2], thr, p.det_conf)
             if not accepted:
                 _empty = np.empty((0, 5), np.float32)
                 return _empty, _empty
@@ -942,7 +991,7 @@ class ProcessWorker(QThread):
 
                 p = self._latest_params()
                 t0 = time.perf_counter()
-                dets, cands, obs, gate_debug, scrfd_view = self._compute(
+                dets, cands, obs, gate_debug, scrfd_view, poses = self._compute(
                     frame, p, tracker)
                 # Record the raw face-target position (the track's own best
                 # guess — not gated by a live hold) and whether it is a
@@ -966,7 +1015,7 @@ class ProcessWorker(QThread):
                     last_preview = now
                     overlay = frame.copy()
                     _draw_tracking_overlay(overlay, dets, obs, p.det_conf,
-                                           scrfd_view, gate_debug)
+                                           scrfd_view, gate_debug, poses)
                     tracking = self._display_copy(overlay)
                     after = self._display_copy(frame)
                     cv2.putText(after, "analysing  ·  pass 1/2",
@@ -1502,6 +1551,8 @@ class MainWindow(QMainWindow):
             (_NEG_COLOUR, "Hand/foot (veto evidence)"),
             (_SCRFD_FACE_COLOUR, "Face + landmarks (SCRFD)"),
             (_SCRFD_REJ_COLOUR, "Face rejected (bad landmarks)"),
+            (_POSE_SKELETON_COLOUR, "Pose skeleton"),
+            (_POSE_ANCHOR_COLOUR, "Pose head anchor"),
             (_REJECTED_COLOUR, "Face rejected (gate)"),
         ]
         for colour, name in entries:

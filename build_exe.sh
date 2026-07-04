@@ -17,11 +17,13 @@
 #     (onnxruntime-directml, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - The single detector model (PINTO YOLOv9-Wholebody17, ~28 MB) IS bundled
-#     into the exe (--add-data below), so a first run needs no downloads at
-#     all. The startup preflight (libs/models.py) still reports its location
-#     and can download to %USERPROFILE%\.cache\avpp\detector\ if the bundle is
-#     bypassed with AVPP_DETECTOR/AVPP_DETECTOR_URL.
+#   - All three models — the PINTO YOLOv9-Wholebody17 detector (~28 MB), the
+#     SCRFD close-up assist (~17 MB) and the RTMPose-m body7 pose estimator
+#     (~25 MB, supplies the evidence gate's anatomical anchor + torso axis) —
+#     ARE bundled into the exe (--add-data below), so a first run needs no
+#     downloads at all. The startup preflight (libs/models.py) still reports
+#     each one's location and can download to %USERPROFILE%\.cache\avpp\ if a
+#     bundle is bypassed via the AVPP_*_ONNX/AVPP_*_URL env overrides.
 #   - GPU acceleration uses the DirectML execution provider (onnxruntime-directml),
 #     which runs on any Windows GPU including the AMD Radeon RX 6800. The build
 #     asserts DirectML is active so a silent CPU-only bundle can't ship; the app
@@ -121,6 +123,19 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $SCRFD_PATH"
 SCRFD_WIN=$(wslpath -w "$SCRFD_PATH")
 
+# Pose estimator (RTMPose-m body7, ~25 MB) — supplies the evidence gate's
+# anatomical anchor + torso axis (Phase 2). Same bundling treatment;
+# libs/pose.py resolves _MEIPASS/models first.
+echo ""
+echo ">>> Ensuring pose estimator model for bundling…"
+POSE_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.pose import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $POSE_PATH"
+POSE_WIN=$(wslpath -w "$POSE_PATH")
+
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
 # Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
 # cv2/onnxruntime/insightface imports, then hands the splash to ui.main() which
@@ -172,7 +187,9 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   \
   --hidden-import "libs.utils" \
   --hidden-import "libs.detector" \
+  --hidden-import "libs.evidence" \
   --hidden-import "libs.scrfd" \
+  --hidden-import "libs.pose" \
   --hidden-import "libs.head_tracker" \
   --hidden-import "libs.tracklets" \
   --hidden-import "libs.models" \
@@ -190,6 +207,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --collect-all "imageio_ffmpeg" \
   --add-data "$MODEL_WIN;models" \
   --add-data "$SCRFD_WIN;models" \
+  --add-data "$POSE_WIN;models" \
   \
   \
   `# utils.py optionally imports torch for the CUDA blur path; on this` \

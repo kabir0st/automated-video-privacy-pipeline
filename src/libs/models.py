@@ -6,11 +6,13 @@ callback. Run :func:`preflight` at startup so the windowed .exe surfaces model
 status on the splash and in the debug log (:data:`libs.utils.DEBUG_LOG`)
 instead of stalling silently the first time a video is opened.
 
-Two models: the PINTO body/head/face detector (see libs/detector.py for the
-spec, resolution order and env overrides) that owns the pipeline, and the
-SCRFD face detector (libs/scrfd.py) that only assists on extreme close-ups.
-The frozen build bundles both, so a normal first run downloads nothing; the
-download paths exist for dev machines and for spec overrides.
+Three models: the PINTO body/head/face detector (see libs/detector.py for the
+spec, resolution order and env overrides) that owns the pipeline, the SCRFD
+face detector (libs/scrfd.py) that only assists on extreme close-ups, and the
+RTMPose body estimator (libs/pose.py) that supplies the evidence gate's
+anatomical anchor + torso axis. The frozen build bundles all three, so a
+normal first run downloads nothing; the download paths exist for dev
+machines and for spec overrides.
 
 Downloads are idempotent and best-effort: any failure is reported and skipped
 so startup never dies — the pipeline degrades to "no blur + status line"
@@ -23,7 +25,7 @@ from __future__ import annotations
 import os
 from typing import Callable, Optional
 
-from . import detector, scrfd
+from . import detector, pose, scrfd
 from .utils import debug_log
 
 StatusCb = Callable[[str], None]
@@ -59,6 +61,18 @@ def _preflight_scrfd(status: StatusCb, download: bool) -> None:
     status("scrfd close-up detector: ready")
 
 
+def _preflight_pose(status: StatusCb, download: bool) -> None:
+    path = pose.model_path()
+    if path is not None:
+        status(f"pose estimator: {path}  [found]")
+        return
+    status(f"pose estimator: {pose.default_cache()}  [MISSING]")
+    if not download:
+        return
+    pose.download_model(on_status=status)
+    status("pose estimator: ready")
+
+
 def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) -> None:
     """Check the model's location, download it if missing, and report.
 
@@ -83,4 +97,8 @@ def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) ->
         _preflight_scrfd(status, download)
     except Exception as exc:  # noqa: BLE001 — the assist degrades to off
         status(f"scrfd: download/check failed, will degrade — {exc!r}")
+    try:
+        _preflight_pose(status, download)
+    except Exception as exc:  # noqa: BLE001 — the gate degrades to head-anchor
+        status(f"pose: download/check failed, will degrade — {exc!r}")
     status("Model check complete")
