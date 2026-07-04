@@ -109,6 +109,18 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $MODEL_PATH"
 MODEL_WIN=$(wslpath -w "$MODEL_PATH")
 
+# SCRFD close-up assist model (~17 MB) — same treatment: bundled so the
+# frozen exe never downloads. libs/scrfd.py resolves _MEIPASS/models first.
+echo ""
+echo ">>> Ensuring SCRFD close-up model for bundling…"
+SCRFD_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.scrfd import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $SCRFD_PATH"
+SCRFD_WIN=$(wslpath -w "$SCRFD_PATH")
+
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
 # Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
 # cv2/onnxruntime/insightface imports, then hands the splash to ui.main() which
@@ -160,6 +172,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   \
   --hidden-import "libs.utils" \
   --hidden-import "libs.detector" \
+  --hidden-import "libs.scrfd" \
   --hidden-import "libs.head_tracker" \
   --hidden-import "libs.tracklets" \
   --hidden-import "libs.models" \
@@ -176,6 +189,7 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   --collect-all "onnxruntime" \
   --collect-all "imageio_ffmpeg" \
   --add-data "$MODEL_WIN;models" \
+  --add-data "$SCRFD_WIN;models" \
   \
   \
   `# utils.py optionally imports torch for the CUDA blur path; on this` \

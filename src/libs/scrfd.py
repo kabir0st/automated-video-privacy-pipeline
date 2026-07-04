@@ -1,0 +1,284 @@
+"""Supplementary SCRFD face detector — extreme-close-up recall assist.
+
+The primary Wholebody17 detector owns heads (all 360° orientations), but it
+can come up empty on extreme close-ups where only part of a face fills the
+frame — no whole head, no whole body, just an eye/cheek/forehead. SCRFD is a
+dedicated face detector that stays reliable on exactly those crops, so it
+runs as a *fallback only*: when the upright pass finds no confident head or
+face, SCRFD's faces are unioned in and grow pseudo-heads via
+``fuse_heads`` like any orphan face. It never replaces the primary (it cannot
+see back-of-heads at all) and it costs nothing on frames the primary handles.
+
+This is a standalone ONNX wrapper, not a return of the insightface package
+(dropped in the single-detector rewrite — it dragged heavy deps into the exe
+and its FaceAnalysis created-and-destroyed sessions, which corrupts DirectML).
+Same DirectML laws as libs/detector.py: one session, created lazily, never
+destroyed, input shape-pinned. Any failure flips ``available`` to False and
+the assist silently switches off.
+
+Model file resolution order (first hit wins):
+  1. ``AVPP_SCRFD_ONNX`` — explicit path to a local ``.onnx``;
+  2. the frozen bundle (``sys._MEIPASS/models/det_10g.onnx``, PyInstaller);
+  3. ``~/.cache/avpp/scrfd/det_10g.onnx``.
+:func:`download_model` fetches the official insightface ``buffalo_l`` zip and
+extracts only ``det_10g.onnx``; ``AVPP_SCRFD_URL`` may point at either a
+direct ``.onnx`` or another ``.zip`` containing one.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+
+_CACHE_DIR = Path.home() / ".cache" / "avpp" / "scrfd"
+_MEMBER = "det_10g.onnx"
+_URL = ("https://github.com/deepinsight/insightface/releases/download/"
+        "v0.7/buffalo_l.zip")
+_INPUT_HW = (640, 640)   # pinned into the graph for DirectML
+
+# Faces below this never leave the module. SCRFD on bare skin is a known
+# false-positive source on this footage, and every face here becomes a blur
+# candidate via a pseudo-head, so the floor is deliberately higher than the
+# primary detector's 0.05 parse floor — the tracker's spawn gate and the
+# export's tracklet verification are the backstops, not substitutes.
+_FLOOR = 0.45
+_NMS_IOU = 0.45
+
+# Corroboration floor: when SCRFD is asked "does a face exist here, even in
+# profile?" to second-opinion the primary's face claims, a weaker answer
+# counts than when its detection must stand alone as a blur candidate —
+# witnesses gate other evidence, they never become boxes themselves.
+WITNESS_FLOOR = 0.30
+
+# The assist exists solely for faces big enough to defeat the primary —
+# "partial face fills the frame". A small SCRFD-only face on a frame where
+# the 360°-trained primary saw nothing confident is almost always skin or
+# blanket texture misread as a face (the failure mode that got insightface
+# dropped from this project once already), and it fires on *every* frame of
+# head-free footage, so sub-close-up boxes must die before they can seed a
+# track. Longest side vs the frame's short side.
+_CLOSEUP_MIN_FRAC = 0.25
+
+# SCRFD head geometry: anchor-free FPN, 2 anchors per cell at each stride;
+# bbox outputs are centre-to-edge distances in stride units.
+_STRIDES = (8, 16, 32)
+_ANCHORS_PER_CELL = 2
+
+
+def model_path() -> Optional[Path]:
+    """First existing model file per the resolution order in the module doc."""
+    env = os.environ.get("AVPP_SCRFD_ONNX")
+    if env and Path(env).is_file():
+        return Path(env)
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        p = Path(bundle) / "models" / _MEMBER
+        if p.is_file():
+            return p
+    cache = default_cache()
+    if cache.is_file():
+        return cache
+    return None
+
+
+def default_cache() -> Path:
+    return _CACHE_DIR / _MEMBER
+
+
+def download_model(
+    on_status: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Ensure ``det_10g.onnx`` exists locally, downloading it if missing.
+
+    The default source is the official insightface ``buffalo_l.zip``; only the
+    detection member is extracted (matched by name suffix so the archive's
+    internal layout doesn't matter). ``.part`` temp + atomic rename, same as
+    the primary detector's downloader."""
+    existing = model_path()
+    if existing is not None:
+        return existing
+
+    url = os.environ.get("AVPP_SCRFD_URL", _URL)
+    cache = default_cache()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+
+    def _report(block: int, block_size: int, total: int) -> None:
+        if on_status and total > 0:
+            done = min(block * block_size, total)
+            on_status(f"Downloading SCRFD close-up detector… "
+                      f"{done / 1e6:.0f}/{total / 1e6:.0f} MB")
+
+    if on_status:
+        on_status(f"Downloading SCRFD close-up detector from {url}")
+
+    if url.endswith(".zip"):
+        with tempfile.NamedTemporaryFile(
+                suffix=".zip", dir=cache.parent, delete=False) as tf:
+            archive = Path(tf.name)
+        try:
+            urllib.request.urlretrieve(url, archive, reporthook=_report)
+            with zipfile.ZipFile(archive) as zf:
+                names = [n for n in zf.namelist() if n.endswith(_MEMBER)]
+                if not names:
+                    raise FileNotFoundError(f"{_MEMBER} not in {url}")
+                tmp = cache.with_suffix(".onnx.part")
+                with zf.open(names[0]) as src, open(tmp, "wb") as dst:
+                    while chunk := src.read(1 << 20):
+                        dst.write(chunk)
+                tmp.replace(cache)
+        finally:
+            archive.unlink(missing_ok=True)
+    else:
+        tmp = cache.with_suffix(".onnx.part")
+        urllib.request.urlretrieve(url, tmp, reporthook=_report)
+        tmp.replace(cache)
+    return cache
+
+
+def closeup_filter(boxes: np.ndarray, frame_hw: tuple[int, int],
+                   min_score: float = _FLOOR) -> np.ndarray:
+    """Keep only faces at close-up scale (see _CLOSEUP_MIN_FRAC) that also
+    clear ``max(min_score, _FLOOR)`` — callers pass their confidence setting
+    so the assist is never trusted below the bar the primary must clear.
+    Pure numpy; applied by the *fallback* caller, not detect(), because the
+    export verifier re-runs SCRFD on magnified crops where a real face is
+    legitimately below this fraction."""
+    if len(boxes) == 0:
+        return boxes
+    fh, fw = frame_hw
+    side = np.maximum(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1])
+    keep = ((boxes[:, 4] >= max(min_score, _FLOOR))
+            & (side >= _CLOSEUP_MIN_FRAC * min(fh, fw)))
+    return boxes[keep]
+
+
+def _decode(outs: list, in_hw: tuple[int, int], floor: float) -> np.ndarray:
+    """Raw SCRFD outputs → (K, 5) ``[x1, y1, x2, y2, score]`` in input pixels.
+
+    ``outs`` is the session's output list: per-stride score tensors first,
+    then per-stride bbox distance tensors (kps tensors, if exported, are
+    ignored). Pure numpy so it unit-tests without a model."""
+    h, w = in_hw
+    fmc = len(_STRIDES)
+    rows: list[np.ndarray] = []
+    for i, stride in enumerate(_STRIDES):
+        scores = np.asarray(outs[i], dtype=np.float32).reshape(-1)
+        bbox = np.asarray(outs[i + fmc],
+                          dtype=np.float32).reshape(-1, 4) * stride
+        keep = scores >= floor
+        if not keep.any():
+            continue
+        gh, gw = h // stride, w // stride
+        xs, ys = np.meshgrid(np.arange(gw), np.arange(gh))
+        centers = np.stack([xs, ys], axis=-1).reshape(-1, 2) * stride
+        centers = np.repeat(centers, _ANCHORS_PER_CELL,
+                            axis=0).astype(np.float32)
+        c, b, s = centers[keep], bbox[keep], scores[keep]
+        rows.append(np.stack([c[:, 0] - b[:, 0], c[:, 1] - b[:, 1],
+                              c[:, 0] + b[:, 2], c[:, 1] + b[:, 3], s],
+                             axis=1).astype(np.float32))
+    if not rows:
+        return np.empty((0, 5), np.float32)
+    return np.concatenate(rows)
+
+
+class ScrfdDetector:
+    """Lazy single-session SCRFD wrapper → (K, 5) face boxes, frame coords.
+
+    Mirrors HeadDetector's lifecycle: built once on first use, never
+    destroyed; any failure flips ``available`` to False and ``detect``
+    returns empty forever after (the assist degrades, the pipeline doesn't
+    notice)."""
+
+    def __init__(self, on_status: Optional[Callable[[str], None]] = None) -> None:
+        self._on_status = on_status
+        self._sess = None
+        self._in_name = ""
+        self.available: Optional[bool] = None
+        self.last_ms = 0.0
+
+    def _status(self, msg: str) -> None:
+        if self._on_status:
+            self._on_status(msg)
+
+    def _ensure(self) -> bool:
+        if self.available is not None:
+            return self.available
+        try:
+            path = model_path()
+            if path is None:
+                raise FileNotFoundError(
+                    f"no SCRFD ONNX found (set AVPP_SCRFD_ONNX or place it "
+                    f"at {default_cache()})")
+            import onnxruntime as ort
+
+            from .detector import _pinned_model
+            from .utils import best_onnx_providers, make_session
+
+            self._status(f"Loading SCRFD close-up detector ({path.name})…")
+            pinned = _pinned_model(str(path), _INPUT_HW)
+            providers = best_onnx_providers()
+            try:
+                sess = make_session(pinned, providers)
+            except Exception:  # noqa: BLE001 — fp16/DML rejected → plain fp32
+                sess = ort.InferenceSession(pinned, providers=providers)
+            self._in_name = sess.get_inputs()[0].name
+            self._sess = sess
+            self.available = True
+            h, w = _INPUT_HW
+            self._status(f"SCRFD close-up detector ready on "
+                         f"{sess.get_providers()[0]} @ {w}×{h}")
+        except Exception as exc:  # noqa: BLE001 — degrade, never crash
+            self._status(f"SCRFD close-up detector unavailable: {exc!r}")
+            self.available = False
+        return self.available
+
+    def detect(self, frame_bgr: np.ndarray,
+               floor: float = _FLOOR) -> np.ndarray:
+        """Detect faces on ``frame_bgr`` → (K, 5) xyxy+score, frame coords.
+
+        Aspect-preserving letterbox into the pinned input (top-left anchored,
+        insightface convention) so close-up faces aren't distorted. Pass
+        ``floor=WITNESS_FLOOR`` when the result corroborates other evidence
+        instead of standing alone."""
+        if not self._ensure():
+            return np.empty((0, 5), np.float32)
+        import cv2
+
+        from .detector import _nms
+
+        fh, fw = frame_bgr.shape[:2]
+        h, w = _INPUT_HW
+        scale = min(w / fw, h / fh)
+        rw, rh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+        try:
+            t0 = time.perf_counter()
+            canvas = np.zeros((h, w, 3), dtype=np.uint8)
+            canvas[:rh, :rw] = cv2.resize(frame_bgr, (rw, rh),
+                                          interpolation=cv2.INTER_LINEAR)
+            blob = canvas[:, :, ::-1].astype(np.float32)   # BGR → RGB
+            blob = (blob - 127.5) / 128.0
+            blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
+            outs = self._sess.run(None, {self._in_name: blob})
+            boxes = _nms(_decode(outs, _INPUT_HW, floor), _NMS_IOU)
+            self.last_ms = (time.perf_counter() - t0) * 1e3
+            if len(boxes) == 0:
+                return boxes
+            boxes[:, :4] /= scale
+            boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, fw - 1)
+            boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, fh - 1)
+            ok = ((boxes[:, 2] - boxes[:, 0] >= 4)
+                  & (boxes[:, 3] - boxes[:, 1] >= 4))
+            return boxes[ok]
+        except Exception as exc:  # noqa: BLE001 — one bad frame ≠ crash
+            self._status(f"SCRFD detect failed, degrading: {exc!r}")
+            self.available = False
+            return np.empty((0, 5), np.float32)

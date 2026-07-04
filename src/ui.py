@@ -64,10 +64,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QFont
 
-from libs.detector import Detections, HeadDetector, fuse_heads
+from libs.detector import (Detections, HeadDetector, filter_orphan_faces,
+                           fuse_heads, suppress_shadow_heads)
 from libs.head_tracker import HeadTracker, TrackObs
 from libs.models import preflight as preflight_models
-from libs.tracklets import PostParams, TrackRecorder, postprocess
+from libs.scrfd import WITNESS_FLOOR, ScrfdDetector, closeup_filter
+from libs.tracklets import (PostParams, TrackRecorder, postprocess,
+                            verify_tracklets)
 from libs.utils import (
     DEFAULT_BLUR_LAYERS,
     BlurPipeline,
@@ -347,6 +350,11 @@ def _track_colour(tid: int) -> tuple[int, int, int]:
     return _TRACK_COLOURS[tid % len(_TRACK_COLOURS)]
 
 
+def _max_score(boxes: np.ndarray) -> float:
+    """Best score in a (K, 5) box array; 0.0 when empty."""
+    return float(boxes[:, 4].max()) if len(boxes) else 0.0
+
+
 def _draw_box(
     frame: np.ndarray,
     box: np.ndarray,
@@ -450,6 +458,9 @@ class ProcessWorker(QThread):
         # One detector session for the process lifetime — built lazily, never
         # rebuilt (destroying a DirectML session corrupts the provider).
         self._detector: Optional[HeadDetector] = None
+        # Same lifecycle for the SCRFD close-up assist (fallback only: runs
+        # when the primary sees nothing confident, so usually never loads).
+        self._scrfd: Optional[ScrfdDetector] = None
         self._blur = BlurPipeline()
         # Preview tracking state persists across sequential frames (Play),
         # so Kalman smoothing/hold is visible live; any scrub/jump resets it.
@@ -572,6 +583,11 @@ class ProcessWorker(QThread):
             self._detector = HeadDetector(on_status=self.status.emit)
         return self._detector
 
+    def _ensure_scrfd(self) -> ScrfdDetector:
+        if self._scrfd is None:
+            self._scrfd = ScrfdDetector(on_status=self.status.emit)
+        return self._scrfd
+
     @staticmethod
     def _display_copy(frame: np.ndarray) -> np.ndarray:
         """Downscale for the preview panels (long edge ≤ _DISPLAY_LONG_EDGE)."""
@@ -595,6 +611,43 @@ class ProcessWorker(QThread):
         detector = self._ensure_detector()
         rots = (0, 90, 270) if p.rot_assist else (0,)
         dets = detector.detect(frame, rotations=rots)
+
+        # One SCRFD pass per frame at the corroboration floor, fetched
+        # lazily — three consumers below may ask, most frames need none.
+        scrfd_cache: list[np.ndarray] = []
+
+        def scrfd_once() -> np.ndarray:
+            if not scrfd_cache:
+                scrfd_cache.append(self._ensure_scrfd().detect(
+                    frame, floor=WITNESS_FLOOR))
+            return scrfd_cache[0]
+
+        # Face claims: a primary face with no covering head box grows a
+        # pseudo-head (= blur), and the face class misreads bare skin —
+        # orphans must be seconded by SCRFD before they are believed.
+        dets.faces = filter_orphan_faces(dets.faces, dets.heads, scrfd_once)
+        # Close-up assist: when the primary sees nothing confident — the
+        # extreme-close-up signature (partial face fills the frame, no whole
+        # head/body to detect) — ask SCRFD. Only faces at close-up scale and
+        # above the user's confidence bar survive closeup_filter (this state
+        # holds on *every* frame of head-free footage, so an ungated SCRFD
+        # would blur its skin/texture misfires); survivors join dets.faces
+        # and grow pseudo-heads in fuse_heads like any orphan face.
+        if _max_score(dets.heads) < p.det_conf \
+                and _max_score(dets.faces) < p.det_conf:
+            extra = closeup_filter(scrfd_once(), frame.shape[:2],
+                                   min_score=p.det_conf)
+            if len(extra):
+                dets.faces = (np.concatenate([dets.faces, extra])
+                              if len(dets.faces) else extra)
+        # Head claims: a body box holding a face-backed head plus a disjoint
+        # face-less rival at modest score is blurring someone's chest, not a
+        # second head (see suppress_shadow_heads for why this never touches
+        # back-of-heads).
+        dets.heads = suppress_shadow_heads(
+            dets.heads, dets.bodies,
+            lambda: (np.concatenate([dets.faces, scrfd_once()])
+                     if len(dets.faces) else scrfd_once()))
         fused = fuse_heads(dets)
         tracker.configure(det_conf=p.det_conf, det_conf_low=p.det_conf_low,
                           min_hits=p.min_hits, max_age_s=p.max_age_s)
@@ -727,6 +780,66 @@ class ProcessWorker(QThread):
                 self._paused_preview(frame)
             self._export_run.wait(0.05)
         return self._export_cancel.is_set()
+
+    def _make_verifier(self, input_path: str, p: Params):
+        """Build the ``verify=`` hook for postprocess: cropped re-inference.
+
+        Seeks back into the source and asks the detector for a second
+        opinion on every tracklet that survived the prune (see
+        tracklets.verify_tracklets). Returns None — verification off, fail
+        open — when the detector is down or the source can't be reopened.
+        """
+        det = self._detector
+        if det is None or not det.available:
+            return None
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            return None
+        rots = (0, 90, 270) if p.rot_assist else (0,)
+
+        def frame_at(idx: int) -> Optional[np.ndarray]:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            return frame if ok else None
+
+        def detect_fn(crop: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            d = det.detect(crop, rotations=rots)
+            cands = fuse_heads(d)
+            # Face evidence for the corroboration bar: SCRFD at the witness
+            # floor plus the primary's own confident-enough faces. No
+            # closeup_filter here: in a ×3 crop a real close-up face sits
+            # below the close-up fraction by construction.
+            faces = self._ensure_scrfd().detect(crop, floor=WITNESS_FLOOR)
+            strong_pf = d.faces[d.faces[:, 4] >= WITNESS_FLOOR] \
+                if len(d.faces) else d.faces
+            if len(strong_pf):
+                faces = (np.concatenate([faces, strong_pf])
+                         if len(faces) else strong_pf)
+            if len(cands) == 0 and len(faces):
+                # Face-only tracklets (close-up assist) re-verify via the
+                # face evidence growing pseudo-heads.
+                cands = fuse_heads(Detections(faces=faces))
+            return cands, faces
+
+        def verify(tracklets: list) -> list:
+            try:
+                if not tracklets:
+                    return tracklets
+                self.status.emit(
+                    f"Verifying {len(tracklets)} tracklet(s)…")
+                kept, dropped = verify_tracklets(
+                    tracklets, frame_at, detect_fn)
+                if dropped:
+                    msg = (f"verify: rejected {len(dropped)}/"
+                           f"{len(tracklets)} tracklet(s) as false "
+                           f"positives (ids {[t.tid for t in dropped]})")
+                    debug_log(msg)
+                    self.status.emit(msg)
+                return kept
+            finally:
+                cap.release()
+
+        return verify
 
     def _analyse_pass(
         self,
@@ -964,7 +1077,9 @@ class ProcessWorker(QThread):
             self.export_finished.emit(False, "No frames decoded")
             return
 
-        # Offline tracklet cleanup between the passes (fast, pure numpy).
+        # Offline tracklet cleanup between the passes (fast, pure numpy,
+        # plus the cropped re-inference verification pass — see
+        # _make_verifier — which is what kills persistent hallucinations).
         p = self._latest_params()
         raw = recorder.finalize()
         table = postprocess(
@@ -972,7 +1087,8 @@ class ProcessWorker(QThread):
             p=PostParams(det_conf=p.det_conf, min_hits=p.min_hits,
                          min_track_s=p.min_track_s,
                          bridge_gap_s=p.bridge_gap_s,
-                         smooth_win_s=p.smooth_win_s))
+                         smooth_win_s=p.smooth_win_s),
+            verify=self._make_verifier(input_path, p))
         kept = {tid for entries in table for tid, _b in entries}
         covered = sum(1 for entries in table if entries)
         msg = (f"Analysis: {len(raw)} raw tracklets → {len(kept)} heads, "

@@ -11,6 +11,15 @@ using knowledge a streaming tracker can never have — the future:
   * **Prune** — tracklets too short or never confident are detector noise; a
     one-second-late prune here beats a three-frame-late blur onset in a
     streaming tracker, because pass 2 rewinds time.
+  * **Verify** — every tracklet that survives the prune must *reproduce*
+    under re-inference: sample a few of its hit frames, crop around its box
+    with context, and ask the detector again on the magnified crop
+    (:func:`verify_tracklets`). A real head re-detects stronger when it
+    fills the input; a hallucination (bed corner, curtain fold) doesn't
+    reproduce at the same spot. This kills persistent false positives that
+    score-and-length gates can never catch — a hallucination on a static
+    scene is long *and* confident — without touching thresholds, so recall
+    is untouched.
   * **Bridge** — a track that vanishes and reappears nearby (head briefly
     buried in a pillow / behind a shoulder) is re-joined and the gap is
     *interpolated along the path*, so the blur follows the head instead of
@@ -28,12 +37,29 @@ scale bookkeeping.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 from scipy.signal import savgol_filter
 
 # Prune gates (see postprocess).
 _MIN_HIT_RATIO = 0.30
+# Verification gates (see verify_tracklets).
+_VERIFY_SAMPLES = 5      # hit frames sampled per tracklet
+_VERIFY_MIN_FRAC = 0.4   # fraction of tested samples that must re-detect
+# Crop side = max(box w, h) × this. Must be ≥ ~2.5: the detector's rotated
+# passes reject heads above ~20 % of the *image* area, and the image here is
+# the crop — at ×3 a true head is ~11 % of it, safely under that cap even for
+# sideways heads that only the rotated pass can re-detect.
+_VERIFY_MARGIN = 3.0
+_VERIFY_MIN_CROP = 96    # px — never crop tighter than this
+_VERIFY_SCORE = 0.50     # re-detection floor when face evidence agrees
+# Floor without face evidence in the crop. Skin misread as a head (chest,
+# thigh) *reproduces* under magnification — unlike texture hallucinations —
+# but rarely this confidently; a real back-of-head magnified ×3 does. This
+# is the safe form of "check it has a face": face evidence lowers the bar,
+# its absence raises it, it never zeroes a tracklet by itself.
+_VERIFY_LONE = 0.65
 # Bridge gates.
 _BRIDGE_SIZE_RATIO = (0.6, 1.67)
 _CORRIDOR_IOU = 0.20
@@ -52,6 +78,9 @@ class Tracklet:
     boxes: np.ndarray       # (T, 4) float32 cx, cy, w, h — contiguous frames
     scores: np.ndarray      # (T,)
     hits: np.ndarray        # (T,) bool — False = coasted or interpolated
+    # (T,) bool — face evidence matched the track that frame; None = no
+    # evidence was collected (face gating must then not judge this tracklet).
+    faces: Optional[np.ndarray] = None
 
     @property
     def end(self) -> int:
@@ -66,6 +95,12 @@ class PostParams:
     min_track_s: float = 0.25
     bridge_gap_s: float = 1.5
     smooth_win_s: float = 0.5
+    # Drop tracklets that never once showed a face across their whole
+    # (bridged) lifetime — one sighting anywhere marks the entire track,
+    # turned-away spans included. The caller must only enable this while
+    # face-evidence collection is actually live (SCRFD up), or real heads
+    # would be judged on missing data.
+    require_face: bool = False
 
 
 class TrackRecorder:
@@ -259,12 +294,106 @@ def _bridge(tracklets: list[Tracklet], gap_max: int) -> list[Tracklet]:
                      if k not in consumed]
 
 
+def _face_backed(cand: np.ndarray, faces: np.ndarray) -> bool:
+    """A face box centre inside the candidate, or vice versa — the candidate
+    head has face evidence behind it."""
+    if len(faces) == 0:
+        return False
+    fcx = (faces[:, 0] + faces[:, 2]) / 2
+    fcy = (faces[:, 1] + faces[:, 3]) / 2
+    in_c = ((cand[0] <= fcx) & (fcx <= cand[2])
+            & (cand[1] <= fcy) & (fcy <= cand[3]))
+    ccx, ccy = (cand[0] + cand[2]) / 2, (cand[1] + cand[3]) / 2
+    c_in = ((faces[:, 0] <= ccx) & (ccx <= faces[:, 2])
+            & (faces[:, 1] <= ccy) & (ccy <= faces[:, 3]))
+    return bool((in_c | c_in).any())
+
+
+def verify_tracklets(
+    tracklets: list[Tracklet],
+    frame_at: Callable[[int], "np.ndarray | None"],
+    detect_fn: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
+    *,
+    min_score: float = _VERIFY_SCORE,
+) -> tuple[list[Tracklet], list[Tracklet]]:
+    """Re-inference gate: keep tracklets whose head reproduces on crops.
+
+    For up to ``_VERIFY_SAMPLES`` evenly spaced *hit* frames per tracklet,
+    crop the frame around the tracklet box (side ``max(w, h) ×
+    _VERIFY_MARGIN``) and run ``detect_fn`` on the crop. ``detect_fn``
+    returns ``(candidates, faces)`` — head blur candidates plus every piece
+    of face evidence seen in the crop (both as ``[x1, y1, x2, y2, score]``
+    in crop coords). A sample verifies when some candidate lands on the
+    tracklet box (its centre inside the box, or the box centre inside it — a
+    close-up head can out-grow its recorded box) and either scores ≥
+    ``min_score`` with face evidence behind it, or scores ≥ ``_VERIFY_LONE``
+    alone (the back-of-head path — face evidence is never required, only
+    rewarded). The tracklet survives when at least ``_VERIFY_MIN_FRAC`` of
+    its *tested* samples verify.
+
+    Fail-open by design: unreadable frames or degenerate crops don't count
+    as tested, and a tracklet with zero tested samples is kept — for a
+    privacy tool a spurious blur is cheaper than an unblurred head.
+
+    Returns ``(kept, dropped)`` so the caller can log what died.
+    """
+    kept: list[Tracklet] = []
+    dropped: list[Tracklet] = []
+    for t in tracklets:
+        hit_idx = np.nonzero(t.hits)[0]
+        if len(hit_idx) == 0:
+            kept.append(t)
+            continue
+        n = min(_VERIFY_SAMPLES, len(hit_idx))
+        picks = hit_idx[np.unique(
+            np.round(np.linspace(0, len(hit_idx) - 1, n)).astype(int))]
+        tested = accepted = 0
+        for k in picks:
+            frame = frame_at(t.start + int(k))
+            if frame is None:
+                continue
+            fh, fw = frame.shape[:2]
+            cx, cy, w, h = (float(v) for v in t.boxes[k])
+            side = max(w, h) * _VERIFY_MARGIN
+            side = max(side, float(_VERIFY_MIN_CROP))
+            x0 = int(max(0, cx - side / 2))
+            y0 = int(max(0, cy - side / 2))
+            x1 = int(min(fw, cx + side / 2))
+            y1 = int(min(fh, cy + side / 2))
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                continue
+            tested += 1
+            raw_cands, raw_faces = detect_fn(frame[y0:y1, x0:x1])
+            cands = np.asarray(raw_cands, dtype=np.float32).reshape(-1, 5)
+            faces = np.asarray(raw_faces, dtype=np.float32).reshape(-1, 5)
+            # Tracklet box in crop coordinates.
+            bx0, by0 = cx - w / 2 - x0, cy - h / 2 - y0
+            bx1, by1 = cx + w / 2 - x0, cy + h / 2 - y0
+            bcx, bcy = cx - x0, cy - y0
+            for c in cands:
+                if c[4] < min_score:
+                    continue
+                ccx, ccy = (c[0] + c[2]) / 2, (c[1] + c[3]) / 2
+                if not ((bx0 <= ccx <= bx1 and by0 <= ccy <= by1)
+                        or (c[0] <= bcx <= c[2] and c[1] <= bcy <= c[3])):
+                    continue
+                if c[4] >= _VERIFY_LONE or _face_backed(c, faces):
+                    accepted += 1
+                    break
+        if tested == 0 or accepted / tested >= _VERIFY_MIN_FRAC:
+            kept.append(t)
+        else:
+            dropped.append(t)
+    return kept, dropped
+
+
 def postprocess(
     tracklets: list[Tracklet],
     *,
     fps: float,
     n_frames: int,
     p: PostParams,
+    verify: Optional[Callable[[list[Tracklet]], list[Tracklet]]] = None,
 ) -> list[list[tuple[int, np.ndarray]]]:
     """Raw tracklets → per-frame render table ``frame -> [(tid, xyxy)]``."""
     fps = max(fps, 1.0)
@@ -285,6 +414,12 @@ def postprocess(
         if n_hit / len(t.boxes) < _MIN_HIT_RATIO:
             continue
         kept.append(t)
+
+    # 2½. VERIFY — re-inference second opinion (export wires cropped
+    # re-detection here; None in tests/preview). Before BRIDGE so a fake
+    # tracklet can never be interpolated into a real one.
+    if verify is not None:
+        kept = verify(kept)
 
     # 3. BRIDGE across gaps.
     kept = _bridge(kept, gap_max=int(round(p.bridge_gap_s * fps)))

@@ -67,14 +67,36 @@ BODY_FLOOR = 0.35
 _MERGE_IOU = 0.55
 _FACE_IN_HEAD_IOU = 0.30
 
+# Face-evidence arbitration (filter_orphan_faces / suppress_shadow_heads).
+# Skin misread as a head or face is the dominant false positive on nude
+# footage — a chest or thigh forms a confident, *reproducing* box no score or
+# geometry gate can tell from a head. Face evidence (the primary's face class
+# cross-checked against SCRFD) arbitrates instead. It is never a veto on a
+# lone head: back-of-heads show no face and must stay covered.
+_SHADOW_MAX_SCORE = 0.60     # in-body rival heads above this are never dropped
+_SHADOW_DISJOINT_IOU = 0.20  # below this, the rival is a separate head claim
+_WITNESS_MATCH_IOU = 0.20    # boxes from two detectors describe the same face
+
 # Rotated-pass acceptance. Rotation passes exist purely as recall assist for
 # sideways heads, and the model hallucinates on rotated scenes (a rotated
-# upright scene can read as one giant "head" spanning the frame). A genuinely
-# sideways head becomes *upright* in the rotated view and scores high, so a
-# stricter floor costs no real recall; the containment check below kills the
-# giant-hallucination case outright.
-_ROT_SCORE_FLOOR = 0.50
+# upright scene can read as one giant "head" spanning the frame — or, worse,
+# a moderate bed-sized one that no absolute size cap can distinguish from a
+# real head). A genuinely sideways head becomes *upright* in the rotated view
+# and scores high, so a stricter floor costs no real recall; the containment
+# check kills the giant-hallucination case when an upright head exists, and
+# the absolute area cap kills frame-spanning fakes outright.
+#
+# The witness rule closes the remaining hole (moderate-size fakes on frames
+# the upright pass read as empty): the head class is trained on all 360°
+# orientations, so a real sideways head essentially never leaves the upright
+# pass *completely* blind at its location — at the 0.05 parse floor a weak
+# head/face registers, or the body containing it does. A rotated-only box
+# with zero upright corroboration must clear a much higher floor to survive.
+_ROT_SCORE_FLOOR = 0.50    # corroborated by upright evidence at the same spot
+_ROT_LONE_FLOOR = 0.75     # no upright evidence at all → presumed fake
+_ROT_WITNESS_IOU = 0.10   # min IoU for a weak upright head/face to corroborate
 _ROT_CONTAIN_AREA = 0.5   # rotated head is fake if it swallows an upright one
+_ROT_MAX_AREA_FRAC = 0.20  # rotated-only head bigger than this × frame is fake
 
 
 @dataclass(frozen=True)
@@ -281,6 +303,104 @@ def _nms(boxes: np.ndarray, iou_thr: float = _MERGE_IOU) -> np.ndarray:
     return boxes[keep]
 
 
+def _centres_inside(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(N, M) bool — a[i]'s centre lies inside b[j]'s box."""
+    if len(a) == 0 or len(b) == 0:
+        return np.zeros((len(a), len(b)), bool)
+    acx = (a[:, 0] + a[:, 2]) / 2
+    acy = (a[:, 1] + a[:, 3]) / 2
+    return ((b[None, :, 0] <= acx[:, None]) & (acx[:, None] <= b[None, :, 2])
+            & (b[None, :, 1] <= acy[:, None]) & (acy[:, None] <= b[None, :, 3]))
+
+
+def _covered_mask(faces: np.ndarray, heads: np.ndarray,
+                  iou_thr: float = _FACE_IN_HEAD_IOU) -> np.ndarray:
+    """True per face when some head box covers it — overlap beyond
+    ``iou_thr`` or the face centre inside the head (the fuse_heads
+    corroboration criterion)."""
+    if len(faces) == 0 or len(heads) == 0:
+        return np.zeros(len(faces), bool)
+    return ((_iou_matrix(faces, heads) >= iou_thr).any(axis=1)
+            | _centres_inside(faces, heads).any(axis=1))
+
+
+def match_faces(boxes: np.ndarray, witnesses: np.ndarray,
+                iou_thr: float = _WITNESS_MATCH_IOU) -> np.ndarray:
+    """True per box when some witness face agrees with it: IoU beyond
+    ``iou_thr`` or centre containment either way (two detectors box the same
+    face at different scales, and a face sits well inside a head box)."""
+    if len(boxes) == 0 or len(witnesses) == 0:
+        return np.zeros(len(boxes), bool)
+    return ((_iou_matrix(boxes, witnesses) >= iou_thr).any(axis=1)
+            | _centres_inside(boxes, witnesses).any(axis=1)
+            | _centres_inside(witnesses, boxes).any(axis=0))
+
+
+def filter_orphan_faces(
+    faces: np.ndarray, heads: np.ndarray,
+    witness_fn: Callable[[], np.ndarray],
+) -> np.ndarray:
+    """Cross-check the faces that would grow pseudo-heads.
+
+    A face covered by a head box is corroboration for that head and rides
+    along untouched. An *orphan* face becomes a blur candidate all by itself
+    (fuse_heads grows it a pseudo-head), and the primary's face class
+    misreads bare skin — so an orphan must be seconded by the witness
+    detector (SCRFD at its permissive corroboration floor, any face angle)
+    or it is presumed skin and dies here. ``witness_fn`` is called lazily:
+    it costs an inference pass and most frames have no orphans."""
+    if len(faces) == 0:
+        return faces
+    covered = _covered_mask(faces, heads)
+    if covered.all():
+        return faces
+    witnesses = np.asarray(witness_fn(), np.float32).reshape(-1, 5)
+    return faces[covered | match_faces(faces, witnesses)]
+
+
+def suppress_shadow_heads(
+    heads: np.ndarray, bodies: np.ndarray,
+    faces_fn: Callable[[], np.ndarray],
+) -> np.ndarray:
+    """One head per body *where a face pins it down*.
+
+    Inside a body box holding a face-backed head, a second disjoint head
+    claim with no face and only modest confidence (≤ _SHADOW_MAX_SCORE) is
+    anatomically a skin/limb misread — the chest-blur failure — and is
+    dropped. Deliberately narrow: never touches strong heads, heads outside
+    every body, or bodies with no face-backed member, because two entangled
+    people can merge into a single body box and the partner's back-of-head
+    must survive having no face. ``faces_fn`` (may cost an SCRFD pass) is
+    called only when some body actually holds two disjoint head claims."""
+    if len(heads) < 2 or len(bodies) == 0:
+        return heads
+    member = _centres_inside(heads, bodies)          # (H, B)
+    ious = _iou_matrix(heads, heads)
+    contested = []
+    for b in range(member.shape[1]):
+        idx = np.nonzero(member[:, b])[0]
+        if len(idx) >= 2 and \
+                (ious[np.ix_(idx, idx)] < _SHADOW_DISJOINT_IOU).any():
+            contested.append(idx)
+    if not contested:
+        return heads
+    faces = np.asarray(faces_fn(), np.float32).reshape(-1, 5)
+    backed = match_faces(heads, faces, iou_thr=_FACE_IN_HEAD_IOU)
+    if not backed.any():
+        return heads
+    drop = np.zeros(len(heads), bool)
+    for idx in contested:
+        anchors = idx[backed[idx]]
+        if len(anchors) == 0:
+            continue
+        for i in idx:
+            if backed[i] or heads[i, 4] > _SHADOW_MAX_SCORE:
+                continue
+            if (ious[i, anchors] < _SHADOW_DISJOINT_IOU).all():
+                drop[i] = True
+    return heads[~drop]
+
+
 def fuse_heads(dets: Detections, iou_thr: float = _FACE_IN_HEAD_IOU) -> np.ndarray:
     """Blur candidates: all head boxes, plus a pseudo-head for every face that
     no head box covers.
@@ -295,24 +415,15 @@ def fuse_heads(dets: Detections, iou_thr: float = _FACE_IN_HEAD_IOU) -> np.ndarr
     if len(faces) == 0:
         return heads
     out = [heads]
-    ious = _iou_matrix(faces, heads)
-    for i, f in enumerate(faces):
+    covered = _covered_mask(faces, heads, iou_thr)
+    for f in faces[~covered]:
         cx, cy = (f[0] + f[2]) / 2, (f[1] + f[3]) / 2
-        covered = False
-        if len(heads):
-            if ious[i].max() >= iou_thr:
-                covered = True
-            else:
-                inside = ((heads[:, 0] <= cx) & (cx <= heads[:, 2])
-                          & (heads[:, 1] <= cy) & (cy <= heads[:, 3]))
-                covered = bool(inside.any())
-        if not covered:
-            w, h = f[2] - f[0], f[3] - f[1]
-            pcx, pcy = cx, cy - 0.25 * h
-            pw, ph = 1.7 * w, 1.9 * h
-            out.append(np.array([[pcx - pw / 2, pcy - ph / 2,
-                                  pcx + pw / 2, pcy + ph / 2, f[4]]],
-                                dtype=np.float32))
+        w, h = f[2] - f[0], f[3] - f[1]
+        pcx, pcy = cx, cy - 0.25 * h
+        pw, ph = 1.7 * w, 1.9 * h
+        out.append(np.array([[pcx - pw / 2, pcy - ph / 2,
+                              pcx + pw / 2, pcy + ph / 2, f[4]]],
+                            dtype=np.float32))
     return np.concatenate(out, axis=0) if len(out) > 1 else heads
 
 
@@ -436,13 +547,38 @@ class HeadDetector:
                           bodies=take(s.body_ids, BODY_FLOOR))
 
     @staticmethod
-    def _filter_rotated(boxes: np.ndarray, upright: np.ndarray) -> np.ndarray:
+    def _filter_rotated(boxes: np.ndarray, upright: np.ndarray,
+                        witnesses: np.ndarray, fw: int, fh: int) -> np.ndarray:
         """Acceptance gates for a rotated pass's boxes (see _ROT_* consts):
-        stricter score floor, and no box that contains an upright-pass box of
-        half its area or less (the giant-hallucination signature)."""
+        a witness-dependent score floor, an absolute size cap (a real head
+        recovered by rotation assist is never a fifth of the frame — only
+        hallucinations are), and no box that contains an upright-pass box of
+        half its area or less (the giant-hallucination signature).
+
+        ``upright`` is the same class's upright boxes (containment gate);
+        ``witnesses`` is *all* upright evidence — heads and faces at the
+        parse floor plus bodies. A rotated box is corroborated when it
+        overlaps a weak upright head/face beyond _ROT_WITNESS_IOU (the IoU
+        bar keeps a big fake from being blessed by a speck of upright noise
+        it happens to cover) or its centre lies inside an upright body; only
+        corroborated boxes get the normal floor, the rest need
+        _ROT_LONE_FLOOR."""
         if len(boxes) == 0:
             return boxes
-        boxes = boxes[boxes[:, 4] >= _ROT_SCORE_FLOOR]
+        floor = np.full(len(boxes), _ROT_LONE_FLOOR, np.float32)
+        if len(witnesses):
+            iou_ok = (_iou_matrix(boxes, witnesses)
+                      >= _ROT_WITNESS_IOU).any(axis=1)
+            bcx = (boxes[:, 0] + boxes[:, 2]) / 2
+            bcy = (boxes[:, 1] + boxes[:, 3]) / 2
+            inside = ((witnesses[None, :, 0] <= bcx[:, None])
+                      & (bcx[:, None] <= witnesses[None, :, 2])
+                      & (witnesses[None, :, 1] <= bcy[:, None])
+                      & (bcy[:, None] <= witnesses[None, :, 3])).any(axis=1)
+            floor[iou_ok | inside] = _ROT_SCORE_FLOOR
+        area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        boxes = boxes[(boxes[:, 4] >= floor)
+                      & (area <= _ROT_MAX_AREA_FRAC * fw * fh)]
         if len(boxes) == 0 or len(upright) == 0:
             return boxes
         ucx = (upright[:, 0] + upright[:, 2]) / 2
@@ -498,12 +634,16 @@ class HeadDetector:
                 base = Detections()
             if not extra_heads and not extra_faces:
                 return base
+            witnesses = np.concatenate(
+                [base.heads, base.faces, base.bodies])
             rot_heads = self._filter_rotated(
                 np.concatenate(extra_heads) if extra_heads
-                else np.empty((0, 5), np.float32), base.heads)
+                else np.empty((0, 5), np.float32),
+                base.heads, witnesses, fw, fh)
             rot_faces = self._filter_rotated(
                 np.concatenate(extra_faces) if extra_faces
-                else np.empty((0, 5), np.float32), base.faces)
+                else np.empty((0, 5), np.float32),
+                base.faces, witnesses, fw, fh)
             return Detections(
                 heads=_nms(np.concatenate([base.heads, rot_heads])),
                 faces=_nms(np.concatenate([base.faces, rot_faces])),

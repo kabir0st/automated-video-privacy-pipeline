@@ -8,8 +8,10 @@ Verifies, in order:
   2. the detector model resolves (bundle/cache/env), loads, and the session
      lands on DmlExecutionProvider — not a silent CPU fallback;
   3. a detection pass returns sane per-class boxes (with rotation assist);
-  4. the Kalman tracker consumes them across a few frames;
-  5. mask render + blur run on the available backend.
+  4. the SCRFD close-up assist model loads and detects under DirectML
+     (its pinned graph must survive DML's strict validation);
+  5. the Kalman tracker consumes them across a few frames;
+  6. mask render + blur run on the available backend.
 
 Prints timings so a CPU fallback is obvious (~100 ms/frame CPU vs ~5-15 ms
 DML for the s-model at 640).
@@ -31,9 +33,12 @@ if "DmlExecutionProvider" not in ort.get_available_providers():
 
 from libs.detector import HeadDetector, fuse_heads, model_path  # noqa: E402
 from libs.head_tracker import HeadTracker  # noqa: E402
+from libs.scrfd import ScrfdDetector  # noqa: E402
+from libs.scrfd import model_path as scrfd_model_path  # noqa: E402
 from libs.utils import BlurPipeline, render_head_mask  # noqa: E402
 
 print("model:", model_path() or "MISSING (run the app once, or set AVPP_DETECTOR_ONNX)")
+print("scrfd:", scrfd_model_path() or "MISSING (run the app once, or set AVPP_SCRFD_ONNX)")
 
 # Source frames: a video/image path if given, else a synthetic gradient with
 # no people (still exercises the full code path, just detects nothing).
@@ -75,4 +80,15 @@ for i, frame in enumerate(frames):
           f"({ms:.0f} ms, detect {det.last_ms:.0f} ms)")
 
 assert det.available, "detector failed to initialise"
+
+# SCRFD close-up assist: in the app it only fires when the primary sees
+# nothing confident, but its DML session must be known-good, so poke it
+# directly here.
+scrfd = ScrfdDetector(on_status=print)
+t0 = time.perf_counter()
+faces = scrfd.detect(frames[0])
+print(f"scrfd: faces={len(faces)} "
+      f"({(time.perf_counter() - t0) * 1e3:.0f} ms, "
+      f"infer {scrfd.last_ms:.0f} ms)")
+assert scrfd.available, "scrfd close-up assist failed to initialise"
 print("SMOKE OK")

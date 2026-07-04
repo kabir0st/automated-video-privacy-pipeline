@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — false-positive blurs on Max Privacy
+
+- **Rotation-assist hallucinations with no upright witness.** The ±90° recall
+  passes could hallucinate "heads" — frame-spanning or bed-sized — on scenes
+  with *no real head in frame*; the containment gate only fired when the
+  upright pass had found one, so on empty scenes the fake sailed through,
+  formed a confident static track, survived every offline gate and blurred
+  the furniture. Two gates in `detector._filter_rotated` now close this: an
+  absolute area cap (rotated-only heads > 20 % of the frame are fake), and a
+  **witness rule** — the head class is 360°-trained, so a real sideways head
+  never leaves the upright pass completely blind at its spot; a rotated box
+  with no upright corroboration (weak head/face overlap or a body containing
+  its centre) must clear 0.75 instead of 0.50 to survive.
+- **Tracklet verification by cropped re-inference**
+  (`tracklets.verify_tracklets`). Between the export passes, every tracklet
+  that survives the prune must *reproduce*: up to 5 of its hit frames are
+  re-read, cropped around its box with context, and re-detected. A real head
+  re-detects stronger when magnified; a persistent hallucination (long *and*
+  confident, so score/length gates can't touch it) doesn't reproduce and is
+  dropped before rendering. Fail-open: unreadable frames or a downed detector
+  never remove a blur.
+
+### Added — extreme-close-up recall assist
+
+- **SCRFD close-up fallback** (`src/libs/scrfd.py`). When the primary
+  detector finds no confident head or face — the extreme-close-up signature —
+  a standalone SCRFD det_10g wrapper (no insightface package; same
+  one-session-never-destroyed DirectML rules) supplies face boxes that grow
+  pseudo-heads. Bundled into the exe (~17 MB), preflighted at startup,
+  overridable via `AVPP_SCRFD_ONNX` / `AVPP_SCRFD_URL`, and it degrades to
+  off on any failure. Gated to its actual mission (`closeup_filter`): only
+  faces at close-up scale (longest side ≥ 25 % of the frame's short side)
+  that clear the user's confidence bar are accepted — SCRFD misreading bare
+  skin or blanket texture as a face is the failure that got insightface
+  dropped from this project once already, and the fallback state holds on
+  every frame of head-free footage.
+
+---
+
 This release rebuilds face finding around **whole-body pose** so the blur holds
 on faces at the hard angles the previous frontal detector missed — two people
 in bed, cuddling, top-down close-ups — and pushes the heavy work onto the GPU.

@@ -45,6 +45,15 @@ _SIZE_GATE = (0.5, 2.0)  # stage 3: w and h ratio bounds
 
 _MAX_TRACKS = 16         # bounds pathological detector spam
 
+# face_age for a track that has never shown a face. Face evidence (the
+# detector's face class cross-checked/supplemented by SCRFD) is matched to
+# tracks every frame; ``face_age`` counts frames since the last match, so
+# callers can require a *recent* face rather than a face-this-frame — the
+# temporal smoothing that keeps a blur steady while a head briefly turns or
+# the face detector flickers, as long as the track itself stays coherent
+# (the association gates are the "body position hasn't changed" test).
+FACE_NEVER = 1 << 30
+
 
 class TrackObs(NamedTuple):
     track_id: int
@@ -53,6 +62,7 @@ class TrackObs(NamedTuple):
     hit: bool                # matched a detection this frame
     confirmed: bool
     coast_frames: int        # consecutive frames without a detection
+    face_age: int = FACE_NEVER   # frames since face evidence matched this track
 
 
 class _KalmanBox:
@@ -146,6 +156,7 @@ class _Track:
         self.confirmed = min_hits <= 1
         self.last_score = float(det[4])
         self.hit = True
+        self.face_age = FACE_NEVER
 
     def mark_hit(self, det: np.ndarray, min_hits: int) -> None:
         self.kf.update(_to_z(det))
@@ -205,13 +216,20 @@ class HeadTracker:
     def _max_age(self) -> int:
         return max(1, int(round(self.max_age_s * self._fps)))
 
-    def update(self, heads: np.ndarray, frame_shape: tuple) -> list[TrackObs]:
-        """Advance one frame with (N,5) head candidates; return live tracks."""
+    def update(self, heads: np.ndarray, frame_shape: tuple,
+               faces: np.ndarray | None = None) -> list[TrackObs]:
+        """Advance one frame with (N,5) head candidates; return live tracks.
+
+        ``faces`` is optional (N,5) face *evidence* in the same frame — each
+        track's ``face_age`` resets to 0 when a face lands on its box this
+        frame, and ages by 1 otherwise (including when no evidence was
+        collected at all)."""
         fh, fw = frame_shape[:2]
         heads = np.asarray(heads, dtype=np.float32).reshape(-1, 5)
 
         for t in self._tracks:
             t.kf.predict()
+            t.face_age = min(t.face_age + 1, FACE_NEVER)
 
         high = heads[heads[:, 4] >= self.det_conf]
         low = heads[(heads[:, 4] >= self.det_conf_low)
@@ -298,6 +316,22 @@ class HeadTracker:
                     _Track(self._next_id, high[di], self.min_hits))
                 self._next_id += 1
 
+        # Face evidence → per-track memory (newborn tracks included).
+        if faces is not None:
+            faces = np.asarray(faces, dtype=np.float32).reshape(-1, 5)
+            if len(faces):
+                fcx = (faces[:, 0] + faces[:, 2]) / 2
+                fcy = (faces[:, 1] + faces[:, 3]) / 2
+                for t in self._tracks:
+                    b = t.kf.box
+                    bcx, bcy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+                    in_t = ((b[0] <= fcx) & (fcx <= b[2])
+                            & (b[1] <= fcy) & (fcy <= b[3]))
+                    t_in = ((faces[:, 0] <= bcx) & (bcx <= faces[:, 2])
+                            & (faces[:, 1] <= bcy) & (bcy <= faces[:, 3]))
+                    if bool((in_t | t_in).any()):
+                        t.face_age = 0
+
         return [TrackObs(t.id, t.kf.box, t.last_score, t.hit, t.confirmed,
-                         t.coast_frames)
+                         t.coast_frames, t.face_age)
                 for t in self._tracks]
