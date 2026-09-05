@@ -3,7 +3,9 @@
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -97,3 +99,47 @@ def test_binary_mask_hard_path_unchanged():
     bp.apply(frame, mask)
     assert (frame[0:29, 0:29] == orig[0:29, 0:29]).all()
     assert not (frame[30:70, 30:70] == orig[30:70, 30:70]).all()
+
+
+class TestFeatherROIEquivalence:
+    """render_head_mask feathers only the sub-rect the ellipses touch. That is
+    a pure optimisation, so it has to be bit-identical to blurring the whole
+    frame — including when a head hangs off an edge (cv2.ellipse clips, and
+    the ROI must clip the same way) or fills the frame (ROI == frame)."""
+
+    @staticmethod
+    def _full_frame(shape_hw, boxes, pad=0.18, feather=0.12):
+        mask = np.zeros(shape_hw, np.uint8)
+        boxes = list(boxes)
+        if not boxes:
+            return mask
+        diags = [float(np.hypot(b[2] - b[0], b[3] - b[1])) for b in boxes]
+        k = (max(3, int(round(feather * (sum(diags) / len(diags)))) | 1)
+             if feather > 0 else 0)
+        r = k / 2.0
+        for b in boxes:
+            x1, y1, x2, y2 = (float(v) for v in b[:4])
+            w, h = x2 - x1, y2 - y1
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            ax = max(1.0, w / 2.0 * (1.0 + 2.0 * pad) + r)
+            ay = max(1.0, h / 2.0 * (1.0 + 2.0 * pad) + r)
+            cv2.ellipse(mask, (int(round(cx)), int(round(cy))),
+                        (int(round(ax)), int(round(ay))), 0, 0, 360, 255, -1)
+        if k >= 3:
+            mask = cv2.GaussianBlur(mask, (k, k), 0)
+        return mask
+
+    @pytest.mark.parametrize("feather", [0.0, 0.05, 0.12, 0.4])
+    @pytest.mark.parametrize("boxes", [
+        [np.array([300., 200., 460., 400.], np.float32)],
+        [np.array([100., 100., 260., 300.], np.float32),
+         np.array([700., 400., 900., 620.], np.float32)],
+        [np.array([-80., -60., 120., 140.], np.float32)],       # off top-left
+        [np.array([1180., 640., 1400., 900.], np.float32)],     # off bot-right
+        [np.array([0., 0., 1280., 720.], np.float32)],          # fills frame
+    ])
+    def test_matches_full_frame_gaussian(self, boxes, feather):
+        shape = (720, 1280)
+        assert np.array_equal(
+            self._full_frame(shape, boxes, feather=feather),
+            render_head_mask(shape, boxes, feather=feather))

@@ -1,115 +1,71 @@
 # Pipeline Dataflow
 
-The Automated Video Privacy Pipeline anonymises faces in video with an
-**evidence-gated, two-pass** design: no single detection is ever a blur
-target by itself. Three lightweight ONNX models (a body/head/face/parts
-detector, a landmark-checked witness face detector, and a body pose
-estimator) all feed one acceptance gate; only a face claim that clears
-anatomical anchoring, independent corroboration, and an unresolved-veto
-check becomes a candidate a Kalman tracker may follow. Offline, a fourth
-model (an independent, adult-content-trained witness) re-verifies every
-surviving track before a review dialog gives you the final say, and only
-then does the render pass paint blur.
+End-to-end path of one video through the union pipeline, stage by stage,
+with the module responsible for each. The GUI (`src/app/`) and the CLI
+(`src/cli.py`) drive exactly the same functions (`src/pipeline/session.py`).
 
-Entry point [`src/main.py`](../src/main.py) shows the splash and hands off to
-the PyQt6 inspector ([`src/ui.py`](../src/ui.py)) — the GUI is the sole entry
-point.
+The design has two cost tiers. **Detection** (pass 1) is the only expensive
+thing and runs once per video; its per-frame output is cached. **Everything
+else** — tracking, refinement, scoring, table building, rendering — runs from
+that cache in seconds, so every knob except the detection set can be
+changed and re-applied without re-detecting.
 
 ## Diagram
 
 ```mermaid
 flowchart TD
-    subgraph Input
-        VID[Video file]
-        VC["OpenCV VideoCapture<br/>(BGR frame)"]
-        VID --> VC
-    end
-
-    VC --> FRAME([frame])
-
-    subgraph P1["Export pass 1 · analyse (no blur)"]
-        direction TB
-        FRAME --> DET["HeadDetector<br/>PINTO YOLOv9-Wholebody17 (ONNX)<br/>body/head/face + eye/nose/mouth/ear (parts)<br/>+ hand/foot (negatives) · optional ±90° rotation assist"]
-        FRAME --> SCRFD["ScrfdDetector<br/>every frame — landmark-checked witness<br/>face + 5-pt landmarks (kps_plausible gate)"]
-        DET --> POSE["PoseEstimator<br/>RTMPose-m body7 SimCC, top-down on ≤2 bodies<br/>→ head-anchor box + shoulder→hip torso axis"]
-        DET --> GATE{{"gate_face_candidates()<br/>anatomical anchor (head box / pose+axis)<br/>+ part or landmark corroboration<br/>+ no unresolved hand/foot veto<br/>(or extreme-close-up cross-model consensus)"}}
-        SCRFD --> GATE
-        POSE --> GATE
-        GATE --> TRK["HeadTracker<br/>constant-velocity Kalman ·<br/>BYTE two-stage association · Hungarian<br/>— only gated candidates spawn/drive a track"]
-        TRK --> REC["TrackRecorder<br/>per-frame TrackObs + Ev evidence flags,<br/>full-res coords"]
-    end
-
-    REC --> CLEAN["tracklets.clean_tracklets()<br/>trim · composite prune (length/score/hit-ratio<br/>+ evidence ledger) · cross-model VERIFY ·<br/>bridge gaps · face-gap fill · extend · SavGol smooth"]
-    CLEAN --> SIDE[("sidecar.py<br/>raw tracklets cached next to the source,<br/>fingerprinted on file + analysis params")]
-    CLEAN --> REVIEW{{"ReviewDialog (PyQt6)<br/>enable/disable tracks · draw manual regions<br/>— blocks the worker thread until closed"}}
-    REVIEW --> TABLE[("RenderTable<br/>frame → [(id, head box, face box, face_ok)]<br/>+ manual regions")]
-    REVIEW -.-> SIDE
-
-    subgraph P2["Export pass 2 · render (no inference)"]
-        direction TB
-        VC2["fresh VideoCapture"] --> FRAME2([frame])
-        TABLE --> MASK["render_head_mask()<br/>padded feathered ellipses<br/>(face-only box, or whole head)"]
-        FRAME2 --> BLUR["BlurPipeline · Gaussian + pixelate<br/>CUDA/PyTorch · OpenCL/UMat · CPU"]
-        MASK --> BLUR
-        BLUR --> WRITE["FFmpegWriter · libx264<br/>+ audio stream-copy from source"]
-        WRITE --> OUT[Anonymised MP4]
-    end
-
-    PROV["best_onnx_providers()<br/>DirectML → CUDA → ROCm → CPU"] -.-> DET
-
-    classDef tech fill:#1f2937,stroke:#60a5fa,color:#e5e7eb;
-    class DET,SCRFD,POSE,TRK,CLEAN,MASK,BLUR,WRITE tech;
+    V([Video file]) --> DEC["Decode thread<br/>queue(4), sequential"]
+    DEC --> STR{stride?}
+    STR -->|skip| DEC
+    STR -->|analyse| HD["Head detector (YOLO11-L)<br/>0° 90° 180° 270°"]
+    STR --> WB["Wholebody17<br/>0° 90° 180° 270°<br/>heads + faces"]
+    STR --> SC["SCRFD det_10g<br/>0° 180°<br/>landmark-plausible faces"]
+    STR --> NN["NudeNet 320<br/>body-part boxes (veto)"]
+    HD --> FU
+    WB --> FU
+    SC --> FU
+    NN --> FU
+    FU{{"fuse()<br/>heads cluster · faces corroborate across model families ·<br/>score = max + 0.15/extra family ·<br/>body-part veto · single-family trust: aspect, rotated-only, frame-filling"}}
+    FU --> TR["Tracker<br/>Kalman CV · Hungarian IoU ·<br/>BYTE sustain ≥0.10 · spawn ≥0.35 ·<br/>coast 2.5 s · face memory"]
+    TR --> REC["TrackRecorder<br/>step-space tracklets"]
+    FU --> RAW[("raw candidates<br/>per analysed frame")]
+    REC --> SIDE[("&lt;video&gt;.avpp2.json<br/>fingerprint · tracklets · raw · decisions · manual")]
+    RAW --> SIDE
+    SIDE --> RT["retrack()<br/>tracker knobs from cache"]
+    RT --> RF["refine()<br/>trim → soft prune → identify → bridge →<br/>fill face gaps → extend 0.3 s → SavGol → upsample"]
+    RF --> SCO["score_tracks()<br/>lonely · unverified · weak · short ·<br/>sparse · static · rotated · oversized"]
+    SCO --> REV{{"Timeline review<br/>toggle · split · trim · draw+propagate"}}
+    REV --> TAB["build_table()<br/>velocity-padded xyxy per frame"]
+    TAB --> REN["render_video()<br/>feathered ellipse mask → blur stack → ffmpeg + audio copy"]
+    REN --> OUT([Anonymised MP4])
 ```
-
-The **live preview** runs the same detect → pose → gate → track chain as
-pass 1 in streaming mode (confirmed tracks only, short hold) and blurs a
-display-resolution copy — approximate by design, with no offline cleanup,
-cross-model verify, or review step; the export's full pipeline is what the
-written file gets.
 
 ## Stage-by-stage
 
-| # | Stage | Tech | Source | Purpose |
-|---|-------|------|--------|---------|
-| 1 | Decode | OpenCV `VideoCapture` on a reader thread | [ui.py](../src/ui.py) | Read BGR frames; overlaps GPU inference |
-| 2 | Detection | PINTO YOLOv9-Wholebody17 post-ONNX (ONNX Runtime) | [detector.py](../src/libs/detector.py) | One pass → body/head/face boxes, eye/nose/mouth/ear "part" hits, and hand/foot "negative" evidence. None of this is a blur target by itself — it is evidence for the gate. Optional ±90° rotated passes recover sideways heads, gated against hallucinations (score floor, absolute area cap, containment test, upright-witness corroboration) |
-| 3 | Witness face detection | SCRFD det_10g (ONNX Runtime), every frame | [scrfd.py](../src/libs/scrfd.py) | Independent face + 5-point-landmark detector. Faces whose landmark geometry fails `kps_plausible` (a scattered/degenerate layout — fabric or skin misread as a face) are cut before the gate ever sees them; the rest are consensus/corroboration evidence, same as the primary's own face class |
-| 4 | Pose | RTMPose-m body7 SimCC (ONNX Runtime), top-down on ≤2 bodies | [pose.py](../src/libs/pose.py) | 17 COCO keypoints per body → a coarse head-anchor box (oriented by the shoulder→hip torso axis, so a "head" on the hip side of the body — legs misread as a face — is rejected) and the axis itself, used to test whether a face claim sits on the correct side of the body |
-| 5 | Evidence gate | Pure NumPy (`gate_face_candidates`) | [evidence.py](../src/libs/evidence.py) | The precision mechanism: a face claim becomes a blur candidate only when anatomically anchored (inside an independent head box, or on the head side of a pose-confirmed torso axis) **and** corroborated (an eye/nose/mouth hit, a landmark-checked SCRFD witness, or confident pose keypoints) **and** not vetoed by a hand/foot detection substantially covering it (unless strong evidence overrides the veto — a hand genuinely resting on a face is a real scene). An extreme-close-up path substitutes cross-model consensus (primary + SCRFD agreeing, at close-up scale) when there is no body/pose context to anchor to at all |
-| 6 | Tracking | Constant-velocity Kalman + BYTE association + Hungarian (NumPy/SciPy) | [head_tracker.py](../src/libs/head_tracker.py) | Stable ids; only gated candidates may spawn or drive a track. Low-score, veto-passed detections sustain a track through occlusion but never spawn one; min-hits confirmation kills 1-frame false positives |
-| 7 | Offline cleanup | `tracklets.clean_tracklets` (NumPy/SciPy + cross-model re-inference) | [tracklets.py](../src/libs/tracklets.py) | Trim coasted tails; **composite prune** — length/score/hit-ratio *and* an evidence ledger (a tracklet that never accumulates real anatomical/part backing is dropped regardless of score/length, which is what catches a static skin/fabric misread that reproduces every frame at high confidence); **cross-model VERIFY** — every survivor must be re-detected by an INDEPENDENT witness (SCRFD and/or NudeNet — never the primary detector that produced the track) on a magnified crop, or fall back to its evidence grade when no witness could run; bridge detection gaps with interpolation (corridor + ambiguity gates against identity smears); fill short face-evidence gaps separately from head bridging; zero-phase Savitzky-Golay smoothing |
-| 7b | Cross-model witness | NudeNet YOLOv8n (ONNX Runtime), offline-only | [nudenet.py](../src/libs/nudenet.py) | An adult-content-trained detector with explicit `FACE_FEMALE`/`FACE_MALE` classes — a genuinely independent second opinion from a different training distribution than the primary/SCRFD, used only during VERIFY, never per-frame |
-| 8 | Analysis cache | JSON sidecar, keyed on file identity + analysis params | [sidecar.py](../src/libs/sidecar.py) | Persists pass-1's raw tracklets (and review decisions) next to the source; a re-export with unchanged analysis-affecting params (confidence floors, evidence profile, rotation assist) skips pass 1 entirely, replaying cleanup-only changes (bridge gap, smoothing, blur region) from the cache |
-| 9 | Review | PyQt6 modal dialog, GUI thread | [review_ui.py](../src/review_ui.py) | Every kept/rejected track, worst grade first, with a thumbnail — enable/disable any track, or draw a manual blur region (rubber-band + start/end keyframe, linearly interpolated). The export worker thread blocks on this via a `threading.Event` handshake (`ui.py`'s `review_ready`/`take_review_request`/`submit_review_decision`) since PyQt widgets can't run on a `QThread` |
-| 10 | Masking | Padded feathered ellipses (OpenCV) | [utils.py](../src/libs/utils.py) `render_head_mask` | One consistent shape per blur target, every frame — no popping; feather hides jitter. Face-only mode skips any frame where face evidence isn't fresh rather than falling back to the head box |
-| 11 | Blur | Gaussian + pixelate stack — CUDA/PyTorch · OpenCL/UMat · CPU | [utils.py](../src/libs/utils.py) `BlurPipeline` | One masked composite per frame; soft (alpha) compositing for feathered masks |
-| 12 | Encode | FFmpeg libx264 via imageio-ffmpeg (cv2 fallback) | [video_writer.py](../src/libs/video_writer.py) | Source-bitrate-matched MP4, valid past 4 GiB; source audio stream-copied |
-
-The ONNX execution provider is selected once by
-[`best_onnx_providers()`](../src/libs/utils.py): **DirectML → CUDA → ROCm → CPU**.
-Every model's session is created once and never destroyed, with its input
-shape-pinned — both DirectML survival rules, applied identically across the
-detector, SCRFD, pose and NudeNet.
+| # | Stage | Where | What happens |
+| --- | --- | --- | --- |
+| 1 | Decode | `pipeline/analysis.py:_decode_thread` | Sequential decode on a thread into a 4-deep queue; frames not on the stride are counted and dropped. |
+| 2 | Detect | `analysis.py:detect_frame` | Head detector on each configured rotation (`libs/headdet.py`), Wholebody17 heads + faces per rotation (`libs/detector.py`), SCRFD faces per rotation filtered by `kps_plausible` (`libs/scrfd.py`), and NudeNet's non-face classes as body-part boxes (`libs/nudenet.py`, one 320 px pass). Rotated boxes are mapped back with `geom.unrotate_boxes`. Every source's boxes are cached in the sidecar. |
+| 3 | Fuse | `pipeline/fuse.py:fuse` | **Heads define geometry, faces corroborate.** Head claims (head detector, Wholebody head) cluster greedily by score (IoU ≥ 0.45 or centre containment within a 0.45–1.8× area ratio); the cluster box is the score-weighted mean. Each face (SCRFD, Wholebody face) attaches to the head cluster that contains its centre and is under 8× its area, adding its source bit and, if it comes from a *different model family*, `FACE_IN_HEAD` — a face never changes a cluster's box (a face grown to head scale is larger than a close-up head and used to spawn torso-sized duplicates). Faces nothing covers become head-sized claims via `geom.grow_to_head` (×1.35 wide, ×1.55 tall). Score = best member (faces × 0.9) + 0.15 per extra **family** (head detector / Wholebody / SCRFD — Wholebody's head and face classes are one network, one family). When a cluster exceeds 1.5× its attached face's grown area, its box is pulled halfway toward the face. A candidate that coincides with a NudeNet body-part box (IoU ≥ 0.45, 70 % inside one, or a part of ≥ 10 % its area lying inside it) is flagged `BODYPART` unless a cross-family face corroborates it; by default the flag only feeds the `bodypart` suspicion component (`bodypart_weight = 1.0`), because suppressing spawn measured three points of head coverage lost for a dozen fewer unsupported boxes — the *Strict* preset sets 0.3 and actually vetoes. Single-family claims without a cross-family face are scaled by source trust (Wholebody ×0.7) and lose more weight when frame-filling (×0.5 over 30 %), oddly shaped (×0.5 outside 0.45–2.2 aspect) or rotated-only (×0.7); a rotated-only single-family claim over 30 % of the frame is dropped. |
+| 4 | Track | `pipeline/tracker.py:Tracker.update` | Constant-velocity Kalman per track. Stage 1: Hungarian on IoU ≥ 0.15 with candidates ≥ `spawn_conf`, sizes within 0.5–2× the track's. Stage 2 (BYTE): recently-alive leftovers × candidates ≥ `sustain_conf` at IoU ≥ 0.25 and sizes within 0.6–1.7× (flagged `SUSTAIN`) — the size gates stop a torso-sized weak box, whose IoU with the head it contains can clear the bar, from dragging the Kalman box up to torso size. Stage 3: unmatched confirmed tracks × leftovers by centre distance under one diagonal with a size gate. Unconfirmed tracks die after one miss; confirmed ones coast `max_age_s`. Raw faces refresh a per-track face box stored relative to the head. |
+| 5 | Record | `pipeline/record.py` | Per-frame observations → contiguous step-space `Tracklet`s (six channels). |
+| 6 | Persist | `pipeline/project.py` | Sidecar keyed by file size+mtime and the *detection* fingerprint (`AnalysisConfig.fingerprint()`, which excludes fusion and tracker knobs). Holds per-source detections, fused candidates and faces, tracklets, review overrides, manual heads, edits. |
+| 7 | Re-fuse + re-track | `analysis.py:retrack` | Whenever the offline stages run, fusion and tracking are rebuilt from the cached per-source detections with the current knobs (seconds). |
+| 8 | Refine | `pipeline/refine.py:refine` | **Trim** coasted ends. **Prune** only tracklets with no temporal support (one measurement; under 0.2 s with < 3 hits and no face evidence; < 20 % measured; top score < 0.2) — set aside, not deleted. **Identify** (ArcFace mean over face-evidence frames). **Bridge** gaps ≤ 2.5 s when the velocity-extrapolated landing point is within `diag × (0.75 + gap/gap_max)`, sizes within 0.5–2×, no other track in the corridor (IoU > 0.45), no near-equal competing join, and appearance does not veto (`cos < DIFF_ID_COS`); gap frames are `INTERP` with mid-gap padding. **Fill** face gaps ≤ 2 s. **Extend** 0.3 s each end. **Smooth** SavGol 0.3 s. **Upsample** to frame space; non-measured frames are `INTERP`, never hits. |
+| 9 | Score | `pipeline/score.py` | Components in 0–1, weighted mean: lonely 0.25 (no `MULTI`/`FACE_IN_HEAD` ever), bodypart 0.25 (share of hits vetoed by a body-part box), unverified 0.15 (magnified re-detection by SCRFD + head detector on 5 crops; a re-detection inside the box counts only if it is at least 30 % of the box's area), oversized 0.12 (over 25 % of the frame), weak 0.08, short 0.05, sparse 0.05, static 0.03, rotated 0.02. `kept = suspicion < auto_disable_above`. Set-aside tracklets score ≥ 0.9 with their reason. |
+| 10 | Review | `src/app/` | Lanes sorted by suspicion; alert strip = frames with a fused candidate ≥ `spawn_conf` that no blur box overlaps. Drawn boxes are propagated by `pipeline/propagate.py` (snap to cached candidates, else NCC template match, hold ≤ 6 frames). Decisions save to the sidecar with a 0.6 s debounce. |
+| 11 | Table | `pipeline/render.py:build_table` | Enabled tracks (default `kept`, overridable) and manual heads → per-frame xyxy; face mode uses the bloomed face box where `fvalid` else the head box; every box grows by `motion_lead ×` its per-frame centre displacement. |
+| 12 | Render | `render.py:render_video` | Decode thread → `libs/utils.render_head_mask` (padded feathered ellipse, ROI-limited blur) → `BlurPipeline.apply` (CUDA / OpenCL UMat / CPU) → `libs/video_writer` (ffmpeg, audio stream-copied, no `-shortest`). |
 
 ## Tech inventory
 
-- **Language / tooling:** Python 3.12, `uv`, PyInstaller (Windows .exe)
-- **Detection:** PINTO model zoo 457_YOLOv9-Wholebody17 (`s` variant, ~28 MB,
-  bundled into the exe); swappable via `AVPP_DETECTOR*` env vars
-  (434_YOLOX-Body-Head-Hand-Face spec included)
-- **Witness face detection:** insightface SCRFD det_10g (~17 MB, bundled),
-  standalone ONNX wrapper (no insightface package); overridable via
-  `AVPP_SCRFD*` env vars
-- **Pose:** RTMPose-m body7 SimCC (~25 MB, bundled), standalone ONNX wrapper
-  (no rtmlib/mmpose package); overridable via `AVPP_POSE*` env vars
-- **Cross-model verify witness:** NudeNet YOLOv8n `320n.onnx` (~12 MB,
-  bundled, sourced from the official PyPI wheel rather than the upstream
-  GitHub release — see `libs/nudenet.py`'s module docstring); overridable via
-  `AVPP_NUDENET*` env vars
-- **Inference runtime:** ONNX Runtime (DirectML on the RX 6800 / CUDA / ROCm /
-  CPU), fp32 by default (`AVPP_FP16` gates the fp16 derivative)
-- **Numerics:** NumPy (Kalman, geometry, evidence gate), SciPy (Hungarian
-  assignment, Savitzky-Golay)
-- **Video I/O & blur:** OpenCV (`cv2`), OpenCL/UMat GPU blur path
-- **Encoding:** FFmpeg / libx264 via imageio-ffmpeg, audio stream-copy
-- **GUI:** PyQt6 (main inspector + the review dialog)
+| Stage | Model / library | Input | Notes |
+| --- | --- | --- | --- |
+| Head detection | deepghs `head_detect_v0_l_yv11` (YOLO11-L, ONNX, 101 MB) | 640 letterbox, RGB /255 | `AVPP_HEADDET` picks n/s/m/l; raw `(1,5,N)` output decoded in numpy |
+| Second head vote + faces | PINTO YOLOv9-S Wholebody17 (28 MB) | 640 resize, raw BGR | NMS baked in; head class trained on all orientations |
+| Faces | InsightFace SCRFD det_10g (17 MB) | 640 (1280 in Max Privacy) letterbox | 5-point landmark plausibility filter kills skin/fabric misreads |
+| Identity | InsightFace MobileFaceNet ArcFace (14 MB) | 112×112 aligned crops | veto only |
+| Body-part veto | NudeNet YOLOv8n (12 MB, AGPL-3.0) | 320 letterbox | non-face classes veto head candidates at fusion; also `AVPP_*` switchable via `use_bodypart` |
+| Runtime | ONNX Runtime; DirectML → CUDA → MIGraphX → ROCm → CPU | | providers verified by dlopen, fp16 derivative on GPU |
+| Blur | OpenCV (OpenCL UMat) or PyTorch CUDA | | pixelate + Gaussian stack, one pass per frame |
+| Encode | imageio-ffmpeg static ffmpeg | | H.264 CRF 18, audio copied |

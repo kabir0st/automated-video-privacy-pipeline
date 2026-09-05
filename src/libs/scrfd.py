@@ -1,13 +1,19 @@
-"""Supplementary SCRFD face detector — extreme-close-up recall assist.
+"""SCRFD witness face detector — independent corroboration, every frame.
 
-The primary Wholebody17 detector owns heads (all 360° orientations), but it
-can come up empty on extreme close-ups where only part of a face fills the
-frame — no whole head, no whole body, just an eye/cheek/forehead. SCRFD is a
-dedicated face detector that stays reliable on exactly those crops, so it
-runs as a *fallback only*: when the upright pass finds no confident head or
-face, SCRFD's faces are unioned in and grow pseudo-heads via
-``fuse_heads`` like any orphan face. It never replaces the primary (it cannot
-see back-of-heads at all) and it costs nothing on frames the primary handles.
+The primary Wholebody17 detector owns heads (all 360° orientations); SCRFD is
+a dedicated face detector with 5-point landmarks that stays reliable where the
+primary struggles, notably extreme close-ups where only part of a face fills
+the frame — no whole head, no whole body, just an eye/cheek/forehead.
+
+It runs on **every frame** as a first-class evidence source for
+``libs/evidence.py``'s gate, and again offline as one of the cross-model
+VERIFY witnesses. (It was a close-up-only fallback originally; it was promoted
+because independent corroboration is what separates a real face from
+face-shaped skin, and a witness that only speaks when the primary is silent
+can't corroborate anything.) Its faces are never blur targets by themselves —
+``kps_plausible`` cuts landmark-implausible claims before the gate sees them,
+and the gate decides the rest. It never replaces the primary, which sees
+back-of-heads it cannot.
 
 This is a standalone ONNX wrapper, not a return of the insightface package
 (dropped in the single-detector rewrite — it dragged heavy deps into the exe
@@ -43,6 +49,28 @@ _MEMBER = "det_10g.onnx"
 _URL = ("https://github.com/deepinsight/insightface/releases/download/"
         "v0.7/buffalo_l.zip")
 _INPUT_HW = (640, 640)   # pinned into the graph for DirectML
+
+# Why this is square, and why shrinking it is not available:
+#
+# Letterboxing a 16:9 frame into 640x640 leaves ~44 % of the tensor as black
+# padding that every convolution still pays for, and SCRFD is not cheap — on
+# this project's CPU path it costs about as much per frame as one full pass of
+# the primary detector. Sizing the canvas to the source's aspect ratio (640x384
+# for 16:9) would be *lossless*, since the letterbox scale min(W/fw, H/fh) is
+# unchanged by shrinking the axis the content doesn't occupy — the same pixels
+# at the same scale, just less padding. It measured at ~1.67x on that stage.
+#
+# The det_10g export makes it impossible. Its input is [1, 3, '?', '?'] where
+# both spatial dims share ONE symbolic name, so fixing H also fixes W and the
+# graph can only ever be square; and its outputs are hard-coded to 12800/3200/
+# 800 rows (80^2 + 40^2 + 20^2, times _ANCHORS_PER_CELL) — the anchor counts for
+# 640x640 specifically. Pinning any other shape fails outright in
+# onnxruntime's fix_output_shapes:
+#     ValueError: Can't replace existing fixed size of 384 with 640
+# _decode() is written against (h, w) and would handle a rectangular grid fine,
+# so this is purely a property of the published weights. Re-exporting SCRFD from
+# insightface with dynamic axes would unlock it; swapping to a lighter variant
+# (det_2.5g, det_500m) is the cheaper way to buy the same time.
 
 # Faces below this never leave the module. SCRFD on bare skin is a known
 # false-positive source on this footage, and every face here becomes a blur
@@ -259,6 +287,7 @@ class ScrfdDetector:
         self._in_name = ""
         self.available: Optional[bool] = None
         self.last_ms = 0.0
+        self._in_hw = _INPUT_HW
 
     def _status(self, msg: str) -> None:
         if self._on_status:
@@ -278,8 +307,12 @@ class ScrfdDetector:
             from .detector import _pinned_model
             from .utils import best_onnx_providers, make_session
 
-            self._status(f"Loading SCRFD close-up detector ({path.name})…")
-            pinned = _pinned_model(str(path), _INPUT_HW)
+            self._status(f"Loading SCRFD witness detector ({path.name})…")
+            # Pinned once, on the first frame's aspect ratio, and never
+            # rebuilt — the DirectML law forbids replacing a live session, so
+            # a mid-video resolution change keeps the original shape (still
+            # correct, just back to letterboxing).
+            pinned = _pinned_model(str(path), self._in_hw)
             providers = best_onnx_providers()
             try:
                 sess = make_session(pinned, providers)
@@ -288,11 +321,11 @@ class ScrfdDetector:
             self._in_name = sess.get_inputs()[0].name
             self._sess = sess
             self.available = True
-            h, w = _INPUT_HW
-            self._status(f"SCRFD close-up detector ready on "
+            h, w = self._in_hw
+            self._status(f"SCRFD witness detector ready on "
                          f"{sess.get_providers()[0]} @ {w}×{h}")
         except Exception as exc:  # noqa: BLE001 — degrade, never crash
-            self._status(f"SCRFD close-up detector unavailable: {exc!r}")
+            self._status(f"SCRFD witness detector unavailable: {exc!r}")
             self.available = False
         return self.available
 
@@ -320,7 +353,7 @@ class ScrfdDetector:
         from .detector import _nms
 
         fh, fw = frame_bgr.shape[:2]
-        h, w = _INPUT_HW
+        h, w = self._in_hw
         scale = min(w / fw, h / fh)
         rw, rh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
         try:
@@ -333,7 +366,7 @@ class ScrfdDetector:
             blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
             outs = self._sess.run(None, {self._in_name: blob})
             # _nms keys on column 4 and carries any landmark columns along.
-            rows = _nms(_decode(outs, _INPUT_HW, floor), _NMS_IOU)
+            rows = _nms(_decode(outs, self._in_hw, floor), _NMS_IOU)
             self.last_ms = (time.perf_counter() - t0) * 1e3
             if len(rows) == 0:
                 return (np.empty((0, 5), np.float32),

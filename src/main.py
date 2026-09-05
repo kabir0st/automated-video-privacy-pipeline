@@ -1,22 +1,24 @@
-"""Automated Video Privacy Pipeline — GUI inspector launcher.
+"""Automated Video Privacy Pipeline — launcher.
 
 Usage:
-    uv run python src/main.py        # open the GUI inspector
+    uv run python src/main.py [VIDEO]     # open the timeline editor
+    uv run python src/cli.py --help       # headless analyse / export
 """
 
 import sys
 
 
 def main() -> None:
-    # Show the splash before importing ui, whose module-level imports
-    # (cv2/torch/insightface/onnxruntime) are what make startup slow — this file
-    # must stay stdlib-only at module level so the splash appears instantly.
+    # Show the splash before importing the app, whose module-level imports
+    # (cv2/numpy/scipy/onnxruntime/PyQt6 widgets) are what make startup slow —
+    # this file must stay stdlib-only at module level so the splash appears
+    # instantly.
     from splash import show_splash  # PyQt6 only
 
     splash = show_splash()
-    from ui import main as ui_main
+    from app.window import main as app_main
 
-    ui_main(splash=splash)
+    app_main(splash=splash)
 
 
 if __name__ == "__main__":

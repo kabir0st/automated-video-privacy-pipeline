@@ -1,7 +1,7 @@
 [project]
 name = "automated-video-privacy-pipeline"
 version = "0.2.0"
-description = "Offline face-anonymization pipeline with a live tuning inspector — detect, track, and blur faces in video."
+description = "Offline head-anonymisation pipeline with a timeline editor — union detection, long-memory tracking, suspicion-ranked review, blur."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12"

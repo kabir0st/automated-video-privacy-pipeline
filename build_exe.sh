@@ -17,15 +17,15 @@
 #     (onnxruntime-directml, pyqt6, scipy, opencv-python, etc.)
 #
 # Notes:
-#   - All four models — the PINTO YOLOv9-Wholebody17 detector (~28 MB), the
-#     SCRFD close-up assist (~17 MB), the RTMPose-m body7 pose estimator
-#     (~25 MB, supplies the evidence gate's anatomical anchor + torso axis)
-#     and the NudeNet YOLOv8n verify witness (~12 MB, offline-only —
-#     independent cross-model confirmation for tracklet verification) — ARE
-#     bundled into the exe (--add-data below), so a first run needs no
-#     downloads at all. The startup preflight (libs/models.py) still reports
-#     each one's location and can download to %USERPROFILE%\.cache\avpp\ if a
-#     bundle is bypassed via the AVPP_*_ONNX/AVPP_*_URL env overrides.
+#   - All five models — the deepghs YOLO11-L head detector (~101 MB, the
+#     primary blur source), the PINTO YOLOv9-Wholebody17 detector (~28 MB,
+#     second head vote + face class), the SCRFD face detector (~17 MB), the
+#     NudeNet YOLOv8n witness (~12 MB, optional) and the ArcFace embedder
+#     (~14 MB) — ARE bundled into the exe (--add-data below), so a first run
+#     needs no downloads at all. The startup preflight (libs/models.py) still
+#     reports each one's location and can download to
+#     %USERPROFILE%\.cache\avpp\ if a bundle is bypassed via the
+#     AVPP_*_ONNX/AVPP_*_URL env overrides.
 #   - NudeNet is AGPL-3.0 licensed (the model weights, bundled here for this
 #     project's own offline/personal-use build; see README before ever
 #     redistributing the exe).
@@ -92,7 +92,8 @@ SRC_WIN_DIR=$(wslpath -w "$SCRIPT_DIR/src")
 "${WIN_PY[@]}" -c "
 import sys
 sys.path.insert(0, r'$SRC_WIN_DIR')
-import ui  # pulls in PyQt6, cv2, scipy, libs.*
+import app.window  # pulls in PyQt6, cv2, scipy, libs.*, pipeline.*
+import cli
 import onnxruntime as ort
 from libs.utils import best_onnx_providers
 prov = best_onnx_providers()
@@ -103,11 +104,21 @@ assert 'DmlExecutionProvider' in ort.get_available_providers(), (
 print('OK: DirectML provider present — GPU inference will be used on the RX 6800')
 "
 
-# ── ensure the detector model exists, for bundling ───────────────────────────
-# The single ONNX (~28 MB) is bundled into the exe so first run downloads
-# nothing. libs.detector resolves sys._MEIPASS/models/<name> first at runtime.
+# ── ensure the models exist, for bundling ────────────────────────────────────
+# Each ONNX is bundled into the exe so first run downloads nothing; every
+# wrapper resolves sys._MEIPASS/models/<name> first at runtime.
 echo ""
-echo ">>> Ensuring detector model for bundling…"
+echo ">>> Ensuring head detector model for bundling…"
+HEADDET_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.headdet import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $HEADDET_PATH"
+HEADDET_WIN=$(wslpath -w "$HEADDET_PATH")
+
+echo ""
+echo ">>> Ensuring Wholebody17 detector model for bundling…"
 MODEL_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
 import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
 from libs.detector import download_model
@@ -116,10 +127,8 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $MODEL_PATH"
 MODEL_WIN=$(wslpath -w "$MODEL_PATH")
 
-# SCRFD close-up assist model (~17 MB) — same treatment: bundled so the
-# frozen exe never downloads. libs/scrfd.py resolves _MEIPASS/models first.
 echo ""
-echo ">>> Ensuring SCRFD close-up model for bundling…"
+echo ">>> Ensuring SCRFD face model for bundling…"
 SCRFD_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
 import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
 from libs.scrfd import download_model
@@ -128,24 +137,9 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $SCRFD_PATH"
 SCRFD_WIN=$(wslpath -w "$SCRFD_PATH")
 
-# Pose estimator (RTMPose-m body7, ~25 MB) — supplies the evidence gate's
-# anatomical anchor + torso axis (Phase 2). Same bundling treatment;
-# libs/pose.py resolves _MEIPASS/models first.
+# NudeNet witness (YOLOv8n, ~12 MB) — optional independent face witness.
 echo ""
-echo ">>> Ensuring pose estimator model for bundling…"
-POSE_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
-import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
-from libs.pose import download_model
-print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
-" | tail -1)
-echo "    Model: $POSE_PATH"
-POSE_WIN=$(wslpath -w "$POSE_PATH")
-
-# NudeNet verify witness (YOLOv8n, ~12 MB) — independent, offline-only
-# cross-model witness for tracklet verification (Phase 3). Same bundling
-# treatment; libs/nudenet.py resolves _MEIPASS/models first.
-echo ""
-echo ">>> Ensuring NudeNet verify witness model for bundling…"
+echo ">>> Ensuring NudeNet witness model for bundling…"
 NUDENET_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
 import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
 from libs.nudenet import download_model
@@ -154,10 +148,22 @@ print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
 echo "    Model: $NUDENET_PATH"
 NUDENET_WIN=$(wslpath -w "$NUDENET_PATH")
 
+# Face embedder (MobileFaceNet ArcFace, ~14 MB) — appearance channel; the
+# bridge stage uses it to veto joins between two visibly different people.
+echo ""
+echo ">>> Ensuring face embedder model for bundling…"
+EMBED_PATH=$("$SCRIPT_DIR/.venv/bin/python" -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR/src')
+from libs.embed import download_model
+print(download_model(on_status=lambda m: print(m, file=sys.stderr)))
+" | tail -1)
+echo "    Model: $EMBED_PATH"
+EMBED_WIN=$(wslpath -w "$EMBED_PATH")
+
 # ── convert WSL paths → Windows paths ────────────────────────────────────────
-# Entry is main.py (NOT ui.py): main.py shows the loading splash before the heavy
-# cv2/onnxruntime/insightface imports, then hands the splash to ui.main() which
-# runs the model preflight on it. Building from ui.py skips the splash entirely.
+# Entry is main.py (NOT app/window.py): main.py shows the loading splash before
+# the heavy cv2/onnxruntime imports, then hands the splash to app.window.main()
+# which runs the model preflight on it. Building from window.py skips the splash.
 SRC_WIN=$(wslpath -w "$SCRIPT_DIR/src/main.py")
 PATHS_WIN=$(wslpath -w "$SCRIPT_DIR/src")
 RTH_WIN=$(wslpath -w "$SCRIPT_DIR/rth_windowed_stdio.py")
@@ -205,18 +211,17 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   \
   --hidden-import "libs.utils" \
   --hidden-import "libs.detector" \
-  --hidden-import "libs.evidence" \
+  --hidden-import "libs.headdet" \
   --hidden-import "libs.scrfd" \
-  --hidden-import "libs.pose" \
   --hidden-import "libs.nudenet" \
-  --hidden-import "libs.sidecar" \
-  --hidden-import "libs.head_tracker" \
-  --hidden-import "libs.tracklets" \
+  --hidden-import "libs.embed" \
+  --hidden-import "libs.labels" \
   --hidden-import "libs.models" \
   --hidden-import "libs.video_writer" \
+  --collect-submodules "pipeline" \
+  --collect-submodules "app" \
   --hidden-import "splash" \
-  --hidden-import "review_ui" \
-  --hidden-import "ui" \
+  --hidden-import "cli" \
   \
   --hidden-import "PyQt6" \
   --hidden-import "PyQt6.QtWidgets" \
@@ -226,10 +231,11 @@ echo ">>> Building FaceBlurInspector.exe (--onefile --windowed)…"
   \
   --collect-all "onnxruntime" \
   --collect-all "imageio_ffmpeg" \
+  --add-data "$HEADDET_WIN;models" \
   --add-data "$MODEL_WIN;models" \
   --add-data "$SCRFD_WIN;models" \
-  --add-data "$POSE_WIN;models" \
   --add-data "$NUDENET_WIN;models" \
+  --add-data "$EMBED_WIN;models" \
   \
   \
   `# utils.py optionally imports torch for the CUDA blur path; on this` \

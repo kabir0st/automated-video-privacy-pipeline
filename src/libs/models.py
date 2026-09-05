@@ -6,15 +6,16 @@ callback. Run :func:`preflight` at startup so the windowed .exe surfaces model
 status on the splash and in the debug log (:data:`libs.utils.DEBUG_LOG`)
 instead of stalling silently the first time a video is opened.
 
-Four models: the PINTO body/head/face detector (see libs/detector.py for the
+Five models: the PINTO body/head/face detector (see libs/detector.py for the
 spec, resolution order and env overrides) that owns the pipeline, the SCRFD
-face detector (libs/scrfd.py) that only assists on extreme close-ups, the
+face detector (libs/scrfd.py) that corroborates it on every frame, the
 RTMPose body estimator (libs/pose.py) that supplies the evidence gate's
-anatomical anchor + torso axis, and NudeNet (libs/nudenet.py) — an
-independent, offline-only witness for cross-model tracklet verification
-(never runs in the live per-frame path). The frozen build bundles all four,
-so a normal first run downloads nothing; the download paths exist for dev
-machines and for spec overrides.
+anatomical anchor + torso axis, NudeNet (libs/nudenet.py) — an independent,
+offline-only witness for cross-model tracklet verification — and the face
+embedder (libs/embed.py), an offline-only appearance channel that lets the
+bridge stage veto joins between two visibly different people. The frozen
+build bundles all five, so a normal first run downloads nothing; the download
+paths exist for dev machines and for spec overrides.
 
 Downloads are idempotent and best-effort: any failure is reported and skipped
 so startup never dies — the pipeline degrades to "no blur + status line"
@@ -27,7 +28,7 @@ from __future__ import annotations
 import os
 from typing import Callable, Optional
 
-from . import detector, nudenet, pose, scrfd
+from . import detector, embed, headdet, nudenet, scrfd
 from .utils import debug_log
 
 StatusCb = Callable[[str], None]
@@ -54,25 +55,25 @@ def _preflight_detector(status: StatusCb, download: bool) -> None:
 def _preflight_scrfd(status: StatusCb, download: bool) -> None:
     path = scrfd.model_path()
     if path is not None:
-        status(f"scrfd close-up detector: {path}  [found]")
+        status(f"scrfd witness detector: {path}  [found]")
         return
-    status(f"scrfd close-up detector: {scrfd.default_cache()}  [MISSING]")
+    status(f"scrfd witness detector: {scrfd.default_cache()}  [MISSING]")
     if not download:
         return
     scrfd.download_model(on_status=status)
-    status("scrfd close-up detector: ready")
+    status("scrfd witness detector: ready")
 
 
-def _preflight_pose(status: StatusCb, download: bool) -> None:
-    path = pose.model_path()
+def _preflight_headdet(status: StatusCb, download: bool) -> None:
+    path = headdet.model_path()
     if path is not None:
-        status(f"pose estimator: {path}  [found]")
+        status(f"head detector ({headdet.variant()}): {path}  [found]")
         return
-    status(f"pose estimator: {pose.default_cache()}  [MISSING]")
+    status(f"head detector ({headdet.variant()}): {headdet.default_cache()}  [MISSING]")
     if not download:
         return
-    pose.download_model(on_status=status)
-    status("pose estimator: ready")
+    headdet.download_model(on_status=status)
+    status("head detector: ready")
 
 
 def _preflight_nudenet(status: StatusCb, download: bool) -> None:
@@ -85,6 +86,21 @@ def _preflight_nudenet(status: StatusCb, download: bool) -> None:
         return
     nudenet.download_model(on_status=status)
     status("nudenet verify witness: ready")
+
+
+def _preflight_embed(status: StatusCb, download: bool) -> None:
+    if not embed.enabled():
+        status("face embedder: disabled (AVPP_EMBED=0)")
+        return
+    path = embed.model_path()
+    if path is not None:
+        status(f"face embedder: {path}  [found]")
+        return
+    status(f"face embedder: {embed.default_cache()}  [MISSING]")
+    if not download:
+        return
+    embed.download_model(on_status=status)
+    status("face embedder: ready")
 
 
 def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) -> None:
@@ -112,11 +128,15 @@ def preflight(status_cb: Optional[StatusCb] = None, *, download: bool = True) ->
     except Exception as exc:  # noqa: BLE001 — the assist degrades to off
         status(f"scrfd: download/check failed, will degrade — {exc!r}")
     try:
-        _preflight_pose(status, download)
-    except Exception as exc:  # noqa: BLE001 — the gate degrades to head-anchor
-        status(f"pose: download/check failed, will degrade — {exc!r}")
+        _preflight_headdet(status, download)
+    except Exception as exc:  # noqa: BLE001 — union degrades to Wholebody+SCRFD
+        status(f"head detector: download/check failed, will degrade — {exc!r}")
     try:
         _preflight_nudenet(status, download)
     except Exception as exc:  # noqa: BLE001 — verify degrades to SCRFD-only
         status(f"nudenet: download/check failed, will degrade — {exc!r}")
+    try:
+        _preflight_embed(status, download)
+    except Exception as exc:  # noqa: BLE001 — bridge degrades to geometry-only
+        status(f"embed: download/check failed, will degrade — {exc!r}")
     status("Model check complete")

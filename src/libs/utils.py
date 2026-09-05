@@ -54,27 +54,178 @@ DEFAULT_BLUR_LAYERS: tuple[BlurLayer, ...] = (
 )
 
 
+# ── GPU runtime discovery ────────────────────────────────────────────────────
+# ONNX Runtime advertises an execution provider whenever its plugin .so is
+# present in the wheel — it does NOT check that the plugin's own dependencies
+# resolve. On a ROCm box that gap is easy to hit: distro packages install the
+# HIP/HSA runtime under /opt/rocm (a symlink to the newest tree) while
+# repo.radeon.com's math libraries (rocBLAS, MIOpen, MIGraphX) land in a
+# *different*, version-suffixed tree that nothing adds to the linker path. The
+# provider then lists fine and fails at session creation with
+#     Failed to load library ... libmigraphx_c.so.3: cannot open shared object
+# and ORT silently falls back to CPU.
+#
+# That silent fallback is worse than it looks here, because fp16_model_path()
+# has already decided to convert the graph based on a GPU being "available" —
+# so the fallback runs an *fp16 graph on the CPU*, which measured 71 ms/pass
+# against 26 ms for plain fp32. A broken GPU provider made things 2.7x slower
+# than having no GPU at all.
+#
+# So: preload the math libraries into the global symbol namespace, then verify
+# each GPU provider's plugin actually loads, and drop the ones that don't.
+_ROCM_LIB_GLOBS = ("/opt/rocm/lib", "/opt/rocm-*/lib", "/opt/rocm*/lib64")
+
+#: EP → its plugin filename. Providers absent from this map (DirectML, CPU)
+#: live inside the main runtime library and need no separate check.
+_PROVIDER_LIBS = {
+    "MIGraphXExecutionProvider": "libonnxruntime_providers_migraphx.so",
+    "ROCMExecutionProvider": "libonnxruntime_providers_rocm.so",
+    "CUDAExecutionProvider": "libonnxruntime_providers_cuda.so",
+}
+
+_preloaded = False
+_provider_cache: "dict[str, bool]" = {}
+
+
+def _preload_gpu_runtime() -> None:
+    """dlopen ROCm's math libraries with RTLD_GLOBAL, once per process.
+
+    Loading them here satisfies the provider plugin's dependencies without the
+    user having to set LD_LIBRARY_PATH (which the dynamic loader only reads at
+    exec, so a process can't set it for itself). Repeated passes handle
+    inter-library ordering without hardcoding a dependency graph; anything that
+    never loads is simply not needed. Entirely best-effort and silent — on a
+    machine with no ROCm this is a no-op."""
+    global _preloaded
+    if _preloaded:
+        return
+    _preloaded = True
+    import ctypes
+    import glob as _glob
+
+    pending = []
+    for pattern in _ROCM_LIB_GLOBS:
+        for d in _glob.glob(pattern):
+            pending.extend(_glob.glob(os.path.join(d, "lib*.so*")))
+    pending = sorted(set(pending))
+    if not pending:
+        return
+    for _ in range(4):
+        progressed = False
+        for path in list(pending):
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                continue
+            pending.remove(path)
+            progressed = True
+        if not progressed:
+            break
+
+
+def _provider_usable(name: str) -> bool:
+    """True when this EP's plugin library actually loads.
+
+    ORT must be imported first: the plugin resolves ``Provider_GetHost`` out of
+    the main runtime library, so probing it standalone reports a spurious
+    undefined-symbol failure."""
+    lib = _PROVIDER_LIBS.get(name)
+    if lib is None:
+        return True                      # built into the main runtime
+    if name in _provider_cache:
+        return _provider_cache[name]
+    ok = True
+    try:
+        import ctypes
+        import onnxruntime as ort
+
+        cand = Path(ort.__file__).parent / "capi" / lib
+        if cand.is_file():               # absent ⇒ monolithic build, assume ok
+            _preload_gpu_runtime()
+            try:
+                ctypes.CDLL(str(cand), mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                debug_log(f"{name} advertised but its plugin will not load "
+                          f"({exc}); dropping it — a silent CPU fallback would "
+                          f"run an fp16 graph on the CPU and be slower than "
+                          f"never having claimed a GPU")
+                ok = False
+    except Exception:  # noqa: BLE001 — probing must never break startup
+        ok = True
+    _provider_cache[name] = ok
+    return ok
+
+
+def _configure_migraphx_cache() -> None:
+    """Point MIGraphX at a persistent compiled-model cache.
+
+    MIGraphX compiles the whole graph ahead of time, which is where its speed
+    comes from and also why a cold session costs ~25 s per model — five models
+    would be minutes of startup, every launch. With the cache that drops to
+    ~0.8 s. Only set when the user hasn't chosen a location themselves.
+
+    Lives under ~/.cache/avpp beside the models rather than in DERIVED_MODEL_
+    CACHE (which is under the system temp dir): the fp16 and shape-pinned
+    derivatives kept there regenerate in seconds, whereas these cost ~25 s per
+    model, so losing them to a reboot is a materially worse trade."""
+    if os.environ.get("ORT_MIGRAPHX_MODEL_CACHE_PATH"):
+        return
+    try:
+        cache = Path.home() / ".cache" / "avpp" / "migraphx"
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ["ORT_MIGRAPHX_MODEL_CACHE_PATH"] = str(cache)
+    except OSError:
+        pass
+
+
 def best_onnx_providers() -> list[str]:
     """Pick GPU execution providers when available, in preference order:
-    DirectML (any Windows GPU incl. AMD Radeon) > CUDA (NVIDIA) > ROCm (AMD on
-    Linux) > CPU. On an AMD RX 6800 the winning provider is DirectML on Windows
-    (install ``onnxruntime-directml``) or ROCm on native Linux."""
+    DirectML (any Windows GPU incl. AMD Radeon) > CUDA (NVIDIA) > MIGraphX /
+    ROCm (AMD on Linux) > CPU.
+
+    Only providers whose plugin library actually loads are returned — see
+    :func:`_provider_usable` for why advertising is not enough.
+
+    On an AMD RX 6800 the winning provider is DirectML on Windows (install
+    ``onnxruntime-directml``) or, on native Linux, **MIGraphX** — AMD ships
+    ``onnxruntime_migraphx`` rather than ``onnxruntime_rocm`` from ROCm 7.1
+    onward, so both names are listed and whichever the installed wheel provides
+    is used. MIGraphX is preferred over the plain ROCm EP because it compiles
+    and fuses the graph ahead of time (closer to TensorRT than to a per-op
+    dispatcher), which matters a lot for the batch-1 shapes this pipeline runs.
+    """
     import onnxruntime as ort
 
     preferred = (
-        "DmlExecutionProvider",      # Windows, any GPU incl. AMD Radeon
-        "CUDAExecutionProvider",     # NVIDIA
-        "ROCMExecutionProvider",     # AMD on native Linux
+        "DmlExecutionProvider",        # Windows, any GPU incl. AMD Radeon
+        "CUDAExecutionProvider",       # NVIDIA
+        "MIGraphXExecutionProvider",   # AMD on native Linux (ROCm >= 7.1)
+        "ROCMExecutionProvider",       # AMD on native Linux (ROCm <= 7.0)
         "CPUExecutionProvider",
     )
     available = ort.get_available_providers()
-    return [p for p in preferred if p in available] or list(available)
+    usable = [p for p in preferred if p in available and _provider_usable(p)]
+    if usable and usable[0] == "MIGraphXExecutionProvider":
+        _configure_migraphx_cache()
+    return usable or ["CPUExecutionProvider"]
+
+
+#: Providers that actually run compute on a GPU. Checked by name rather than
+#: "anything that isn't CPU" because ORT also advertises non-compute providers
+#: (AzureExecutionProvider ships in the stock CPU wheel), and treating one of
+#: those as a GPU silently enables the fp16 path on a CPU-only box.
+GPU_PROVIDERS = frozenset({
+    "DmlExecutionProvider",
+    "CUDAExecutionProvider",
+    "MIGraphXExecutionProvider",
+    "ROCMExecutionProvider",
+})
 
 
 def has_gpu_provider() -> bool:
-    """True when a non-CPU ONNX execution provider is available."""
+    """True when the winning ONNX execution provider runs compute on a GPU."""
     prov = best_onnx_providers()
-    return bool(prov) and prov[0] != "CPUExecutionProvider"
+    return bool(prov) and prov[0] in GPU_PROVIDERS
 
 
 # ── float16 acceleration for GPU inference ───────────────────────────────────
@@ -131,11 +282,31 @@ def fp16_model_path(src_path: str) -> str:
         return src_path
 
 
+def _cpu_threads() -> int:
+    """Physical-core count for ORT's intra-op pool (SMT siblings excluded).
+
+    ``os.cpu_count()`` reports logical CPUs; ORT's default pool of that size
+    oversubscribes SMT pairs on convolution graphs. Falls back to half the
+    logical count, which is right for every SMT-2 machine this runs on."""
+    override = os.environ.get("AVPP_CPU_THREADS", "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    try:  # Linux: count distinct physical core ids
+        import re
+        txt = Path("/proc/cpuinfo").read_text()
+        ids = set(re.findall(r"^core id\s*:\s*(\d+)", txt, re.M))
+        pkgs = set(re.findall(r"^physical id\s*:\s*(\d+)", txt, re.M))
+        if ids:
+            return max(1, len(ids) * max(1, len(pkgs)))
+    except OSError:
+        pass
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
 def make_session(model_path: str, providers: list[str]):
-    """Build an ONNX Runtime session with fp16 (GPU) and DirectML-friendly
-    options. Use for sessions this project creates directly (RTMW, RF-DETR);
-    insightface/rtmlib that build their own sessions get fp16 via the model
-    file from :func:`fp16_model_path` instead."""
+    """Build an ONNX Runtime session with fp16 (GPU) and provider-specific
+    options. Use for every session this project creates directly (detector,
+    SCRFD, pose, NudeNet, face embedder)."""
     import onnxruntime as ort
 
     path = fp16_model_path(model_path)
@@ -145,6 +316,13 @@ def make_session(model_path: str, providers: list[str]):
         # DirectML does not support ORT's memory-pattern planner; leaving it on
         # forces a fallback path. Disabling is required for DML, harmless else.
         so.enable_mem_pattern = False
+    if providers and providers[0] == "CPUExecutionProvider":
+        # ORT's default is one intra-op thread per *logical* core, which
+        # oversubscribes SMT pairs and costs ~10-20 % on convolution-heavy
+        # graphs like these. Pin to physical cores instead. AVPP_CPU_THREADS
+        # overrides for benchmarking.
+        so.intra_op_num_threads = _cpu_threads()
+        so.inter_op_num_threads = 1
     return ort.InferenceSession(path, sess_options=so, providers=providers)
 
 
@@ -201,6 +379,8 @@ def render_head_mask(
     if feather > 0:
         k = max(3, int(round(feather * (sum(diags) / len(diags)))) | 1)
     r = k / 2.0
+    ex1 = ey1 = float("inf")
+    ex2 = ey2 = float("-inf")
     for b in boxes:
         x1, y1, x2, y2 = (float(v) for v in b[:4])
         w, h = x2 - x1, y2 - y1
@@ -211,16 +391,34 @@ def render_head_mask(
         # so a head half out of frame keeps its sliver of blur.
         cv2.ellipse(mask, (int(round(cx)), int(round(cy))),
                     (int(round(ax)), int(round(ay))), 0, 0, 360, 255, -1)
+        ex1, ey1 = min(ex1, cx - ax), min(ey1, cy - ay)
+        ex2, ey2 = max(ex2, cx + ax), max(ey2, cy + ay)
     if k >= 3:
-        mask = cv2.GaussianBlur(mask, (k, k), 0)
+        # Feather only the sub-rect the ellipses touch, grown by a full kernel
+        # width. Every nonzero pixel is then at least k from that sub-rect's
+        # border, so a border pixel's kernel sees nothing but zeros and the
+        # result is bit-identical to blurring the whole frame — while a 4K
+        # frame with one head stops paying for a 3840x2160 Gaussian.
+        mh, mw = shape_hw
+        bx1 = max(0, int(np.floor(ex1)) - k)
+        by1 = max(0, int(np.floor(ey1)) - k)
+        bx2 = min(mw, int(np.ceil(ex2)) + k + 1)
+        by2 = min(mh, int(np.ceil(ey2)) + k + 1)
+        if bx2 > bx1 and by2 > by1:
+            roi = mask[by1:by2, bx1:bx2]
+            mask[by1:by2, bx1:bx2] = cv2.GaussianBlur(roi, (k, k), 0)
     return mask
 
 
 # ── GPU-accelerated stacked blur pipeline ────────────────────────────────────
 
 def _is_soft(mask: np.ndarray) -> bool:
-    """True when the mask has intermediate values (a feathered alpha mask)."""
-    return bool(((mask > 0) & (mask < 255)).any())
+    """True when the mask has intermediate values (a feathered alpha mask).
+
+    ``cv2.inRange`` + ``countNonZero`` is one C++ pass over one uint8
+    temporary; the equivalent ``((mask > 0) & (mask < 255)).any()`` builds two
+    full-size bool arrays and a third for the AND."""
+    return cv2.countNonZero(cv2.inRange(mask, 1, 254)) > 0
 
 
 def _blend(frame: np.ndarray, blurred: np.ndarray, mask: np.ndarray) -> None:
@@ -299,8 +497,12 @@ class BlurPipeline:
         alpha-blends, so blur fades out over the feather band."""
         if not self._layers:
             return
-        ys, xs = np.nonzero(mask)
-        if xs.size == 0:
+        # boundingRect is a single C++ pass returning the box directly.
+        # np.nonzero allocated two int64 arrays holding *every* set pixel's
+        # coordinate — tens of MB per frame on a 4K feathered mask — purely to
+        # take four min/max values off them.
+        bx, by, bw, bh = cv2.boundingRect(mask)
+        if bw == 0 or bh == 0:
             return
 
         fh, fw = frame.shape[:2]
@@ -309,8 +511,8 @@ class BlurPipeline:
         gmax = max((s for k, s in self._layers if k == "gaussian"), default=0)
         pmax = max((s for k, s in self._layers if k == "pixelate"), default=0)
         pad = gmax + pmax + 4
-        x1 = max(0, int(xs.min()) - pad); x2 = min(fw, int(xs.max()) + 1 + pad)
-        y1 = max(0, int(ys.min()) - pad); y2 = min(fh, int(ys.max()) + 1 + pad)
+        x1 = max(0, bx - pad); x2 = min(fw, bx + bw + pad)
+        y1 = max(0, by - pad); y2 = min(fh, by + bh + pad)
 
         if (x2 - x1) * (y2 - y1) >= self._ROI_MAX_FRAC * fw * fh:
             f_roi, m_roi = frame, mask          # ROI ≈ whole frame; skip the crop

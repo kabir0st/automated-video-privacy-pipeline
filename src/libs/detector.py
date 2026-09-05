@@ -274,7 +274,17 @@ def _pinned_model(path: str, hw: tuple[int, int]) -> str:
     h, w = hw
     cache_dir = Path(tempfile.gettempdir()) / "FaceBlurInspector-models"
     cache_dir.mkdir(exist_ok=True)
-    fixed = cache_dir / f"{Path(path).stem}_pin{w}x{h}.onnx"
+    # Key on size+mtime as well as name/shape (same convention as
+    # utils.fp16_model_path). Without the fingerprint, swapping the model via
+    # AVPP_DETECTOR_ONNX for a different file with the same basename silently
+    # reuses the previously pinned graph — you benchmark the old model and
+    # never find out.
+    try:
+        st = Path(path).stat()
+        stamp = f"_{st.st_size}_{int(st.st_mtime)}"
+    except OSError:
+        stamp = ""
+    fixed = cache_dir / f"{Path(path).stem}_pin{w}x{h}{stamp}.onnx"
     if not fixed.exists():
         model = onnx.load(path)
         make_input_shape_fixed(model.graph, model.graph.input[0].name,

@@ -10,3 +10,15 @@ wheels/
 .venv
 build_diag
 dis_diag
+
+# Claude Code personal settings
+.claude/settings.local.json
+
+# pipeline sidecars next to source videos
+*.avpp.json
+*.avpp2.json
+
+# test footage and exports never belong in the repo
+*.mp4
+*.mov
+*.mkv
